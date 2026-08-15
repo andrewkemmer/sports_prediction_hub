@@ -1,0 +1,785 @@
+// Pure-TS machine learning engine for MLB win probability.
+// No node/convex imports — safe to use from Convex actions and shared types.
+//
+// Pipeline:
+//   1. Chronological Elo ratings + as-of-game-time features (no lookahead).
+//   2. Chronological 70/15/15 split: train / calibrate / test.
+//   3. Feature selection via greedy backward elimination on the calibrate set.
+//   4. Candidate models: Elo, logistic regression, blended ensemble.
+//   5. Model selection: maximize AUC, then minimize Brier among near-best.
+//   6. Isotonic calibration (PAV) to reduce Brier / calibration error.
+//   7. Monte Carlo decision: enable the stochastic component only if it
+//      measurably reduces holdout Brier (risk).
+
+import {
+  CalibrationBin,
+  CandidateModel,
+  ConfidencePoint,
+  CurvePoint,
+  FEATURE_KEYS,
+  FEATURE_LABELS,
+  FeatureImportance,
+  FeatureKey,
+  FeatureRow,
+  FeatureValues,
+  PowerRanking,
+  RawGame,
+  ShapContribution,
+  TeamState,
+  TrainedModel,
+} from "./types";
+
+const ELO_INIT = 1500;
+const ELO_HFA_UPDATE = 30; // home advantage baked into Elo updates only
+const EPS = 1e-6;
+
+export interface EvalResult {
+  auc: number;
+  brier: number;
+  logLoss: number;
+  ece: number;
+  bins: CalibrationBin[];
+  confidenceDistribution: ConfidencePoint[];
+  calibrationCurve: CurvePoint[];
+}
+
+export interface ModelRunResult {
+  season: string;
+  asOfDate: string;
+  gamesTrained: number;
+  holdoutCount: number;
+  selectedModel: string;
+  modelDescription: string;
+  featureNames: FeatureKey[];
+  weights: number[];
+  bias: number;
+  featureStats: Record<FeatureKey, { mean: number; std: number }>;
+  isotonicPoints: { x: number; y: number }[];
+  eloHfa: number;
+  monteCarloEnabled: boolean;
+  monteCarloTrials: number;
+  monteCarloSigma: number;
+  monteCarloRationale: string;
+  auc: number;
+  brier: number;
+  logLoss: number;
+  ece: number;
+  bins: CalibrationBin[];
+  confidenceDistribution: ConfidencePoint[];
+  calibrationCurve: CurvePoint[];
+  featureImportances: FeatureImportance[];
+  candidates: CandidateModel[];
+  powerRankings: PowerRanking[];
+}
+
+export interface Prediction {
+  homeWinProb: number;
+  awayWinProb: number;
+  pickTeam: "home" | "away";
+  pickProb: number;
+  shap: ShapContribution[];
+  edge: number;
+  fairHomeOdds: number;
+  fairAwayOdds: number;
+}
+
+export interface ModelRun {
+  result: ModelRunResult;
+  model: TrainedModel;
+  teamState: TeamState;
+  rows: FeatureRow[];
+  predict: (game: RawGame) => Prediction;
+}
+
+// ---------------------------------------------------------------------------
+// Math helpers
+// ---------------------------------------------------------------------------
+
+export function sigmoid(x: number): number {
+  if (x >= 0) {
+    const z = Math.exp(-x);
+    return 1 / (1 + z);
+  }
+  const z = Math.exp(x);
+  return z / (1 + z);
+}
+
+export function logit(p: number): number {
+  const q = clamp(p, EPS, 1 - EPS);
+  return Math.log(q / (1 - q));
+}
+
+export function clamp(x: number, lo: number, hi: number): number {
+  return Math.min(hi, Math.max(lo, x));
+}
+
+function mean(vals: number[]): number {
+  if (vals.length === 0) return 0;
+  return vals.reduce((a, b) => a + b, 0) / vals.length;
+}
+
+function std(vals: number[]): number {
+  if (vals.length === 0) return 0;
+  const m = mean(vals);
+  return Math.sqrt(vals.reduce((s, v) => s + (v - m) * (v - m), 0) / vals.length);
+}
+
+function dot(a: number[], b: number[]): number {
+  let s = 0;
+  for (let i = 0; i < a.length; i++) s += a[i] * b[i];
+  return s;
+}
+
+function daysBetween(from: string, to: string): number {
+  if (!from || !to) return 4;
+  const a = Date.parse(from);
+  const b = Date.parse(to);
+  if (Number.isNaN(a) || Number.isNaN(b)) return 4;
+  return Math.round((b - a) / 86400000);
+}
+
+// ---------------------------------------------------------------------------
+// Feature engineering (strictly as-of-game-time)
+// ---------------------------------------------------------------------------
+
+interface MutableState {
+  elo: Record<number, number>;
+  formHistory: Record<number, number[]>;
+  lastGameDate: Record<number, string>;
+  records: Record<number, { wins: number; losses: number }>;
+}
+
+function newState(): MutableState {
+  return { elo: {}, formHistory: {}, lastGameDate: {}, records: {} };
+}
+
+function formOf(state: MutableState, id: number): number {
+  const h = state.formHistory[id];
+  if (!h || h.length === 0) return 0.5;
+  return h.reduce((a, b) => a + b, 0) / h.length;
+}
+
+function buildFeatures(game: RawGame, state: MutableState): FeatureValues {
+  const homeElo = state.elo[game.home.id] ?? ELO_INIT;
+  const awayElo = state.elo[game.away.id] ?? ELO_INIT;
+
+  const homeRec = state.records[game.home.id] ?? { wins: 0, losses: 0 };
+  const awayRec = state.records[game.away.id] ?? { wins: 0, losses: 0 };
+  const homeWins = game.home.wins ?? homeRec.wins;
+  const homeLosses = game.home.losses ?? homeRec.losses;
+  const awayWins = game.away.wins ?? awayRec.wins;
+  const awayLosses = game.away.losses ?? awayRec.losses;
+  const homeWp = homeWins + homeLosses > 0 ? homeWins / (homeWins + homeLosses) : 0.5;
+  const awayWp = awayWins + awayLosses > 0 ? awayWins / (awayWins + awayLosses) : 0.5;
+
+  const homeRest = clamp(daysBetween(state.lastGameDate[game.home.id] ?? "", game.date), 0, 10);
+  const awayRest = clamp(daysBetween(state.lastGameDate[game.away.id] ?? "", game.date), 0, 10);
+
+  return {
+    eloDiff: (homeElo - awayElo) / 100,
+    winPctDiff: homeWp - awayWp,
+    formDiff: formOf(state, game.home.id) - formOf(state, game.away.id),
+    restDiff: clamp(homeRest - awayRest, -4, 4),
+    homeField: 1,
+  };
+}
+
+function updateState(state: MutableState, game: RawGame): void {
+  const home = game.home.id;
+  const away = game.away.id;
+  const homeElo = state.elo[home] ?? ELO_INIT;
+  const awayElo = state.elo[away] ?? ELO_INIT;
+
+  const expectedHome = 1 / (1 + Math.pow(10, -((homeElo + ELO_HFA_UPDATE) - awayElo) / 400));
+  const homeActual = game.winner === "home" ? 1 : 0;
+  const margin = Math.abs((game.home.score ?? 0) - (game.away.score ?? 0));
+  const k = 24 * Math.sqrt(Math.max(1, margin));
+  const delta = k * (homeActual - expectedHome);
+  state.elo[home] = homeElo + delta;
+  state.elo[away] = awayElo - delta;
+
+  const hh = state.formHistory[home] ?? [];
+  hh.push(homeActual);
+  if (hh.length > 10) hh.shift();
+  state.formHistory[home] = hh;
+  const ah = state.formHistory[away] ?? [];
+  ah.push(1 - homeActual);
+  if (ah.length > 10) ah.shift();
+  state.formHistory[away] = ah;
+
+  const hr = state.records[home] ?? { wins: 0, losses: 0 };
+  const ar = state.records[away] ?? { wins: 0, losses: 0 };
+  if (homeActual === 1) {
+    hr.wins += 1;
+    ar.losses += 1;
+  } else {
+    hr.losses += 1;
+    ar.wins += 1;
+  }
+  state.records[home] = hr;
+  state.records[away] = ar;
+
+  state.lastGameDate[home] = game.date;
+  state.lastGameDate[away] = game.date;
+}
+
+export function computeEloAndFeatures(
+  games: RawGame[],
+): { rows: FeatureRow[]; teamState: TeamState } {
+  const sorted = [...games].sort((a, b) => (a.gameDate < b.gameDate ? -1 : 1));
+  const state = newState();
+  const rows: FeatureRow[] = [];
+  for (const game of sorted) {
+    if (game.winner !== "home" && game.winner !== "away") continue;
+    const features = buildFeatures(game, state);
+    rows.push({
+      game,
+      features,
+      homeElo: state.elo[game.home.id] ?? ELO_INIT,
+      awayElo: state.elo[game.away.id] ?? ELO_INIT,
+      label: game.winner === "home" ? 1 : 0,
+    });
+    updateState(state, game);
+  }
+  const teamState: TeamState = {
+    elo: state.elo,
+    form: {},
+    lastGameDate: state.lastGameDate,
+    records: state.records,
+  };
+  for (const id of Object.keys(state.formHistory)) {
+    teamState.form[Number(id)] = formOf(state, Number(id));
+  }
+  return { rows, teamState };
+}
+
+/** Build features for a not-yet-seen game given the current team state. */
+export function buildFeaturesForGame(game: RawGame, state: TeamState): FeatureValues {
+  const mut: MutableState = {
+    elo: state.elo,
+    formHistory: {},
+    lastGameDate: state.lastGameDate,
+    records: state.records,
+  };
+  // Provide form as a synthetic 10-game history so buildFeatures can reuse it.
+  for (const id of Object.keys(state.form)) {
+    const p = state.form[Number(id)];
+    const wins = Math.round(p * 10);
+    mut.formHistory[Number(id)] = Array.from({ length: 10 }, (_, i) => (i < wins ? 1 : 0));
+  }
+  return buildFeatures(game, mut);
+}
+
+// ---------------------------------------------------------------------------
+// Logistic regression (L2, standardized features)
+// ---------------------------------------------------------------------------
+
+export interface LogisticModel {
+  featureNames: FeatureKey[];
+  weights: number[];
+  bias: number;
+  featureStats: Record<FeatureKey, { mean: number; std: number }>;
+}
+
+export function trainLogistic(
+  rows: FeatureRow[],
+  featureNames: FeatureKey[],
+): LogisticModel {
+  const featureStats = {} as Record<FeatureKey, { mean: number; std: number }>;
+  for (const f of featureNames) {
+    const vals = rows.map((r) => r.features[f]);
+    featureStats[f] = { mean: mean(vals), std: std(vals) || 1 };
+  }
+  const X = rows.map((r) =>
+    featureNames.map((f) => (r.features[f] - featureStats[f].mean) / featureStats[f].std),
+  );
+  const y = rows.map((r) => r.label);
+  const n = rows.length;
+  const m = featureNames.length;
+  const pos = y.reduce((a, b) => a + b, 0);
+  let weights = featureNames.map(() => 0);
+  let bias = Math.log((pos + 1) / (n - pos + 1));
+  const lr = 0.1;
+  const lambda = 0.001;
+  const epochs = 1200;
+  for (let e = 0; e < epochs; e++) {
+    const gradW = featureNames.map(() => 0);
+    let gradB = 0;
+    for (let i = 0; i < n; i++) {
+      const z = bias + dot(weights, X[i]);
+      const p = sigmoid(z);
+      const err = p - y[i];
+      gradB += err;
+      for (let j = 0; j < m; j++) gradW[j] += err * X[i][j];
+    }
+    bias -= (lr * gradB) / n;
+    for (let j = 0; j < m; j++) {
+      weights[j] -= (lr * (gradW[j] / n + lambda * weights[j]));
+    }
+  }
+  return { featureNames, weights, bias, featureStats };
+}
+
+export function logisticLogit(
+  model: LogisticModel,
+  features: FeatureValues,
+  shap: ShapContribution[] | null,
+): number {
+  let logitV = model.bias;
+  for (let i = 0; i < model.featureNames.length; i++) {
+    const f = model.featureNames[i];
+    const z = (features[f] - model.featureStats[f].mean) / (model.featureStats[f].std || 1);
+    logitV += model.weights[i] * z;
+    if (shap) shap.push({ feature: f, label: FEATURE_LABELS[f], value: features[f], contribution: model.weights[i] * z });
+  }
+  return logitV;
+}
+
+// ---------------------------------------------------------------------------
+// Metrics
+// ---------------------------------------------------------------------------
+
+export function computeAuc(preds: number[], labels: number[]): number {
+  const pairs = preds.map((p, i) => ({ p, y: labels[i] }));
+  pairs.sort((a, b) => a.p - b.p);
+  const nPos = labels.reduce((s, y) => s + y, 0);
+  const nNeg = labels.length - nPos;
+  if (nPos === 0 || nNeg === 0) return 0.5;
+  let rankSum = 0;
+  let i = 0;
+  while (i < pairs.length) {
+    let j = i;
+    while (j + 1 < pairs.length && pairs[j + 1].p === pairs[i].p) j++;
+    const avgRank = (i + j) / 2 + 1;
+    for (let k = i; k <= j; k++) if (pairs[k].y === 1) rankSum += avgRank;
+    i = j + 1;
+  }
+  return (rankSum - (nPos * (nPos + 1)) / 2) / (nPos * nNeg);
+}
+
+export function computeBrier(preds: number[], labels: number[]): number {
+  return mean(preds.map((p, i) => (p - labels[i]) * (p - labels[i])));
+}
+
+export function computeLogLoss(preds: number[], labels: number[]): number {
+  return mean(
+    preds.map((p, i) => -(labels[i] * Math.log(clamp(p, EPS, 1)) + (1 - labels[i]) * Math.log(clamp(1 - p, EPS, 1)))),
+  );
+}
+
+function confidenceBins(preds: number[], labels: number[]): CalibrationBin[] {
+  const bins: { sumP: number; sumY: number; count: number }[] = [];
+  for (let b = 0; b < 10; b++) bins.push({ sumP: 0, sumY: 0, count: 0 });
+  for (let i = 0; i < preds.length; i++) {
+    const conf = Math.max(preds[i], 1 - preds[i]);
+    const correct = (preds[i] >= 0.5 ? labels[i] : 1 - labels[i]) === 1 ? 1 : 0;
+    const idx = clamp(Math.floor((conf - 0.5) / 0.05), 0, 9);
+    bins[idx].sumP += conf;
+    bins[idx].sumY += correct;
+    bins[idx].count += 1;
+  }
+  const out: CalibrationBin[] = [];
+  for (let b = 0; b < 10; b++) {
+    if (bins[b].count === 0) continue;
+    const meanPredicted = bins[b].sumP / bins[b].count;
+    const meanActual = bins[b].sumY / bins[b].count;
+    out.push({
+      label: b === 9 ? "95-100%" : `${50 + b * 5}-${55 + b * 5}%`,
+      meanPredicted,
+      meanActual,
+      count: bins[b].count,
+      gap: meanActual - meanPredicted,
+    });
+  }
+  return out;
+}
+
+export function calibrationCurvePoints(preds: number[], labels: number[], minCount = 12): CurvePoint[] {
+  const bins: { sumP: number; sumY: number; count: number }[] = [];
+  for (let b = 0; b < 20; b++) bins.push({ sumP: 0, sumY: 0, count: 0 });
+  for (let i = 0; i < preds.length; i++) {
+    const idx = clamp(Math.floor(preds[i] / 0.05), 0, 19);
+    bins[idx].sumP += preds[i];
+    bins[idx].sumY += labels[i];
+    bins[idx].count += 1;
+  }
+  const out: CurvePoint[] = [];
+  for (let b = 0; b < 20; b++) {
+    if (bins[b].count < minCount) continue;
+    out.push({ x: bins[b].sumP / bins[b].count, y: bins[b].sumY / bins[b].count, n: bins[b].count });
+  }
+  return out;
+}
+
+export function evaluate(preds: number[], labels: number[]): EvalResult {
+  const bins = confidenceBins(preds, labels);
+  const total = preds.length;
+  let ece = 0;
+  for (const b of bins) ece += (b.count / total) * Math.abs(b.gap);
+  const distribution: ConfidencePoint[] = bins.map((b) => ({
+    label: b.label,
+    count: b.count,
+    accuracy: b.meanActual,
+  }));
+  return {
+    auc: computeAuc(preds, labels),
+    brier: computeBrier(preds, labels),
+    logLoss: computeLogLoss(preds, labels),
+    ece,
+    bins,
+    confidenceDistribution: distribution,
+    calibrationCurve: calibrationCurvePoints(preds, labels),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Isotonic calibration (PAV)
+// ---------------------------------------------------------------------------
+
+export function isotonicRegression(xs: number[], ys: number[]): { x: number; y: number }[] {
+  const n = xs.length;
+  const blocks: { xSum: number; ySum: number; count: number }[] = [];
+  for (let i = 0; i < n; i++) {
+    blocks.push({ xSum: xs[i], ySum: ys[i], count: 1 });
+    while (blocks.length > 1) {
+      const a = blocks[blocks.length - 2];
+      const b = blocks[blocks.length - 1];
+      if (a.ySum / a.count <= b.ySum / b.count) break;
+      a.xSum += b.xSum;
+      a.ySum += b.ySum;
+      a.count += b.count;
+      blocks.pop();
+    }
+  }
+  return blocks.map((b) => ({ x: b.xSum / b.count, y: b.ySum / b.count }));
+}
+
+export function applyIsotonic(points: { x: number; y: number }[], p: number): number {
+  if (points.length === 0) return p;
+  if (p <= points[0].x) return points[0].y;
+  if (p >= points[points.length - 1].x) return points[points.length - 1].y;
+  for (let i = 0; i < points.length - 1; i++) {
+    const a = points[i];
+    const b = points[i + 1];
+    if (p >= a.x && p <= b.x) {
+      const t = b.x === a.x ? 0 : (p - a.x) / (b.x - a.x);
+      return a.y + t * (b.y - a.y);
+    }
+  }
+  return p;
+}
+
+// ---------------------------------------------------------------------------
+// Monte Carlo (stochastic component)
+// ---------------------------------------------------------------------------
+
+export function monteCarloAdjust(p: number, sigma: number, trials: number): number {
+  if (sigma <= 0 || trials <= 0) return p;
+  const lp = logit(p);
+  let s0 = 0x12345678;
+  let s1 = 0x9abcdef0;
+  const rand = () => {
+    let x = s0;
+    const y = s1;
+    s0 = y;
+    x ^= x << 13;
+    x ^= x >>> 17;
+    x ^= x << 5;
+    s1 = x;
+    return ((x + y) >>> 0) / 4294967296;
+  };
+  let sum = 0;
+  for (let i = 0; i < trials; i++) {
+    const u1 = Math.max(rand(), 1e-9);
+    const u2 = rand();
+    const z = Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
+    sum += sigmoid(lp + z * sigma);
+  }
+  return sum / trials;
+}
+
+// ---------------------------------------------------------------------------
+// Model pipeline
+// ---------------------------------------------------------------------------
+
+const HFA_GRID = [0, 10, 20, 30, 40, 50, 60];
+
+/**
+ * Apply a trained model to an explicit feature vector (as-of-time for
+ * historical rows, current for upcoming games).
+ */
+export function applyModel(
+  model: TrainedModel,
+  features: FeatureValues,
+  homeElo: number,
+  awayElo: number,
+): Prediction {
+  const shap: ShapContribution[] = [];
+  const logitV = logisticLogit(
+    { featureNames: model.featureNames, weights: model.weights, bias: model.bias, featureStats: model.featureStats },
+    features,
+    shap,
+  );
+  let p = sigmoid(logitV);
+  p = applyIsotonic(model.isotonicPoints, p);
+  if (model.monteCarloEnabled && model.monteCarloSigma > 0) p = monteCarloAdjust(p, model.monteCarloSigma, 800);
+  p = clamp(p, 0.01, 0.99);
+  const baseline = sigmoid(((homeElo + model.eloHfa - awayElo) / 400) * Math.log(10));
+  const edge = p - baseline;
+  return {
+    homeWinProb: p,
+    awayWinProb: 1 - p,
+    pickTeam: p >= 0.5 ? "home" : "away",
+    pickProb: p >= 0.5 ? p : 1 - p,
+    shap: shap.sort((a, b) => Math.abs(b.contribution) - Math.abs(a.contribution)).slice(0, 5),
+    edge,
+    fairHomeOdds: americanOdds(p),
+    fairAwayOdds: americanOdds(1 - p),
+  };
+}
+
+function eloProb(row: FeatureRow, hfa: number): number {
+  return sigmoid(((row.homeElo + hfa - row.awayElo) / 400) * Math.log(10));
+}
+
+export function runModel(completedGames: RawGame[], opts: { season: string; asOfDate: string }): ModelRun {
+  const { rows, teamState } = computeEloAndFeatures(completedGames);
+  const n = rows.length;
+
+  const trainEnd = Math.floor(n * 0.7);
+  const calibEnd = Math.min(n, Math.floor(n * 0.85));
+  const train = rows.slice(0, trainEnd);
+  const calib = rows.slice(trainEnd, calibEnd);
+  const test = rows.slice(calibEnd);
+
+  const calibLabels = calib.map((r) => r.label);
+  const testLabels = test.map((r) => r.label);
+
+  // Feature selection: greedy backward elimination evaluated on the calib set.
+  let selected: FeatureKey[] = [...FEATURE_KEYS];
+  const score = (preds: number[], labels: number[]) => computeBrier(preds, labels) - 0.5 * computeAuc(preds, labels);
+
+  if (calib.length >= 20 && train.length >= 20) {
+    let currentModel = trainLogistic(train, selected);
+    let currentPreds = calib.map((r) => sigmoid(logisticLogit(currentModel, r.features, null)));
+    let currentScore = score(currentPreds, calibLabels);
+    let improved = true;
+    while (improved && selected.length > 2) {
+      improved = false;
+      let bestFeatures = selected;
+      let bestScore = currentScore;
+      for (const drop of selected) {
+        const candidate = selected.filter((f) => f !== drop);
+        const m = trainLogistic(train, candidate);
+        const preds = calib.map((r) => sigmoid(logisticLogit(m, r.features, null)));
+        const s = score(preds, calibLabels);
+        if (s < bestScore) {
+          bestScore = s;
+          bestFeatures = candidate;
+        }
+      }
+      if (bestFeatures.length < selected.length && bestScore < currentScore - 1e-5) {
+        selected = bestFeatures;
+        currentScore = bestScore;
+        currentModel = trainLogistic(train, selected);
+        currentPreds = calib.map((r) => sigmoid(logisticLogit(currentModel, r.features, null)));
+        improved = true;
+      }
+    }
+  }
+
+  const lrModel = trainLogistic(train, selected);
+
+  // Tune Elo home-field advantage on the training set.
+  let eloHfa = 30;
+  if (train.length >= 20) {
+    let bestBrier = Infinity;
+    for (const hfa of HFA_GRID) {
+      const preds = train.map((r) => eloProb(r, hfa));
+      const b = computeBrier(preds, train.map((r) => r.label));
+      if (b < bestBrier) {
+        bestBrier = b;
+        eloHfa = hfa;
+      }
+    }
+  }
+
+  const lrLogits = calib.map((r) => logisticLogit(lrModel, r.features, null));
+  const eloLogits = calib.map((r) => logit(eloProb(r, eloHfa)));
+
+  // Blend weight tuned on the calibrate set.
+  let blendW = 0.5;
+  if (calib.length >= 20) {
+    let bestBrier = Infinity;
+    for (let w = 0; w <= 1.0001; w += 0.05) {
+      const preds = calib.map((_, i) => sigmoid((1 - w) * lrLogits[i] + w * eloLogits[i]));
+      const b = computeBrier(preds, calibLabels);
+      if (b < bestBrier) {
+        bestBrier = b;
+        blendW = w;
+      }
+    }
+  }
+
+  const candPreds: Record<string, number[]> = {
+    "Elo rating": calib.map((r) => eloProb(r, eloHfa)),
+    "Logistic regression": calib.map((r) => sigmoid(logisticLogit(lrModel, r.features, null))),
+    "Blended ensemble": calib.map((_, i) => sigmoid((1 - blendW) * lrLogits[i] + blendW * eloLogits[i])),
+  };
+
+  const candidates: CandidateModel[] = [];
+  let bestName = "Blended ensemble";
+  let bestAuc = -1;
+  let bestBrier = Infinity;
+  const candidateDefs = Object.keys(candPreds);
+  for (const name of candidateDefs) {
+    const p = candPreds[name];
+    const m = evaluate(p, calibLabels);
+    candidates.push({
+      name,
+      auc: m.auc,
+      brier: m.brier,
+      logLoss: m.logLoss,
+      ece: m.ece,
+      selected: false,
+      note: "",
+    });
+    if (m.auc > bestAuc + 0.003 || (Math.abs(m.auc - bestAuc) <= 0.003 && m.brier < bestBrier)) {
+      if (m.auc > bestAuc + 0.003) {
+        bestAuc = m.auc;
+        bestBrier = m.brier;
+        bestName = name;
+      } else if (m.brier < bestBrier) {
+        bestBrier = m.brier;
+        bestName = name;
+      }
+    }
+  }
+  for (const c of candidates) c.selected = c.name === bestName;
+
+  const chosenPreds = candPreds[bestName];
+
+  // Fit isotonic calibration on the calibrate set.
+  const order = chosenPreds.map((p, i) => ({ p, y: calibLabels[i] })).sort((a, b) => a.p - b.p);
+  const isotonicPoints = isotonicRegression(order.map((o) => o.p), order.map((o) => o.y));
+
+  const calibratedCalib = chosenPreds.map((p) => applyIsotonic(isotonicPoints, p));
+
+  // Monte Carlo decision: enable the stochastic component only if it reduces
+  // holdout Brier (risk) meaningfully.
+  const mcGrid = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6];
+  let mcSigma = 0;
+  let mcEnabled = false;
+  let baseBrier = computeBrier(calibratedCalib, calibLabels);
+  let bestMcBrier = baseBrier;
+  for (const s of mcGrid) {
+    const preds = calibratedCalib.map((p) => monteCarloAdjust(p, s, 800));
+    const b = computeBrier(preds, calibLabels);
+    if (b < bestMcBrier - 0.0005) {
+      bestMcBrier = b;
+      mcSigma = s;
+    }
+  }
+  if (mcSigma > 0) mcEnabled = true;
+
+  const monteCarloRationale = mcEnabled
+    ? `Monte Carlo enabled: σ=${mcSigma} reduces calibration-set Brier ${baseBrier.toFixed(4)} → ${bestMcBrier.toFixed(4)} (calibration error shrinks toward the mean).`
+    : `Monte Carlo disabled: no stochastic σ in {0.1..0.6} reduced calibration-set Brier below ${baseBrier.toFixed(4)}. Deterministic point estimates are kept.`;
+
+  const model: TrainedModel = {
+    featureNames: selected,
+    weights: lrModel.weights,
+    bias: lrModel.bias,
+    featureStats: lrModel.featureStats,
+    isotonicPoints,
+    monteCarloSigma: mcSigma,
+    monteCarloEnabled: mcEnabled,
+    eloHfa,
+  };
+
+  const predict = (game: RawGame): Prediction =>
+    applyModel(
+      model,
+      buildFeaturesForGame(game, teamState),
+      teamState.elo[game.home.id] ?? ELO_INIT,
+      teamState.elo[game.away.id] ?? ELO_INIT,
+    );
+
+  // Final unbiased metrics on the test set (as-of-time features only).
+  const testPreds = test.map((r) => applyModel(model, r.features, r.homeElo, r.awayElo).homeWinProb);
+  const testEval = evaluate(testPreds, testLabels);
+
+  // Feature importances (univariate AUC on the full dataset + coefficient).
+  const fullLabels = rows.map((r) => r.label);
+  const featureImportances: FeatureImportance[] = selected.map((f) => {
+    const uni = computeAuc(rows.map((r) => r.features[f]), fullLabels);
+    const idx = lrModel.featureNames.indexOf(f);
+    const w = lrModel.weights[idx];
+    return { feature: f, label: FEATURE_LABELS[f], weight: w, importance: Math.abs(w), univariateAuc: uni };
+  });
+
+  const teamMeta = new Map<number, { name: string; abbrev: string }>();
+  for (const g of completedGames) {
+    if (!teamMeta.has(g.away.id)) teamMeta.set(g.away.id, { name: g.away.name, abbrev: g.away.abbrev });
+    if (!teamMeta.has(g.home.id)) teamMeta.set(g.home.id, { name: g.home.name, abbrev: g.home.abbrev });
+  }
+  const powerRankings: PowerRanking[] = Object.keys(teamState.elo)
+    .map((id) => {
+      const teamId = Number(id);
+      const rec = teamState.records[teamId] ?? { wins: 0, losses: 0 };
+      const meta = teamMeta.get(teamId) ?? { name: `Team ${teamId}`, abbrev: "TBD" };
+      return {
+        teamId,
+        name: meta.name,
+        abbrev: meta.abbrev,
+        elo: teamState.elo[teamId],
+        wins: rec.wins,
+        losses: rec.losses,
+        winPct: rec.wins + rec.losses > 0 ? rec.wins / (rec.wins + rec.losses) : 0,
+        last10WinPct: teamState.form[teamId] ?? 0.5,
+        lastGameDate: teamState.lastGameDate[teamId] ?? "",
+      };
+    })
+    .sort((a, b) => b.elo - a.elo);
+
+  const description =
+    bestName === "Blended ensemble"
+      ? `Ensemble: ${(1 - blendW).toFixed(2)}·logistic + ${blendW.toFixed(2)}·Elo, isotonic-calibrated${mcEnabled ? ", Monte Carlo-smoothed" : ""}.`
+      : `${bestName}, isotonic-calibrated${mcEnabled ? ", Monte Carlo-smoothed" : ""}.`;
+
+  const result: ModelRunResult = {
+    season: opts.season,
+    asOfDate: opts.asOfDate,
+    gamesTrained: n,
+    holdoutCount: test.length,
+    selectedModel: bestName,
+    modelDescription: description,
+    featureNames: selected,
+    weights: lrModel.weights,
+    bias: lrModel.bias,
+    featureStats: lrModel.featureStats,
+    isotonicPoints,
+    eloHfa,
+    monteCarloEnabled: mcEnabled,
+    monteCarloTrials: mcEnabled ? 2000 : 0,
+    monteCarloSigma: mcSigma,
+    monteCarloRationale,
+    auc: testEval.auc,
+    brier: testEval.brier,
+    logLoss: testEval.logLoss,
+    ece: testEval.ece,
+    bins: testEval.bins,
+    confidenceDistribution: testEval.confidenceDistribution,
+    calibrationCurve: testEval.calibrationCurve,
+    featureImportances,
+    candidates,
+    powerRankings,
+  };
+
+  return { result, model, teamState, rows, predict };
+}
+
+export function americanOdds(p: number): number {
+  const q = clamp(p, 0.001, 0.999);
+  return q >= 0.5 ? -Math.round((100 * q) / (1 - q)) : Math.round((100 * (1 - q)) / q);
+}
