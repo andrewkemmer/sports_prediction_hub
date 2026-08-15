@@ -80,6 +80,8 @@ const schema = defineSchema(
       fairAwayOdds: v.optional(v.number()),
       fairHomeOdds: v.optional(v.number()),
       shap: v.optional(v.array(shapContribution)),
+      homeInjuries: v.optional(v.number()),
+      awayInjuries: v.optional(v.number()),
     }).index("by_date", ["date"]),
 
     // Singleton document (key = "current") describing the trained model.

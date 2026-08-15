@@ -47,6 +47,7 @@ export interface FeatureValues {
   winPctDiff: number; // home win% - away win%
   formDiff: number; // home last-10 win% - away last-10 win%
   restDiff: number; // home rest days - away rest days
+  injuryDiff: number; // away injured-list count - home injured-list count (positive favors home)
   homeField: number; // always 1
 }
 
@@ -55,6 +56,7 @@ export const FEATURE_KEYS = [
   "winPctDiff",
   "formDiff",
   "restDiff",
+  "injuryDiff",
   "homeField",
 ] as const;
 
@@ -65,6 +67,7 @@ export const FEATURE_LABELS: Record<FeatureKey, string> = {
   winPctDiff: "Win % edge",
   formDiff: "Recent form (L10)",
   restDiff: "Rest advantage",
+  injuryDiff: "Injury edge (IL)",
   homeField: "Home field",
 };
 
@@ -83,6 +86,7 @@ export interface TeamState {
   form: Record<number, number>; // last-10 win percentage
   lastGameDate: Record<number, string>;
   records: Record<number, { wins: number; losses: number }>;
+  injuries: Record<number, number>; // players currently on the injured list
 }
 
 export interface CalibrationBin {
@@ -133,6 +137,13 @@ export interface PowerRanking {
   winPct: number;
   last10WinPct: number;
   lastGameDate: string;
+  injuries: number;
+}
+
+/** A team's injured-list count captured on a given date. */
+export interface InjurySnapshot {
+  date: string;
+  count: number;
 }
 
 export interface UpsetItem {
@@ -188,4 +199,6 @@ export interface GameDoc {
   fairAwayOdds?: number;
   fairHomeOdds?: number;
   shap?: ShapContribution[];
+  homeInjuries?: number;
+  awayInjuries?: number;
 }

@@ -22,6 +22,7 @@ import {
   FeatureKey,
   FeatureRow,
   FeatureValues,
+  InjurySnapshot,
   PowerRanking,
   RawGame,
   ShapContribution,
@@ -147,10 +148,11 @@ interface MutableState {
   formHistory: Record<number, number[]>;
   lastGameDate: Record<number, string>;
   records: Record<number, { wins: number; losses: number }>;
+  injuries: Record<number, number>;
 }
 
 function newState(): MutableState {
-  return { elo: {}, formHistory: {}, lastGameDate: {}, records: {} };
+  return { elo: {}, formHistory: {}, lastGameDate: {}, records: {}, injuries: {} };
 }
 
 function formOf(state: MutableState, id: number): number {
@@ -180,6 +182,7 @@ function buildFeatures(game: RawGame, state: MutableState): FeatureValues {
     winPctDiff: homeWp - awayWp,
     formDiff: formOf(state, game.home.id) - formOf(state, game.away.id),
     restDiff: clamp(homeRest - awayRest, -4, 4),
+    injuryDiff: (state.injuries[game.away.id] ?? 0) - (state.injuries[game.home.id] ?? 0),
     homeField: 1,
   };
 }
@@ -223,14 +226,38 @@ function updateState(state: MutableState, game: RawGame): void {
   state.lastGameDate[away] = game.date;
 }
 
+/**
+ * Find the injured-list count from the most recent snapshot on or before `date`
+ * (strictly no lookahead). Snapshots are sorted ascending by date.
+ */
+function lookupInjuries(
+  teamId: number,
+  date: string,
+  snapshots?: Map<number, InjurySnapshot[]>,
+): number {
+  if (!snapshots) return 0;
+  const list = snapshots.get(teamId);
+  if (!list || list.length === 0) return 0;
+  let best = 0;
+  for (const s of list) {
+    if (s.date > date) break;
+    best = s.count;
+  }
+  return best;
+}
+
 export function computeEloAndFeatures(
   games: RawGame[],
+  injurySnapshots?: Map<number, InjurySnapshot[]>,
+  latestDate?: string,
 ): { rows: FeatureRow[]; teamState: TeamState } {
   const sorted = [...games].sort((a, b) => (a.gameDate < b.gameDate ? -1 : 1));
   const state = newState();
   const rows: FeatureRow[] = [];
   for (const game of sorted) {
     if (game.winner !== "home" && game.winner !== "away") continue;
+    state.injuries[game.home.id] = lookupInjuries(game.home.id, game.date, injurySnapshots);
+    state.injuries[game.away.id] = lookupInjuries(game.away.id, game.date, injurySnapshots);
     const features = buildFeatures(game, state);
     rows.push({
       game,
@@ -241,11 +268,19 @@ export function computeEloAndFeatures(
     });
     updateState(state, game);
   }
+  // Refresh injury counts to the latest snapshot so upcoming-game predictions
+  // use current roster state rather than the last completed game's snapshot.
+  if (latestDate && injurySnapshots) {
+    for (const id of Object.keys(state.elo)) {
+      state.injuries[Number(id)] = lookupInjuries(Number(id), latestDate, injurySnapshots);
+    }
+  }
   const teamState: TeamState = {
     elo: state.elo,
     form: {},
     lastGameDate: state.lastGameDate,
     records: state.records,
+    injuries: state.injuries,
   };
   for (const id of Object.keys(state.formHistory)) {
     teamState.form[Number(id)] = formOf(state, Number(id));
@@ -260,6 +295,7 @@ export function buildFeaturesForGame(game: RawGame, state: TeamState): FeatureVa
     formHistory: {},
     lastGameDate: state.lastGameDate,
     records: state.records,
+    injuries: state.injuries,
   };
   // Provide form as a synthetic 10-game history so buildFeatures can reuse it.
   for (const id of Object.keys(state.form)) {
@@ -542,8 +578,12 @@ function eloProb(row: FeatureRow, hfa: number): number {
   return sigmoid(((row.homeElo + hfa - row.awayElo) / 400) * Math.log(10));
 }
 
-export function runModel(completedGames: RawGame[], opts: { season: string; asOfDate: string }): ModelRun {
-  const { rows, teamState } = computeEloAndFeatures(completedGames);
+export function runModel(
+  completedGames: RawGame[],
+  opts: { season: string; asOfDate: string },
+  injurySnapshots?: Map<number, InjurySnapshot[]>,
+): ModelRun {
+  const { rows, teamState } = computeEloAndFeatures(completedGames, injurySnapshots, opts.asOfDate);
   const n = rows.length;
 
   const trainEnd = Math.floor(n * 0.7);
@@ -738,6 +778,7 @@ export function runModel(completedGames: RawGame[], opts: { season: string; asOf
         winPct: rec.wins + rec.losses > 0 ? rec.wins / (rec.wins + rec.losses) : 0,
         last10WinPct: teamState.form[teamId] ?? 0.5,
         lastGameDate: teamState.lastGameDate[teamId] ?? "",
+        injuries: teamState.injuries[teamId] ?? 0,
       };
     })
     .sort((a, b) => b.elo - a.elo);

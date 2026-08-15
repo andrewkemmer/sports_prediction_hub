@@ -14,6 +14,7 @@ import { teamMeta } from "./ml/teams";
 import {
   FeatureRow,
   GameDoc,
+  InjurySnapshot,
   PitcherInfo,
   PowerRanking,
   RawGame,
@@ -212,6 +213,79 @@ async function fetchPitcherStats(ids: number[], season: string): Promise<Map<num
 }
 
 // ---------------------------------------------------------------------------
+// Injury data (single consolidated source: MLB Stats API rosters)
+// ---------------------------------------------------------------------------
+
+const INJURY_SNAPSHOT_DAYS = 7;
+
+/** Whether a roster entry's status indicates an injured-list / day-to-day stint. */
+function isInjuredStatus(status: { code?: string; description?: string } | undefined): boolean {
+  if (!status) return false;
+  const code = typeof status.code === "string" ? status.code : "";
+  const description = typeof status.description === "string" ? status.description.toLowerCase() : "";
+  return (
+    /^D/.test(code) ||
+    /^IL/.test(code) ||
+    description.includes("injured") ||
+    description.includes("day-to-day")
+  );
+}
+
+async function fetchInjuryCount(teamId: number, date: string, season: string): Promise<number> {
+  try {
+    const data = await fetchJson(
+      `${MLB_BASE}/api/v1/teams/${teamId}/roster?rosterType=40Man&season=${season}&date=${date}`,
+    );
+    let count = 0;
+    for (const entry of data?.roster ?? []) {
+      if (isInjuredStatus(entry.status)) count += 1;
+    }
+    return count;
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * Weekly per-team injured-list snapshots (plus the final as-of date) so the
+ * injury feature is available historically without lookahead bias.
+ */
+async function fetchInjurySnapshots(
+  teamIds: number[],
+  season: string,
+  startDate: string,
+  endDate: string,
+): Promise<Map<number, InjurySnapshot[]>> {
+  const dates: string[] = [];
+  let cursor = startDate;
+  while (cursor <= endDate) {
+    dates.push(cursor);
+    cursor = addDays(cursor, INJURY_SNAPSHOT_DAYS);
+  }
+  if (dates[dates.length - 1] !== endDate) dates.push(endDate);
+
+  const jobs: { teamId: number; date: string }[] = [];
+  for (const teamId of teamIds) {
+    for (const date of dates) jobs.push({ teamId, date });
+  }
+
+  const results = await mapLimit(jobs, 6, async (job) => ({
+    teamId: job.teamId,
+    date: job.date,
+    count: await fetchInjuryCount(job.teamId, job.date, season),
+  }));
+
+  const out = new Map<number, InjurySnapshot[]>();
+  for (const r of results) {
+    const list = out.get(r.teamId) ?? [];
+    list.push({ date: r.date, count: r.count });
+    out.set(r.teamId, list);
+  }
+  for (const list of out.values()) list.sort((a, b) => (a.date < b.date ? -1 : 1));
+  return out;
+}
+
+// ---------------------------------------------------------------------------
 // Model state reconstruction (for on-demand date predictions)
 // ---------------------------------------------------------------------------
 
@@ -233,13 +307,15 @@ function reconstructTeamState(rankings: PowerRanking[]): TeamState {
   const form: Record<number, number> = {};
   const lastGameDate: Record<number, string> = {};
   const records: Record<number, { wins: number; losses: number }> = {};
+  const injuries: Record<number, number> = {};
   for (const p of rankings) {
     elo[p.teamId] = p.elo;
     form[p.teamId] = p.last10WinPct;
     lastGameDate[p.teamId] = p.lastGameDate;
     records[p.teamId] = { wins: p.wins, losses: p.losses };
+    injuries[p.teamId] = p.injuries;
   }
-  return { elo, form, lastGameDate, records };
+  return { elo, form, lastGameDate, records, injuries };
 }
 
 // ---------------------------------------------------------------------------
@@ -250,6 +326,7 @@ function buildGameDoc(
   game: RawGame,
   pred: { homeWinProb: number; awayWinProb: number; pickTeam: "home" | "away"; pickProb: number; shap: GameDoc["shap"]; edge: number; fairHomeOdds: number; fairAwayOdds: number },
   pitcherStats: Map<number, { era?: number; k9?: number }>,
+  injuries?: { home: number; away: number },
 ): GameDoc {
   const awayPitcher: PitcherInfo | undefined = game.awayPitcher
     ? { ...game.awayPitcher, ...(pitcherStats.get(game.awayPitcher.id) ?? {}) }
@@ -280,6 +357,8 @@ function buildGameDoc(
     fairAwayOdds: pred.fairAwayOdds,
     fairHomeOdds: pred.fairHomeOdds,
     shap: pred.shap,
+    homeInjuries: injuries?.home,
+    awayInjuries: injuries?.away,
   };
   if (game.winner === "home" || game.winner === "away") {
     doc.isCorrect = pred.pickTeam === game.winner;
@@ -317,8 +396,16 @@ export const refreshModel = action({
       );
     }
 
-    // 2. Train, select features/model, calibrate, and decide on Monte Carlo.
-    const run = runModel(completed, { season, asOfDate: today });
+    // 2. Pull as-of-time injured-list snapshots for every team that has played,
+    //    then train, select features/model, calibrate, and decide on Monte Carlo.
+    const teamIds = [...new Set(completed.flatMap((g) => [g.home.id, g.away.id]))];
+    const injurySnapshots = await fetchInjurySnapshots(
+      teamIds,
+      season,
+      `${season}-${SEASON_START_MD}`,
+      today,
+    );
+    const run = runModel(completed, { season, asOfDate: today }, injurySnapshots);
     const { result, model, rows, teamState } = run;
 
     // 3. As-of-time predictions for every completed game (historical results).
@@ -347,7 +434,12 @@ export const refreshModel = action({
     const pitcherStats = await fetchPitcherStats(pitcherIds, season);
     const upcomingDocs: GameDoc[] = upcomingRaw
       .filter((g) => g.winner !== "home" && g.winner !== "away")
-      .map((g) => buildGameDoc(g, predictionFor(g, model, teamState), pitcherStats));
+      .map((g) =>
+        buildGameDoc(g, predictionFor(g, model, teamState), pitcherStats, {
+          home: teamState.injuries[g.home.id] ?? 0,
+          away: teamState.injuries[g.away.id] ?? 0,
+        }),
+      );
 
     // 5. Today's record.
     const todaysRecord = buildTodaysRecord(completedDocs, today);
@@ -433,7 +525,12 @@ export const predictDate = action({
     }
     const pitcherStats = await fetchPitcherStats(pitcherIds, state.season as string);
 
-    const docs = raw.map((g) => buildGameDoc(g, predictionFor(g, model, teamState), pitcherStats));
+    const docs = raw.map((g) =>
+      buildGameDoc(g, predictionFor(g, model, teamState), pitcherStats, {
+        home: teamState.injuries[g.home.id] ?? 0,
+        away: teamState.injuries[g.away.id] ?? 0,
+      }),
+    );
     await ctx.runMutation(internal.mlb.replaceGamesForDate, { date: args.date, games: docs });
     return { games: docs.length };
   },

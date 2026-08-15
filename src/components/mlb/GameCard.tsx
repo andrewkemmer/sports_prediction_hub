@@ -21,6 +21,7 @@ import {
   Check,
   ChevronDown,
   Coins,
+  HeartPulse,
   MapPin,
   Search,
   Trophy,
@@ -191,6 +192,17 @@ function DeepDive({ game }: { game: GameDoc }) {
           </div>
         )}
 
+        {(game.homeInjuries !== undefined || game.awayInjuries !== undefined) && (
+          <div className="flex items-center justify-between rounded-lg border border-border/70 px-3 py-2 text-xs">
+            <span className="flex items-center gap-1.5 text-muted-foreground">
+              <HeartPulse className="size-3.5" /> Players on IL
+            </span>
+            <span className="font-semibold tabular-nums">
+              {game.home.abbrev} {game.homeInjuries ?? 0} · {game.away.abbrev} {game.awayInjuries ?? 0}
+            </span>
+          </div>
+        )}
+
         <div className="rounded-lg border border-border/70 bg-white/[0.02] p-3 text-xs text-muted-foreground">
           <div className="mb-1.5 font-medium text-foreground">Starting pitchers</div>
           <div className="flex items-center justify-between">
@@ -336,6 +348,14 @@ export function GameCard({ game }: { game: GameDoc }) {
         <div className="mt-2.5 flex items-center gap-1.5 px-4 text-[11px] text-muted-foreground">
           <MapPin className="size-3.5" />
           {game.venue}
+        </div>
+      )}
+
+      {(game.homeInjuries !== undefined || game.awayInjuries !== undefined) && (
+        <div className="mt-2 flex items-center gap-1.5 px-4 text-[11px] text-muted-foreground">
+          <HeartPulse className="size-3.5" />
+          On IL: {game.home.abbrev} {game.homeInjuries ?? 0} · {game.away.abbrev}{" "}
+          {game.awayInjuries ?? 0}
         </div>
       )}
 

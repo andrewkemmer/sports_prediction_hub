@@ -25,6 +25,7 @@ export function PowerRankingsTab({ modelState }: { modelState: ModelStateDoc }) 
                 <th className="px-4 py-3 text-right font-medium">Record</th>
                 <th className="px-4 py-3 text-right font-medium">Win %</th>
                 <th className="px-4 py-3 text-right font-medium">Last 10</th>
+                <th className="px-4 py-3 text-right font-medium">IL</th>
                 <th className="px-4 py-3 text-right font-medium">Elo</th>
               </tr>
             </thead>
@@ -49,6 +50,9 @@ export function PowerRankingsTab({ modelState }: { modelState: ModelStateDoc }) 
                     </td>
                     <td className="px-4 py-2.5 text-right tabular-nums text-muted-foreground">
                       {formatPct(r.last10WinPct)}
+                    </td>
+                    <td className="px-4 py-2.5 text-right tabular-nums text-muted-foreground">
+                      {r.injuries > 0 ? r.injuries : "—"}
                     </td>
                     <td className="px-4 py-2.5 text-right font-semibold tabular-nums text-foreground">
                       {Math.round(r.elo)}

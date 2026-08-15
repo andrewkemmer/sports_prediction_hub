@@ -158,8 +158,8 @@ export function ModelMonitorTab({ modelState }: { modelState: ModelStateDoc }) {
       {/* Data source */}
       <Section title="Data Source" icon={<Database className="size-4 text-teal-400" />}>
         <p className="text-sm leading-6 text-muted-foreground">
-          All historical game, score, standings, probable-pitcher, and player statistics come from a
-          single consolidated source — the official MLB Stats API (
+          All historical game, score, standings, probable-pitcher, player statistics, and weekly
+          injured-list rosters come from a single consolidated source — the official MLB Stats API (
           <span className="font-medium text-foreground">statsapi.mlb.com</span>). No secondary data
           sources are used. The model retrains and regenerates predictions on demand whenever you
           click <span className="font-medium text-foreground">Refresh</span>.
