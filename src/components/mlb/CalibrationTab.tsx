@@ -1,7 +1,10 @@
+import { api } from "@/convex/_generated/api";
 import type { CalibrationBin, ModelStateDoc } from "@/lib/mlb-ui-types";
 import { formatDateShort, formatNumber, formatPct, formatTrainedAt } from "@/lib/format";
 import { cn } from "@/lib/utils";
-import { Zap } from "lucide-react";
+import { useQuery } from "convex/react";
+import { Check, X, Zap } from "lucide-react";
+import { useState } from "react";
 import {
   Area,
   Bar,
@@ -16,6 +19,26 @@ import {
   XAxis,
   YAxis,
 } from "recharts";
+
+interface GameResultRow {
+  gamePk: number;
+  date: string;
+  away: { abbrev: string; name: string; score?: number };
+  home: { abbrev: string; name: string; score?: number };
+  winner?: "home" | "away";
+  pickTeam: "home" | "away";
+  pickProb: number;
+  homeWinProb: number;
+  awayWinProb: number;
+  isCorrect?: boolean;
+  isUpset?: boolean;
+}
+
+function shortDate(ymd: string): string {
+  const d = new Date(`${ymd}T00:00:00Z`);
+  if (Number.isNaN(d.getTime())) return ymd;
+  return d.toLocaleDateString("en-US", { month: "short", day: "numeric", timeZone: "UTC" });
+}
 
 const tooltipStyle = {
   backgroundColor: "#161b22",
@@ -61,6 +84,20 @@ export function CalibrationTab({ modelState }: { modelState: ModelStateDoc }) {
   const bins: CalibrationBin[] = modelState.bins ?? [];
   const distribution = modelState.confidenceDistribution ?? [];
   const curve = modelState.calibrationCurve ?? [];
+
+  const results = useQuery(api.mlb.getCompletedGameResults) as GameResultRow[] | undefined;
+  const [visibleCount, setVisibleCount] = useState(25);
+  const [search, setSearch] = useState("");
+
+  const allGames = results ?? [];
+  const q = search.trim().toLowerCase();
+  const filteredGames = q
+    ? allGames.filter((g) =>
+        `${g.away.name} ${g.away.abbrev} ${g.home.name} ${g.home.abbrev}`.toLowerCase().includes(q),
+      )
+    : allGames;
+  const visibleGames = filteredGames.slice(0, visibleCount);
+  const correctCount = allGames.filter((g) => g.isCorrect).length;
 
   return (
     <div className="flex flex-col gap-5">
@@ -273,6 +310,99 @@ export function CalibrationTab({ modelState }: { modelState: ModelStateDoc }) {
             </tbody>
           </table>
         </div>
+      </div>
+
+      {/* Game history: predicted vs actual */}
+      <div className="rounded-2xl border border-border bg-card p-5">
+        <div className="mb-4 flex flex-wrap items-end justify-between gap-3">
+          <div>
+            <h3 className="text-sm font-semibold text-foreground">Game History — Predicted vs Actual</h3>
+            <p className="mt-1 text-xs text-muted-foreground">
+              {formatNumber(allGames.length)} games · {formatNumber(correctCount)} correct picks (
+              {formatPct(allGames.length > 0 ? correctCount / allGames.length : 0, 1)})
+            </p>
+          </div>
+          <input
+            type="text"
+            value={search}
+            onChange={(e) => {
+              setSearch(e.target.value);
+              setVisibleCount(25);
+            }}
+            placeholder="Filter by team…"
+            className="h-9 w-full max-w-xs rounded-lg border border-border bg-background px-3 text-sm text-foreground outline-none placeholder:text-muted-foreground focus:border-ring/50"
+          />
+        </div>
+
+        <div className="overflow-x-auto">
+          <table className="w-full min-w-[640px] text-sm">
+            <thead>
+              <tr className="border-b border-border/70 text-left text-[11px] uppercase tracking-wider text-muted-foreground">
+                <th className="pb-2 pr-4 font-medium">Date</th>
+                <th className="pb-2 pr-4 font-medium">Matchup</th>
+                <th className="pb-2 pr-4 text-right font-medium">Final</th>
+                <th className="pb-2 pr-4 text-right font-medium">Predicted</th>
+                <th className="pb-2 pr-4 text-right font-medium">Actual</th>
+                <th className="pb-2 text-right font-medium">Result</th>
+              </tr>
+            </thead>
+            <tbody>
+              {visibleGames.map((g) => {
+                const pickAbbrev = g.pickTeam === "home" ? g.home.abbrev : g.away.abbrev;
+                const winnerAbbrev = g.winner === "home" ? g.home.abbrev : g.away.abbrev;
+                return (
+                  <tr key={g.gamePk} className="border-b border-border/50 last:border-0">
+                    <td className="whitespace-nowrap py-2 pr-4 text-muted-foreground">{shortDate(g.date)}</td>
+                    <td className="whitespace-nowrap py-2 pr-4">
+                      <span className="font-medium text-foreground">{g.away.abbrev}</span>
+                      <span className="text-muted-foreground"> @ </span>
+                      <span className="font-medium text-foreground">{g.home.abbrev}</span>
+                    </td>
+                    <td className="whitespace-nowrap py-2 pr-4 text-right tabular-nums text-foreground">
+                      {g.away.score ?? "—"} – {g.home.score ?? "—"}
+                    </td>
+                    <td className="whitespace-nowrap py-2 pr-4 text-right tabular-nums text-muted-foreground">
+                      {pickAbbrev} {formatPct(g.pickProb)}
+                    </td>
+                    <td className="whitespace-nowrap py-2 pr-4 text-right tabular-nums text-foreground">
+                      {winnerAbbrev}
+                    </td>
+                    <td className="whitespace-nowrap py-2 text-right">
+                      {g.isCorrect ? (
+                        <span className="inline-flex items-center gap-1 rounded-full bg-emerald-500/15 px-2 py-0.5 text-xs font-semibold text-emerald-300">
+                          <Check className="size-3" /> Correct
+                        </span>
+                      ) : (
+                        <span className="inline-flex items-center gap-1 rounded-full bg-rose-500/15 px-2 py-0.5 text-xs font-semibold text-rose-300">
+                          <X className="size-3" /> Upset
+                        </span>
+                      )}
+                    </td>
+                  </tr>
+                );
+              })}
+              {visibleGames.length === 0 && (
+                <tr>
+                  <td colSpan={6} className="py-8 text-center text-sm text-muted-foreground">
+                    {allGames.length === 0
+                      ? "No completed games yet — click Refresh to train the model."
+                      : "No games match your filter."}
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+
+        {visibleCount < filteredGames.length && (
+          <button
+            type="button"
+            onClick={() => setVisibleCount((c) => c + 50)}
+            className="mt-3 w-full cursor-pointer rounded-lg border border-border/80 bg-white/[0.02] py-2 text-xs font-medium text-blue-400 transition-colors hover:bg-blue-500/10"
+          >
+            Show more ({formatNumber(filteredGames.length - visibleCount)} remaining)
+          </button>
+        )}
       </div>
     </div>
   );

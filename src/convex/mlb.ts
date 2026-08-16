@@ -21,6 +21,30 @@ export const getGamesByDate = query({
       .collect(),
 });
 
+// Slim completed-game results (predicted vs actual) for the calibration dashboard.
+export const getCompletedGameResults = query({
+  args: {},
+  handler: async (ctx) => {
+    const all = await ctx.db.query("games").collect();
+    return all
+      .filter((g) => g.winner === "home" || g.winner === "away")
+      .sort((a, b) => (a.date < b.date ? 1 : -1))
+      .map((g) => ({
+        gamePk: g.gamePk,
+        date: g.date,
+        away: { abbrev: g.away.abbrev, name: g.away.name, score: g.away.score },
+        home: { abbrev: g.home.abbrev, name: g.home.name, score: g.home.score },
+        winner: g.winner,
+        pickTeam: g.pickTeam,
+        pickProb: g.pickProb,
+        homeWinProb: g.homeWinProb,
+        awayWinProb: g.awayWinProb,
+        isCorrect: g.isCorrect,
+        isUpset: g.isUpset,
+      }));
+  },
+});
+
 export const getLatestModelState = internalQuery({
   args: {},
   handler: async (ctx) =>
