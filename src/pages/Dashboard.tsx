@@ -71,6 +71,9 @@ export default function Dashboard() {
   // `done`), so a dead run never pins the UI at 4% forever.
   const progressStale = refreshProgress && !refreshProgress.done && Date.now() - refreshProgress.updatedAt > 3 * 60_000;
   const activeProgress = refreshing || (!!refreshProgress && !refreshProgress.done && !progressStale);
+  // True when a refresh is running on the server even if this page reloaded
+  // mid-flight (the local `refreshing` state resets on remount).
+  const serverRefreshing = !!refreshProgress && !refreshProgress.done && !progressStale;
   const progressForUi: RefreshProgressDoc | null =
     refreshing && (!refreshProgress || refreshProgress.done) ? null : (refreshProgress ?? null);
   const showProgress = activeProgress;
@@ -114,17 +117,27 @@ export default function Dashboard() {
   }, [refreshing, refreshProgress]);
 
   const handleRefresh = async () => {
-    if (refreshing) return;
+    if (refreshing || serverRefreshing) return;
     refreshStartedAt.current = Date.now();
     setRefreshing(true);
     try {
       const res = await refresh({});
-      toast.success("Model refreshed", {
-        description: `Trained on ${res.gamesTrained} games · AUC ${res.auc.toFixed(3)} · Brier ${res.brier.toFixed(3)}`,
-      });
-      // Reset the auto-fetch guard so today's view is live.
-      requestedDates.current.delete(selectedDate);
-      setRefreshing(false);
+      if ((res as { alreadyRunning?: boolean }).alreadyRunning) {
+        // A refresh was already in flight server-side (e.g. after a page
+        // reload); nothing new was started — the banner keeps showing its
+        // live progress.
+        toast.info("Refresh already in progress", {
+          description: "A refresh is running on the server — progress shown above.",
+        });
+        setRefreshing(false);
+      } else {
+        toast.success("Model refreshed", {
+          description: `Trained on ${res.gamesTrained} games · AUC ${res.auc.toFixed(3)} · Brier ${res.brier.toFixed(3)}`,
+        });
+        // Reset the auto-fetch guard so today's view is live.
+        requestedDates.current.delete(selectedDate);
+        setRefreshing(false);
+      }
     } catch (e) {
       // The Convex client throws "Connection lost while action was in flight"
       // when the browser tab is backgrounded or the WebSocket re-establishes
@@ -183,11 +196,11 @@ export default function Dashboard() {
             <button
               type="button"
               onClick={handleRefresh}
-              disabled={refreshing}
+              disabled={refreshing || serverRefreshing}
               className="flex cursor-pointer items-center gap-1.5 rounded-lg border border-border bg-card px-3 py-1.5 text-xs font-medium text-foreground transition-colors hover:border-ring/50 disabled:cursor-not-allowed disabled:opacity-60"
             >
-              <RefreshCw className={cn("size-3.5", refreshing && "animate-spin")} />
-              {refreshing ? "Refreshing…" : "Refresh"}
+              <RefreshCw className={cn("size-3.5", (refreshing || serverRefreshing) && "animate-spin")} />
+              {refreshing || serverRefreshing ? "Refreshing…" : "Refresh"}
             </button>
             <button
               type="button"

@@ -869,12 +869,23 @@ async function fastRefresh(
     for (const [date, rows] of backfillByDate) calibrationRowsByDate.set(date, rows);
   }
   const calibrationDates = [...calibrationRowsByDate.keys()];
-  await mapLimit(calibrationDates, 8, (date) =>
-    ctx.runMutation(internal.mlb.replaceCalibrationForDate, {
+  const backfillStage = needsCalibrationBackfill ? "Backfilling calibration" : "Updating calibration";
+  let calibrationWritten = 0;
+  const calibrationTotal = calibrationDates.length;
+  await mapLimit(calibrationDates, 8, async (date) => {
+    await ctx.runMutation(internal.mlb.replaceCalibrationForDate, {
       date,
       rows: calibrationRowsByDate.get(date)!,
-    }),
-  );
+    });
+    calibrationWritten += 1;
+    if (calibrationWritten % 100 === 0 || calibrationWritten === calibrationTotal) {
+      await report(
+        backfillStage,
+        calibrationTotal > 0 ? 95 + Math.floor((calibrationWritten / calibrationTotal) * 4) : 95,
+        `Writing calibration rows — ${calibrationWritten.toLocaleString()}/${calibrationTotal.toLocaleString()} dates…`,
+      );
+    }
+  });
   const calibrationRows = [...calibrationRowsByDate.values()].flat();
   const calibrationSummary =
     calibrationRows.length > 0 ? buildCalibrationSummary(calibrationRows) : previous.calibrationSummary;
@@ -1418,6 +1429,29 @@ export const refreshModel = action({
     try {
       await report("Loading stored games", 4, "Reading previously stored games…");
       const previousState: any = await ctx.runQuery(internal.mlb.getLatestModelState, {});
+
+      // 0a. CONCURRENCY GUARD: if a refresh is already running server-side
+      //     (e.g., the page reloaded or the client reconnected mid-flight),
+      //     don't start a duplicate one that would re-run the expensive
+      //     calibration backfill. Surface the existing run's stats instead.
+      const inFlight = await ctx.runQuery(api.mlb.getRefreshProgress, {});
+      if (inFlight && !inFlight.done && Date.now() - (inFlight.updatedAt ?? 0) < 15 * 60_000) {
+        return {
+          fast: true,
+          alreadyRunning: true,
+          season,
+          asOfDate: today,
+          gamesTrained: previousState?.gamesTrained ?? 0,
+          holdoutCount: previousState?.holdoutCount ?? 0,
+          auc: previousState?.auc ?? 0,
+          brier: previousState?.brier ?? 0,
+          logLoss: previousState?.logLoss ?? 0,
+          ece: previousState?.ece ?? 0,
+          selectedModel: previousState?.selectedModel ?? "",
+          monteCarloEnabled: previousState?.monteCarloEnabled ?? false,
+          storedGames: 0,
+        };
+      }
 
       // 0. FAST PATH: a trained model already exists, so skip the full reload
       //    + retrain (the multi-minute path) and just refresh the recent
