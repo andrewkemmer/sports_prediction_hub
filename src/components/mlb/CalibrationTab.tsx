@@ -1,6 +1,6 @@
 import { api } from "@/convex/_generated/api";
-import type { CalibrationBin, ModelStateDoc } from "@/lib/mlb-ui-types";
-import { formatDateShort, formatNumber, formatPct, formatTrainedAt } from "@/lib/format";
+import type { CalibrationBin, ConfidencePoint, CurvePoint, ModelStateDoc } from "@/lib/mlb-ui-types";
+import { formatNumber, formatPct, formatTrainedAt } from "@/lib/format";
 import { cn } from "@/lib/utils";
 import { useQuery } from "convex/react";
 import { Check, X, Zap } from "lucide-react";
@@ -28,10 +28,24 @@ interface GameResultRow {
   winner?: "home" | "away";
   pickTeam: "home" | "away";
   pickProb: number;
-  homeWinProb: number;
-  awayWinProb: number;
   isCorrect?: boolean;
   isUpset?: boolean;
+}
+
+interface CalibrationQueryResult {
+  games: GameResultRow[];
+  metrics: {
+    auc: number;
+    brier: number;
+    logLoss: number;
+    ece: number;
+    bins: CalibrationBin[];
+    confidenceDistribution: ConfidencePoint[];
+    calibrationCurve: CurvePoint[];
+  };
+  total: number;
+  correct: number;
+  accuracy: number;
 }
 
 function shortDate(ymd: string): string {
@@ -81,15 +95,29 @@ function gapColor(gap: number): string {
 
 export function CalibrationTab({ modelState }: { modelState: ModelStateDoc }) {
   const record = modelState.todaysRecord;
-  const bins: CalibrationBin[] = modelState.bins ?? [];
-  const distribution = modelState.confidenceDistribution ?? [];
-  const curve = modelState.calibrationCurve ?? [];
-
-  const results = useQuery(api.mlb.getCompletedGameResults) as GameResultRow[] | undefined;
+  const seasonStart = `${modelState.season}-03-15`;
+  const [startDate, setStartDate] = useState(seasonStart);
+  const [endDate, setEndDate] = useState(modelState.asOfDate);
   const [visibleCount, setVisibleCount] = useState(25);
   const [search, setSearch] = useState("");
 
-  const allGames = results ?? [];
+  const results = useQuery(api.mlb.getCalibrationResults, {
+    startDate,
+    endDate,
+  }) as CalibrationQueryResult | undefined;
+
+  const metrics = results?.metrics;
+  const bins: CalibrationBin[] = metrics?.bins ?? [];
+  const distribution = metrics?.confidenceDistribution ?? [];
+  const curve = metrics?.calibrationCurve ?? [];
+  const auc = metrics?.auc ?? modelState.auc;
+  const brier = metrics?.brier ?? modelState.brier;
+  const logLoss = metrics?.logLoss ?? modelState.logLoss;
+  const ece = metrics?.ece ?? modelState.ece;
+
+  const allGames = results?.games ?? [];
+  const totalGames = results?.total ?? allGames.length;
+  const correctCount = results?.correct ?? allGames.filter((g) => g.isCorrect).length;
   const q = search.trim().toLowerCase();
   const filteredGames = q
     ? allGames.filter((g) =>
@@ -97,7 +125,15 @@ export function CalibrationTab({ modelState }: { modelState: ModelStateDoc }) {
       )
     : allGames;
   const visibleGames = filteredGames.slice(0, visibleCount);
-  const correctCount = allGames.filter((g) => g.isCorrect).length;
+
+  const onStartChange = (v: string) => {
+    setStartDate(v);
+    if (v && endDate && v > endDate) setEndDate(v);
+  };
+  const onEndChange = (v: string) => {
+    setEndDate(v);
+    if (v && startDate && v < startDate) setStartDate(v);
+  };
 
   return (
     <div className="flex flex-col gap-5">
@@ -105,12 +141,40 @@ export function CalibrationTab({ modelState }: { modelState: ModelStateDoc }) {
       <div>
         <h2 className="text-xl font-bold tracking-tight">Model Calibration Dashboard</h2>
         <span className="mt-3 inline-block rounded-full border border-border bg-card px-3 py-1 text-xs text-muted-foreground">
-          As of {formatDateShort(modelState.asOfDate)} · n = {formatNumber(modelState.gamesTrained)} games ·
-          Trained {formatTrainedAt(modelState.trainedAt)} ET
+          n = {formatNumber(totalGames)} games in range · Trained {formatTrainedAt(modelState.trainedAt)} ET
         </span>
         <p className="mt-3 text-sm text-muted-foreground">
-          Assessing prediction reliability and accuracy across probability buckets.
+          Assessing prediction reliability and accuracy across probability buckets for the predicted
+          favorite (one side per game).
         </p>
+
+        {/* Date range selector */}
+        <div className="mt-4 flex flex-wrap items-center gap-2 rounded-2xl border border-border bg-card p-3">
+          <span className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+            Range
+          </span>
+          <input
+            type="date"
+            value={startDate}
+            min={seasonStart}
+            max={endDate}
+            onChange={(e) => onStartChange(e.target.value)}
+            className="h-9 cursor-pointer rounded-lg border border-border bg-background px-3 text-sm text-foreground outline-none [color-scheme:dark] focus:border-ring/50"
+          />
+          <span className="text-muted-foreground">→</span>
+          <input
+            type="date"
+            value={endDate}
+            min={startDate}
+            max={modelState.asOfDate}
+            onChange={(e) => onEndChange(e.target.value)}
+            className="h-9 cursor-pointer rounded-lg border border-border bg-background px-3 text-sm text-foreground outline-none [color-scheme:dark] focus:border-ring/50"
+          />
+          <span className="text-xs text-muted-foreground">
+            {formatNumber(totalGames)} completed game{totalGames === 1 ? "" : "s"} ·{" "}
+            {formatPct(results?.accuracy ?? 0, 1)} accuracy
+          </span>
+        </div>
       </div>
 
       {/* Today's record */}
@@ -148,7 +212,7 @@ export function CalibrationTab({ modelState }: { modelState: ModelStateDoc }) {
           <h3 className="text-sm font-semibold text-foreground">Calibration Curve</h3>
           <div className="flex items-center gap-4 text-xs text-muted-foreground">
             <span className="flex items-center gap-1.5">
-              <span className="size-2.5 rounded-sm bg-[#4d7fff]" /> Model (n={formatNumber(modelState.gamesTrained)})
+              <span className="size-2.5 rounded-sm bg-[#4d7fff]" /> Model (n={formatNumber(totalGames)})
             </span>
             <span className="flex items-center gap-1.5">
               <span className="h-0 w-4 border-t border-dashed border-muted-foreground" /> Perfect calibration
@@ -202,14 +266,14 @@ export function CalibrationTab({ modelState }: { modelState: ModelStateDoc }) {
 
       {/* Metric cards */}
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-        <MetricCard label="AUC-ROC" value={modelState.auc} color="#22d3ee" />
-        <MetricCard label="Brier Score" value={modelState.brier} color="#34d399" />
-        <MetricCard label="Log-Loss" value={modelState.logLoss} color="#fcd34d" sub="Penalizes confidence" />
-        <MetricCard label="Cal. Error" value={modelState.ece} color="#e879f9" sub="ECE metric" />
+        <MetricCard label="AUC-ROC" value={auc} color="#22d3ee" />
+        <MetricCard label="Brier Score" value={brier} color="#34d399" />
+        <MetricCard label="Log-Loss" value={logLoss} color="#fcd34d" sub="Penalizes confidence" />
+        <MetricCard label="Cal. Error" value={ece} color="#e879f9" sub="ECE metric" />
       </div>
       <p className="-mt-1 text-xs text-muted-foreground">
-        AUC, Brier, log-loss, and calibration error are computed on a chronologically held-out test
-        set (last 15% of games). Reliability and confidence charts use the full 2026 season.
+        Metrics are computed on the predicted favorite only (probability &gt; 50%), one side per
+        game, over the selected date range.
       </p>
 
       {/* Confidence distribution & accuracy */}
@@ -303,7 +367,7 @@ export function CalibrationTab({ modelState }: { modelState: ModelStateDoc }) {
               {bins.length === 0 && (
                 <tr>
                   <td colSpan={5} className="py-8 text-center text-sm text-muted-foreground">
-                    No binned data yet.
+                    No binned data for this range.
                   </td>
                 </tr>
               )}
@@ -318,8 +382,8 @@ export function CalibrationTab({ modelState }: { modelState: ModelStateDoc }) {
           <div>
             <h3 className="text-sm font-semibold text-foreground">Game History — Predicted vs Actual</h3>
             <p className="mt-1 text-xs text-muted-foreground">
-              {formatNumber(allGames.length)} games · {formatNumber(correctCount)} correct picks (
-              {formatPct(allGames.length > 0 ? correctCount / allGames.length : 0, 1)})
+              {formatNumber(totalGames)} games · {formatNumber(correctCount)} correct picks (
+              {formatPct(totalGames > 0 ? correctCount / totalGames : 0, 1)})
             </p>
           </div>
           <input
@@ -385,7 +449,7 @@ export function CalibrationTab({ modelState }: { modelState: ModelStateDoc }) {
                 <tr>
                   <td colSpan={6} className="py-8 text-center text-sm text-muted-foreground">
                     {allGames.length === 0
-                      ? "No completed games yet — click Refresh to train the model."
+                      ? "No completed games in this range — adjust the dates or click Refresh."
                       : "No games match your filter."}
                   </td>
                 </tr>

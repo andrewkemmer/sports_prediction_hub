@@ -418,8 +418,9 @@ export const refreshModel = action({
     );
 
     // Descriptive reliability / calibration views over the full 2026 season.
-    const fullPreds = completedDocs.map((d) => d.homeWinProb);
-    const fullLabels = completedDocs.map((d) => (d.winner === "home" ? 1 : 0));
+    // Favorite framing: one side per game (predicted probability > 50%) vs. outcome.
+    const fullPreds = completedDocs.map((d) => d.pickProb);
+    const fullLabels = completedDocs.map((d) => (d.isCorrect ? 1 : 0));
     const fullCurve = calibrationCurvePoints(fullPreds, fullLabels, 12);
     const fullEval = evaluate(fullPreds, fullLabels);
 
@@ -465,10 +466,10 @@ export const refreshModel = action({
         monteCarloTrials: result.monteCarloTrials,
         monteCarloSigma: result.monteCarloSigma,
         monteCarloRationale: result.monteCarloRationale,
-        auc: result.auc,
-        brier: result.brier,
-        logLoss: result.logLoss,
-        ece: result.ece,
+        auc: fullEval.auc,
+        brier: fullEval.brier,
+        logLoss: fullEval.logLoss,
+        ece: fullEval.ece,
         bins: fullEval.bins,
         confidenceDistribution: fullEval.confidenceDistribution,
         calibrationCurve: fullCurve.length > 0 ? fullCurve : result.calibrationCurve,

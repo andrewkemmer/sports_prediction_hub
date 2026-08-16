@@ -1,5 +1,6 @@
 import { v } from "convex/values";
 import { internalMutation, internalQuery, query } from "./_generated/server";
+import { calibrationCurvePoints, evaluate } from "./ml/model";
 
 // Latest trained model (singleton key = "current").
 export const getModelState = query({
@@ -21,13 +22,19 @@ export const getGamesByDate = query({
       .collect(),
 });
 
-// Slim completed-game results (predicted vs actual) for the calibration dashboard.
-export const getCompletedGameResults = query({
-  args: {},
-  handler: async (ctx) => {
+// Calibration dashboard data: completed games in a date range plus favorite-framed
+// calibration metrics (one side per game — predicted probability > 50%).
+export const getCalibrationResults = query({
+  args: { startDate: v.string(), endDate: v.string() },
+  handler: async (ctx, args) => {
     const all = await ctx.db.query("games").collect();
-    return all
-      .filter((g) => g.winner === "home" || g.winner === "away")
+    const games = all
+      .filter(
+        (g) =>
+          (g.winner === "home" || g.winner === "away") &&
+          g.date >= args.startDate &&
+          g.date <= args.endDate,
+      )
       .sort((a, b) => (a.date < b.date ? 1 : -1))
       .map((g) => ({
         gamePk: g.gamePk,
@@ -37,11 +44,51 @@ export const getCompletedGameResults = query({
         winner: g.winner,
         pickTeam: g.pickTeam,
         pickProb: g.pickProb,
-        homeWinProb: g.homeWinProb,
-        awayWinProb: g.awayWinProb,
         isCorrect: g.isCorrect,
         isUpset: g.isUpset,
       }));
+
+    const total = games.length;
+    const correct = games.filter((g) => g.isCorrect).length;
+
+    if (total === 0) {
+      return {
+        games,
+        metrics: {
+          auc: 0,
+          brier: 0,
+          logLoss: 0,
+          ece: 0,
+          bins: [],
+          confidenceDistribution: [],
+          calibrationCurve: [],
+        },
+        total: 0,
+        correct: 0,
+        accuracy: 0,
+      };
+    }
+
+    const preds = games.map((g) => g.pickProb);
+    const labels = games.map((g) => (g.isCorrect ? 1 : 0));
+    const evalResult = evaluate(preds, labels);
+    const curve = calibrationCurvePoints(preds, labels, 8);
+
+    return {
+      games,
+      metrics: {
+        auc: evalResult.auc,
+        brier: evalResult.brier,
+        logLoss: evalResult.logLoss,
+        ece: evalResult.ece,
+        bins: evalResult.bins,
+        confidenceDistribution: evalResult.confidenceDistribution,
+        calibrationCurve: curve.length > 0 ? curve : evalResult.calibrationCurve,
+      },
+      total,
+      correct,
+      accuracy: correct / total,
+    };
   },
 });
 
