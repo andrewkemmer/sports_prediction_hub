@@ -35,63 +35,28 @@ export const getGamesPage = internalQuery({
   },
 });
 
-// Completed-game row used by both calibration metrics and the game history table.
-interface CalibrationRow {
-  gamePk: number;
-  date: string;
-  away: { abbrev: string; name: string; score?: number };
-  home: { abbrev: string; name: string; score?: number };
-  winner?: string;
-  pickTeam: string;
-  pickProb: number;
-  isCorrect?: boolean;
-  isUpset?: boolean;
-  predictedTotal?: number;
-  homeRunLineProb?: number;
-  actualTotal?: number;
-  actualMargin?: number;
-}
-
-// Minimal structural view of a stored game doc used for calibration.
-interface CalibrationGame {
-  gamePk: number;
-  date: string;
-  away: { abbrev: string; name: string; score?: number };
-  home: { abbrev: string; name: string; score?: number };
-  winner?: string;
-  pickTeam: string;
-  pickProb: number;
-  isCorrect?: boolean;
-  isUpset?: boolean;
-  runProjection?: { total?: number; homeRunLineProb?: number };
-}
-
-function toCalibrationRow(g: CalibrationGame): CalibrationRow {
-  return {
-    gamePk: g.gamePk,
-    date: g.date,
-    away: { abbrev: g.away.abbrev, name: g.away.name, score: g.away.score },
-    home: { abbrev: g.home.abbrev, name: g.home.name, score: g.home.score },
-    winner: g.winner,
-    pickTeam: g.pickTeam,
-    pickProb: g.pickProb,
-    isCorrect: g.isCorrect,
-    isUpset: g.isUpset,
-    predictedTotal: g.runProjection?.total,
-    homeRunLineProb: g.runProjection?.homeRunLineProb,
-    actualTotal: (g.away.score ?? 0) + (g.home.score ?? 0),
-    actualMargin: (g.home.score ?? 0) - (g.away.score ?? 0),
-  };
-}
-
-// Calibration metrics computed over the selected date range. Uses a single
-// (non-paginated) collection so Convex's single-paginated-query rule is never
-// triggered; only small aggregates are returned to the client.
+// Calibration metrics computed over the selected date range. The default
+// full-range view is served from a precomputed summary stored on the model
+// state; narrower ranges are computed from the lightweight `calibration`
+// projection so full-range reads never approach Convex's transaction limit.
 export const getCalibrationResults = query({
   args: { startDate: v.string(), endDate: v.string() },
   handler: async (ctx, args) => {
+    const state = await ctx.db
+      .query("modelState")
+      .withIndex("by_key", (q) => q.eq("key", "current"))
+      .first();
+    if (
+      state?.calibrationSummary &&
+      args.startDate <= "2022-03-15" &&
+      typeof state.asOfDate === "string" &&
+      args.endDate >= state.asOfDate
+    ) {
+      return state.calibrationSummary;
+    }
+
     const games = await ctx.db
-      .query("games")
+      .query("calibration")
       .withIndex("by_date", (q) => q.gte("date", args.startDate).lte("date", args.endDate))
       .collect();
 
@@ -113,18 +78,19 @@ export const getCalibrationResults = query({
       preds.push(g.pickProb);
       labels.push(g.isCorrect ? 1 : 0);
 
-      const predictedTotal = g.runProjection?.total;
+      const predictedTotal = g.predictedTotal;
       if (typeof predictedTotal === "number") {
         tN += 1;
-        const err = predictedTotal - ((g.away.score ?? 0) + (g.home.score ?? 0));
+        const actual = g.actualTotal ?? (g.away.score ?? 0) + (g.home.score ?? 0);
+        const err = predictedTotal - actual;
         tAbs += Math.abs(err);
         tSq += err * err;
         tBias += err;
       }
 
-      const homeRunLineProb = g.runProjection?.homeRunLineProb;
+      const homeRunLineProb = g.homeRunLineProb;
       if (typeof homeRunLineProb === "number") {
-        const margin = (g.home.score ?? 0) - (g.away.score ?? 0);
+        const margin = g.actualMargin ?? (g.home.score ?? 0) - (g.away.score ?? 0);
         rlPreds.push(homeRunLineProb);
         rlLabels.push(margin >= 2 ? 1 : 0);
       }
@@ -183,7 +149,8 @@ export const getCalibrationResults = query({
   },
 });
 
-// Paginated game history for the calibration table.
+// Paginated game history for the calibration table, served from the
+// lightweight calibration projection.
 export const getCalibrationGames = query({
   args: {
     startDate: v.string(),
@@ -192,20 +159,13 @@ export const getCalibrationGames = query({
     limit: v.optional(v.number()),
   },
   handler: async (ctx, args) => {
-    // Paginate directly on the date index (newest first) so each call reads
-    // only a small page instead of the entire multi-season dataset.
     const limit = Math.max(1, Math.min(args.limit ?? 100, 1000));
     const page = await ctx.db
-      .query("games")
+      .query("calibration")
       .withIndex("by_date", (q) => q.gte("date", args.startDate).lte("date", args.endDate))
       .order("desc")
       .paginate({ numItems: limit, cursor: args.cursor ?? null });
-    const games: CalibrationRow[] = [];
-    for (const g of page.page) {
-      if (g.winner !== "home" && g.winner !== "away") continue;
-      games.push(toCalibrationRow(g));
-    }
-    return { games, cursor: page.continueCursor };
+    return { games: page.page, cursor: page.continueCursor };
   },
 });
 
@@ -243,6 +203,18 @@ export const replaceGamesForDate = internalMutation({
       .collect();
     for (const g of existing) await ctx.db.delete(g._id);
     for (const g of args.games) await ctx.db.insert("games", g);
+  },
+});
+
+export const replaceCalibrationForDate = internalMutation({
+  args: { date: v.string(), rows: v.array(v.any()) },
+  handler: async (ctx, args) => {
+    const existing = await ctx.db
+      .query("calibration")
+      .withIndex("by_date", (q) => q.eq("date", args.date))
+      .collect();
+    for (const r of existing) await ctx.db.delete(r._id);
+    for (const r of args.rows) await ctx.db.insert("calibration", r);
   },
 });
 

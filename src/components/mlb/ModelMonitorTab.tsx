@@ -68,6 +68,30 @@ const FEATURE_META: Record<string, { category: string; description: string }> = 
     category: "Starting Pitcher",
     description: "Season ERA differential between the two projected starting pitchers.",
   },
+  opsDiff: {
+    category: "Hitting",
+    description: "Season-to-date team OPS edge — a consolidated measure of on-base and slugging production for the projected lineups.",
+  },
+  teamEraDiff: {
+    category: "Pitching Staff",
+    description: "Season-to-date team ERA edge, capturing rotation and bullpen run prevention beyond the two starters.",
+  },
+  defEffDiff: {
+    category: "Defense",
+    description: "Season fielding-percentage edge (defensive-efficiency proxy) between the two clubs.",
+  },
+  parkFactor: {
+    category: "Ballpark",
+    description: "Home ballpark run factor — values above 1 favor hitters and inflate expected totals.",
+  },
+  tempDev: {
+    category: "Weather",
+    description: "Game-time temperature deviation from 72°F, a proxy for air density and carry.",
+  },
+  windMph: {
+    category: "Weather",
+    description: "Game-time wind speed in mph, affecting fly-ball carry and scoring environment.",
+  },
 };
 
 function shortDate(ymd: string): string {
@@ -587,7 +611,14 @@ function PfiPanel({ modelState }: { modelState: ModelStateDoc }) {
 
 function EnsemblePanel({ modelState }: { modelState: ModelStateDoc }) {
   const candidates = modelState.candidates ?? [];
-  const steps = ["8 Features", "5 Candidate Models", "Stacked Ensemble", "Isotonic Calibration", "Monte Carlo", "Win Probability"];
+  const steps = [
+    `${modelState.featureImportances?.length ?? modelState.featureNames.length} Features`,
+    "5 Candidate Models",
+    "Stacked Ensemble",
+    "Isotonic Calibration",
+    "Monte Carlo",
+    "Win Probability",
+  ];
   return (
     <div className="flex flex-col gap-4">
       {/* Architecture flow */}

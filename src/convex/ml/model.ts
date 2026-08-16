@@ -1008,10 +1008,18 @@ function eloProb(row: FeatureRow, hfa: number): number {
  * e.g. an underdog being shown to score more runs than the favorite.
  */
 function fitRunMarginCalibration(rows: FeatureRow[], model: TrainedModel): RunMarginCalibration {
+  const lr = {
+    featureNames: model.featureNames,
+    weights: model.weights,
+    bias: model.bias,
+    featureStats: model.featureStats,
+  };
   const xs: number[] = [];
   const ys: number[] = [];
   for (const r of rows) {
-    const p = applyModel(model, r.features, r.homeElo, r.awayElo).homeWinProb;
+    // Use the deterministic point estimate (logistic + isotonic), not the
+    // Monte Carlo-smoothed value, so the margin mapping is stable and fast.
+    const p = applyIsotonic(model.isotonicPoints, sigmoid(logisticLogit(lr, r.features, null)));
     const margin = (r.game.home.score ?? 0) - (r.game.away.score ?? 0);
     xs.push(logit(p));
     ys.push(margin);

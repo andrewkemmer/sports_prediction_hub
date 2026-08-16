@@ -1,6 +1,7 @@
 // UI-facing types for the model state and game documents.
 import type {
   CalibrationBin,
+  CalibrationSummary,
   CandidateModel,
   ConfidencePoint,
   CrossValidationResult,
@@ -77,6 +78,9 @@ export interface ModelStateDoc {
   optimizationParams?: OptimizationParams;
   runModel?: RunModel;
   runLineCalibration?: { x: number; y: number }[];
+  runMarginCalibration?: { slope: number; intercept: number };
+  teamSeasonStats?: Record<string, { ops?: number; era?: number; fieldingPct?: number }>;
+  calibrationSummary?: CalibrationSummary;
   spearmanRho?: number;
   topDecileWinRate?: number;
   todaysRecord: TodaysRecord;

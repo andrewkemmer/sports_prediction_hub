@@ -8,13 +8,17 @@ import {
   applyModel,
   buildFeaturesForGame,
   calibrationCurvePoints,
+  computeAuc,
+  computeBrier,
   evaluate,
+  logit,
   runModel,
   spearmanRank,
 } from "./ml/model";
-import { RunModel, simulateRuns } from "./ml/runs";
+import { expectedMargin, RunModel, simulateRuns } from "./ml/runs";
 import { teamMeta } from "./ml/teams";
 import {
+  CalibrationSummary,
   FeatureRow,
   GameDoc,
   GameWeather,
@@ -23,6 +27,7 @@ import {
   PitcherInfo,
   PowerRanking,
   RawGame,
+  RunMarginCalibration,
   RunProjection,
   TeamState,
   TodaysRecord,
@@ -304,6 +309,66 @@ function attachPitcherStats(
 }
 
 // ---------------------------------------------------------------------------
+// Team season stats (OPS / ERA / fielding%) — statsapi-only features
+// ---------------------------------------------------------------------------
+
+interface TeamSeasonStats {
+  ops?: number;
+  era?: number;
+  fieldingPct?: number;
+}
+
+async function fetchTeamSeasonStats(
+  pairs: { id: number; season: string }[],
+): Promise<Map<string, TeamSeasonStats>> {
+  const out = new Map<string, TeamSeasonStats>();
+  const seen = new Set<string>();
+  const unique = pairs.filter((p) => {
+    const key = `${p.id}|${p.season}`;
+    if (p.id <= 0 || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+  await mapLimit(unique, 16, async (p) => {
+    try {
+      const data = await fetchJson(
+        `${MLB_BASE}/api/v1/teams/${p.id}/stats?stats=season&group=hitting,pitching,fielding&season=${p.season}`,
+      );
+      const stats = (data?.stats ?? []) as any[];
+      const result: TeamSeasonStats = {};
+      for (const block of stats) {
+        const group = block?.group?.displayName;
+        const stat = block?.splits?.[0]?.stat;
+        if (!stat) continue;
+        if (group === "hitting") result.ops = statNumber(stat.ops);
+        else if (group === "pitching") result.era = statNumber(stat.era);
+        else if (group === "fielding") result.fieldingPct = statNumber(stat.fielding);
+      }
+      if (Object.keys(result).length > 0) out.set(`${p.id}|${p.season}`, result);
+    } catch {
+      // ignore individual team stat failures
+    }
+  });
+  return out;
+}
+
+/** Attach season team OPS / ERA / fielding% to each game's two teams. */
+function attachTeamSeasonStats(
+  games: RawGame[],
+  stats: Record<string, TeamSeasonStats>,
+): RawGame[] {
+  return games.map((g) => {
+    const homeStats = stats[`${g.home.id}|${g.season}`];
+    const awayStats = stats[`${g.away.id}|${g.season}`];
+    return {
+      ...g,
+      home: { ...g.home, ...(homeStats ?? {}) },
+      away: { ...g.away, ...(awayStats ?? {}) },
+    };
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Market odds (The Odds API) — optional, reads THE_ODDS_API_KEY
 // ---------------------------------------------------------------------------
 
@@ -392,6 +457,25 @@ function marketOddsForGame(odds: Map<string, MarketOdds>, game: RawGame): Market
 // Run projections (predicted scores, totals, run lines)
 // ---------------------------------------------------------------------------
 
+/**
+ * Shift the two Poisson means (total preserved) so the run-scoring model's
+ * expected margin matches the win-probability model. This prevents an
+ * underdog being shown to score more runs than the favorite.
+ */
+function marginShiftForGame(
+  runModel: RunModel,
+  cal: RunMarginCalibration,
+  homeId: number,
+  awayId: number,
+  homeWinProb: number,
+): number {
+  if (!cal || (cal.slope === 0 && cal.intercept === 0)) return 0;
+  const baseMargin = expectedMargin(runModel, homeId, awayId);
+  const p = Math.min(0.99, Math.max(0.01, homeWinProb));
+  const targetMargin = cal.intercept + cal.slope * logit(p);
+  return (targetMargin - baseMargin) / 2;
+}
+
 function buildRunProjection(
   runModel: RunModel,
   runLineIso: { x: number; y: number }[],
@@ -399,11 +483,14 @@ function buildRunProjection(
   marketTotal?: number,
   marketRunLine?: number,
   trials = RUN_SIM_TRIALS,
+  homeWinProb = 0.5,
+  runMarginCal: RunMarginCalibration = { slope: 0, intercept: 0 },
 ): RunProjection {
   const runLine = marketRunLine ?? 1.5;
-  const first = simulateRuns(runModel, game.home.id, game.away.id, 0, trials, runLine);
+  const marginShift = marginShiftForGame(runModel, runMarginCal, game.home.id, game.away.id, homeWinProb);
+  const first = simulateRuns(runModel, game.home.id, game.away.id, 0, trials, runLine, marginShift);
   const line = marketTotal ?? first.total;
-  const sim = line === 0 ? first : simulateRuns(runModel, game.home.id, game.away.id, line, trials, runLine);
+  const sim = line === 0 ? first : simulateRuns(runModel, game.home.id, game.away.id, line, trials, runLine, marginShift);
   // Isotonic calibration is fit on the ±1.5 run line; other lines use raw MC.
   const homeRL =
     runLineIso.length > 0 && runLine === 1.5
@@ -631,12 +718,101 @@ async function loadStoredGames(ctx: any): Promise<RawGame[]> {
   return all;
 }
 
+/** Precomputed full-range calibration metrics stored on the model state. */
+function buildCalibrationSummary(completedDocs: GameDoc[]): CalibrationSummary {
+  const preds = completedDocs.map((d) => d.pickProb);
+  const labels = completedDocs.map((d) => (d.isCorrect ? 1 : 0));
+  const evalResult = evaluate(preds, labels);
+  const curve = calibrationCurvePoints(preds, labels, 8);
+  const metrics = {
+    auc: evalResult.auc,
+    brier: evalResult.brier,
+    logLoss: evalResult.logLoss,
+    ece: evalResult.ece,
+    bins: evalResult.bins,
+    confidenceDistribution: evalResult.confidenceDistribution,
+    calibrationCurve: curve.length > 0 ? curve : evalResult.calibrationCurve,
+  };
+
+  let tN = 0;
+  let tAbs = 0;
+  let tSq = 0;
+  let tBias = 0;
+  const rlPreds: number[] = [];
+  const rlLabels: number[] = [];
+  for (const d of completedDocs) {
+    const predictedTotal = d.runProjection?.total;
+    if (typeof predictedTotal === "number") {
+      const actual = (d.away.score ?? 0) + (d.home.score ?? 0);
+      tN += 1;
+      const err = predictedTotal - actual;
+      tAbs += Math.abs(err);
+      tSq += err * err;
+      tBias += err;
+    }
+    const homeRunLineProb = d.runProjection?.homeRunLineProb;
+    if (typeof homeRunLineProb === "number") {
+      const margin = (d.home.score ?? 0) - (d.away.score ?? 0);
+      rlPreds.push(homeRunLineProb);
+      rlLabels.push(margin >= 2 ? 1 : 0);
+    }
+  }
+
+  const totalsMetrics = {
+    n: tN,
+    mae: tN > 0 ? tAbs / tN : 0,
+    rmse: tN > 0 ? Math.sqrt(tSq / tN) : 0,
+    bias: tN > 0 ? tBias / tN : 0,
+  };
+  let runLineMetrics = { n: rlPreds.length, auc: 0, brier: 0, accuracy: 0 };
+  if (rlPreds.length > 0) {
+    runLineMetrics = {
+      n: rlPreds.length,
+      auc: computeAuc(rlPreds, rlLabels),
+      brier: computeBrier(rlPreds, rlLabels),
+      accuracy:
+        rlPreds.filter((p, i) => (p >= 0.5 ? 1 : 0) === rlLabels[i]).length / rlPreds.length,
+    };
+  }
+
+  const total = completedDocs.length;
+  const correct = completedDocs.filter((d) => d.isCorrect).length;
+  return {
+    metrics,
+    totalsMetrics,
+    runLineMetrics,
+    total,
+    correct,
+    accuracy: total > 0 ? correct / total : 0,
+  };
+}
+
+/** Lightweight projection (1/10th of a game doc) for calibration queries. */
+function calibrationRowFromDoc(d: GameDoc) {
+  return {
+    gamePk: d.gamePk,
+    date: d.date,
+    away: { abbrev: d.away.abbrev, name: d.away.name, score: d.away.score },
+    home: { abbrev: d.home.abbrev, name: d.home.name, score: d.home.score },
+    winner: d.winner,
+    pickTeam: d.pickTeam,
+    pickProb: d.pickProb,
+    isCorrect: d.isCorrect,
+    isUpset: d.isUpset,
+    predictedTotal: d.runProjection?.total,
+    homeRunLineProb: d.runProjection?.homeRunLineProb,
+    actualTotal: (d.away.score ?? 0) + (d.home.score ?? 0),
+    actualMargin: (d.home.score ?? 0) - (d.away.score ?? 0),
+  };
+}
+
 export const refreshModel = action({
   args: {},
   handler: async (ctx) => {
     const now = new Date();
     const season = String(now.getFullYear());
     const today = etDateString(now);
+    const previousState = await ctx.runQuery(internal.mlb.getLatestModelState, {});
 
     // 1. Reuse previously stored games so complete seasons are not re-fetched
     //    from the external API on every refresh (this was the ~5-minute cost).
@@ -679,7 +855,29 @@ export const refreshModel = action({
       if (g.homePitcher) pitcherPairs.push({ id: g.homePitcher.id, season: s });
     }
     const pitcherStats = await fetchPitcherStats(pitcherPairs);
-    const enriched = attachPitcherStats(allRaw, pitcherStats);
+
+    // 5. Fetch season team OPS / ERA / fielding% (statsapi-only features).
+    //    Past seasons are reused from the previously stored model state, so a
+    //    normal refresh only refreshes the current season (~30 requests).
+    const previousTeamStats = (previousState?.teamSeasonStats ?? {}) as Record<string, TeamSeasonStats>;
+    const teamSeasonPairs = new Map<string, { id: number; season: string }>();
+    for (const g of allRaw) {
+      const s = g.season ?? season;
+      const hk = `${g.home.id}|${s}`;
+      const ak = `${g.away.id}|${s}`;
+      if (!teamSeasonPairs.has(hk)) teamSeasonPairs.set(hk, { id: g.home.id, season: s });
+      if (!teamSeasonPairs.has(ak)) teamSeasonPairs.set(ak, { id: g.away.id, season: s });
+    }
+    const teamStatsToFetch = [...teamSeasonPairs.values()].filter((p) => {
+      const key = `${p.id}|${p.season}`;
+      return p.season === season || previousTeamStats[key] === undefined;
+    });
+    const freshTeamStats = await fetchTeamSeasonStats(teamStatsToFetch);
+    const teamSeasonStats: Record<string, TeamSeasonStats> = {
+      ...previousTeamStats,
+      ...Object.fromEntries(freshTeamStats),
+    };
+    const enriched = attachTeamSeasonStats(attachPitcherStats(allRaw, pitcherStats), teamSeasonStats);
     const completedEnriched = enriched.filter(
       (g) => g.winner === "home" || g.winner === "away",
     );
@@ -697,21 +895,23 @@ export const refreshModel = action({
     const { result, model, rows, teamState } = run;
     const runModelState = result.runModel;
     const runLineIso = result.runLineCalibration ?? [];
+    const runMarginCal = result.runMarginCalibration ?? { slope: 0, intercept: 0 };
 
     // Market odds (best-effort; empty map when THE_ODDS_API_KEY is unset).
     const marketOdds = await fetchMarketOdds();
 
     // 3. As-of-time predictions for every completed game (historical results),
     //    plus run-scoring projections for the totals / run-line views.
-    const completedDocs: GameDoc[] = rows.map((row: FeatureRow) =>
-      buildGameDoc(
+    const completedDocs: GameDoc[] = rows.map((row: FeatureRow) => {
+      const pred = applyModel(model, row.features, row.homeElo, row.awayElo);
+      return buildGameDoc(
         row.game,
-        applyModel(model, row.features, row.homeElo, row.awayElo),
+        pred,
         pitcherStats,
         undefined,
-        buildRunProjection(runModelState, runLineIso, row.game, undefined, undefined, RUN_CALIB_TRIALS),
-      ),
-    );
+        buildRunProjection(runModelState, runLineIso, row.game, undefined, undefined, RUN_CALIB_TRIALS, pred.homeWinProb, runMarginCal),
+      );
+    });
 
     // Descriptive reliability / calibration views over the full 2022–2026 dataset.
     // Favorite framing: one side per game (predicted probability > 50%) vs. outcome.
@@ -722,6 +922,8 @@ export const refreshModel = action({
     const spearmanRho = spearmanRank(fullPreds, fullLabels);
     const highConf = completedDocs.filter((d) => d.pickProb >= 0.65);
     const topDecileWinRate = highConf.length > 0 ? highConf.filter((d) => d.isCorrect).length / highConf.length : 0;
+    const calibrationSummary = buildCalibrationSummary(completedDocs);
+    const calibrationRows = completedDocs.map(calibrationRowFromDoc);
 
     // 4. Build fresh docs only for the recent/upcoming window so we never
     //    rewrite thousands of unchanged historical dates on refresh.
@@ -733,24 +935,26 @@ export const refreshModel = action({
       if (g.winner === "home" || g.winner === "away") {
         const row = rowsByPk.get(g.gamePk);
         if (!row) continue;
+        const pred = applyModel(model, row.features, row.homeElo, row.awayElo);
         freshDocs.push(
           buildGameDoc(
             g,
-            applyModel(model, row.features, row.homeElo, row.awayElo),
+            pred,
             pitcherStats,
             undefined,
-            buildRunProjection(runModelState, runLineIso, g, undefined, undefined, RUN_CALIB_TRIALS),
+            buildRunProjection(runModelState, runLineIso, g, undefined, undefined, RUN_CALIB_TRIALS, pred.homeWinProb, runMarginCal),
           ),
         );
       } else {
         const odds = marketOddsForGame(marketOdds, g);
+        const pred = predictionFor(g, model, teamState);
         freshDocs.push(
           buildGameDoc(
             g,
-            predictionFor(g, model, teamState),
+            pred,
             pitcherStats,
             { home: teamState.injuries[g.home.id] ?? 0, away: teamState.injuries[g.away.id] ?? 0 },
-            buildRunProjection(runModelState, runLineIso, g, odds?.total, odds?.runLine, RUN_SIM_TRIALS),
+            buildRunProjection(runModelState, runLineIso, g, odds?.total, odds?.runLine, RUN_SIM_TRIALS, pred.homeWinProb, runMarginCal),
             odds,
           ),
         );
@@ -800,6 +1004,9 @@ export const refreshModel = action({
         optimizationParams: result.optimizationParams,
         runModel: result.runModel,
         runLineCalibration: result.runLineCalibration,
+        runMarginCalibration: runMarginCal,
+        teamSeasonStats,
+        calibrationSummary,
         spearmanRho,
         topDecileWinRate,
         todaysRecord,
@@ -815,6 +1022,24 @@ export const refreshModel = action({
     }
     await mapLimit([...byDate.keys()], 8, (date) =>
       ctx.runMutation(internal.mlb.replaceGamesForDate, { date, games: byDate.get(date)! }),
+    );
+
+    // 8. Store the lightweight calibration projection. On the first run after
+    //    this feature ships (or a cold start) backfill every completed date;
+    //    afterward only the fresh window is rewritten.
+    const needsCalibrationBackfill = !previousState?.calibrationSummary;
+    const calibrationDates = needsCalibrationBackfill
+      ? new Set(calibrationRows.map((r) => r.date))
+      : freshDates;
+    const calibrationByDate = new Map<string, ReturnType<typeof calibrationRowFromDoc>[]>();
+    for (const row of calibrationRows) {
+      if (!calibrationDates.has(row.date)) continue;
+      const list = calibrationByDate.get(row.date) ?? [];
+      list.push(row);
+      calibrationByDate.set(row.date, list);
+    }
+    await mapLimit([...calibrationByDate.keys()], 8, (date) =>
+      ctx.runMutation(internal.mlb.replaceCalibrationForDate, { date, rows: calibrationByDate.get(date)! }),
     );
 
     return {
@@ -844,6 +1069,7 @@ export const predictDate = action({
     const teamState = reconstructTeamState(state.powerRankings as PowerRanking[]);
     const runModelState = state.runModel as RunModel | undefined;
     const runLineIso = (state.runLineCalibration ?? []) as { x: number; y: number }[];
+    const runMarginCal = (state.runMarginCalibration ?? { slope: 0, intercept: 0 }) as RunMarginCalibration;
     const season = state.season as string;
 
     const raw = await fetchScheduleRange(args.date, args.date);
@@ -854,18 +1080,39 @@ export const predictDate = action({
       if (g.homePitcher) pitcherPairs.push({ id: g.homePitcher.id, season: s });
     }
     const pitcherStats = await fetchPitcherStats(pitcherPairs);
-    const enriched = attachPitcherStats(raw, pitcherStats);
+
+    // Team season stats are cached on the model state; refresh only any current
+    // season team that is still missing before predicting a date.
+    const storedTeamStats = (state.teamSeasonStats ?? {}) as Record<string, TeamSeasonStats>;
+    const teamPairs = new Map<string, { id: number; season: string }>();
+    for (const g of raw) {
+      const s = g.season ?? season;
+      for (const id of [g.home.id, g.away.id]) {
+        const key = `${id}|${s}`;
+        if (!teamPairs.has(key)) teamPairs.set(key, { id, season: s });
+      }
+    }
+    const missingTeamStats = [...teamPairs.values()].filter(
+      (p) => storedTeamStats[`${p.id}|${p.season}`] === undefined,
+    );
+    const freshTeamStats = await fetchTeamSeasonStats(missingTeamStats);
+    const teamSeasonStats: Record<string, TeamSeasonStats> = {
+      ...storedTeamStats,
+      ...Object.fromEntries(freshTeamStats),
+    };
+    const enriched = attachTeamSeasonStats(attachPitcherStats(raw, pitcherStats), teamSeasonStats);
 
     const marketOdds = await fetchMarketOdds();
 
     const docs = enriched.map((g) => {
       const odds = marketOddsForGame(marketOdds, g);
+      const pred = predictionFor(g, model, teamState);
       return buildGameDoc(
         g,
-        predictionFor(g, model, teamState),
+        pred,
         pitcherStats,
         { home: teamState.injuries[g.home.id] ?? 0, away: teamState.injuries[g.away.id] ?? 0 },
-        runModelState ? buildRunProjection(runModelState, runLineIso, g, odds?.total, odds?.runLine, RUN_SIM_TRIALS) : undefined,
+        runModelState ? buildRunProjection(runModelState, runLineIso, g, odds?.total, odds?.runLine, RUN_SIM_TRIALS, pred.homeWinProb, runMarginCal) : undefined,
         odds,
       );
     });
