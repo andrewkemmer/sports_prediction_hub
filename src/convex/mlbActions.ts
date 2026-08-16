@@ -770,6 +770,7 @@ async function fastRefresh(
   await report("Saving", 92, "Persisting refreshed predictions…");
   const datesToWrite = [...new Set(enrichedWithLineups.map((g) => g.date))];
   const newlyCompleted: GameDoc[] = [];
+  const calibrationRowsByDate = new Map<string, CalibrationRow[]>();
   await mapLimit(datesToWrite, 8, async (date) => {
     const existingDocs = (await ctx.runQuery(api.mlb.getGamesByDate, { date })) as GameDoc[];
     const existingByPk = new Map<number, GameDoc>(existingDocs.map((d) => [d.gamePk, d]));
@@ -809,6 +810,12 @@ async function fastRefresh(
     }
 
     await ctx.runMutation(internal.mlb.replaceGamesForDate, { date, games: merged });
+
+    // Keep the compact calibration projection in sync for this date.
+    const completedMerged = merged.filter((d) => d.winner === "home" || d.winner === "away");
+    if (completedMerged.length > 0) {
+      calibrationRowsByDate.set(date, completedMerged.map(calibrationRowFromDoc));
+    }
   });
 
   // Today's record from the stored (now completed) games for today.
@@ -818,6 +825,43 @@ async function fastRefresh(
     completedToday.length > 0 || newlyCompleted.length === 0
       ? buildTodaysRecord(completedToday, today)
       : previous.todaysRecord;
+
+  // Calibration projection: rewrite the fresh window's compact rows every
+  // refresh. DBs that predate the calibration feature have no rows and no
+  // summary, so the first refresh after this ships does a one-time full
+  // backfill from stored game docs (bounded pages) — after that, only the
+  // fresh window is rewritten and reads short-circuit on the summary.
+  const needsCalibrationBackfill =
+    !previous.calibrationSummary || (previous.calibrationSummary?.total ?? 0) === 0;
+  await report(
+    needsCalibrationBackfill ? "Backfilling calibration" : "Updating calibration",
+    94,
+    needsCalibrationBackfill
+      ? "Building calibration history from stored games…"
+      : "Writing calibration rows for the fresh window…",
+  );
+  if (needsCalibrationBackfill) {
+    const storedDocs = await loadStoredDocs(ctx, "2022-03-15", today);
+    const backfillByDate = new Map<string, CalibrationRow[]>();
+    for (const d of storedDocs) {
+      if (d.winner !== "home" && d.winner !== "away") continue;
+      if (typeof d.pickProb !== "number") continue;
+      const list = backfillByDate.get(d.date) ?? [];
+      list.push(calibrationRowFromDoc(d));
+      backfillByDate.set(d.date, list);
+    }
+    for (const [date, rows] of backfillByDate) calibrationRowsByDate.set(date, rows);
+  }
+  const calibrationDates = [...calibrationRowsByDate.keys()];
+  await mapLimit(calibrationDates, 8, (date) =>
+    ctx.runMutation(internal.mlb.replaceCalibrationForDate, {
+      date,
+      rows: calibrationRowsByDate.get(date)!,
+    }),
+  );
+  const calibrationRows = [...calibrationRowsByDate.values()].flat();
+  const calibrationSummary =
+    calibrationRows.length > 0 ? buildCalibrationSummary(calibrationRows) : previous.calibrationSummary;
 
   // Compute refreshed powerRankings, preserving everything the model didn't change.
   const newPowerRankings: PowerRanking[] = (
@@ -844,6 +888,7 @@ async function fastRefresh(
       powerRankings: newPowerRankings,
       teamSeasonStats,
       playerOps: playerOpsCache,
+      calibrationSummary,
       todaysRecord,
     },
   });
@@ -1162,6 +1207,45 @@ async function loadStoredGames(ctx: any, startDate: string, endDate: string): Pr
     cursor = page.cursor;
   } while (cursor);
   return all;
+}
+
+/**
+ * Load stored game DOCUMENTS for a date range in bounded pages, keeping the
+ * prediction fields (pickProb / isCorrect / runProjection) intact. Used for
+ * the one-time calibration backfill.
+ */
+async function loadStoredDocs(ctx: any, startDate: string, endDate: string): Promise<GameDoc[]> {
+  const all: GameDoc[] = [];
+  let cursor: string | null = null;
+  do {
+    const page: { games: GameDoc[]; cursor: string | null } = await ctx.runQuery(
+      internal.mlb.getGamesByDateRange,
+      { startDate, endDate, cursor, limit: 300 },
+    );
+    all.push(...page.games);
+    cursor = page.cursor;
+  } while (cursor);
+  return all;
+}
+
+/** Map a stored game document to the compact calibration projection row. */
+function calibrationRowFromDoc(d: GameDoc): CalibrationRow {
+  return {
+    gamePk: d.gamePk,
+    date: d.date,
+    away: { abbrev: d.away.abbrev, name: d.away.name, score: d.away.score },
+    home: { abbrev: d.home.abbrev, name: d.home.name, score: d.home.score },
+    winner: d.winner,
+    pickTeam: d.pickTeam,
+    pickProb: d.pickProb,
+    homeWinProb: d.homeWinProb,
+    isCorrect: d.isCorrect,
+    isUpset: d.isUpset,
+    predictedTotal: d.runProjection?.total,
+    homeRunLineProb: d.runProjection?.homeRunLineProb,
+    actualTotal: (d.away.score ?? 0) + (d.home.score ?? 0),
+    actualMargin: (d.home.score ?? 0) - (d.away.score ?? 0),
+  };
 }
 
 /** Precomputed full-range calibration metrics stored on the model state. */

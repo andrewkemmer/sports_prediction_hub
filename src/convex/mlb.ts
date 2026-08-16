@@ -57,6 +57,7 @@ export const getCalibrationResults = query({
       .first();
     if (
       state?.calibrationSummary &&
+      (state.calibrationSummary as { total?: number }).total !== 0 &&
       args.startDate <= "2022-03-15" &&
       typeof state.asOfDate === "string" &&
       args.endDate >= state.asOfDate
