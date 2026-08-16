@@ -124,6 +124,31 @@ async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promis
   return results;
 }
 
+/**
+ * Best-effort refresh-progress writer. It must never throw: an unhandled
+ * rejection from a failed progress write would surface as `Uncaught
+ * unhandledRejection` and kill the whole refresh action.
+ */
+function progressReporter(ctx: any) {
+  return async (
+    stage: string,
+    pct: number,
+    message: string,
+    extra: { done?: boolean; error?: string } = {},
+  ) => {
+    try {
+      await ctx.runMutation(internal.mlb.setRefreshProgress, {
+        stage,
+        pct,
+        message,
+        ...extra,
+      });
+    } catch {
+      // ignore — progress is informational
+    }
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Schedule parsing
 // ---------------------------------------------------------------------------
@@ -827,59 +852,14 @@ async function fastRefresh(
       : previous.todaysRecord;
 
   // Calibration projection: rewrite the fresh window's compact rows every
-  // refresh. DBs that predate the calibration feature have no rows and no
-  // summary, so the first refresh after this ships does a one-time full
-  // backfill from stored game docs (bounded pages) — after that, only the
-  // fresh window is rewritten and reads short-circuit on the summary.
-  const needsCalibrationBackfill =
-    !previous.calibrationSummary || (previous.calibrationSummary?.total ?? 0) === 0;
-  await report(
-    needsCalibrationBackfill ? "Backfilling calibration" : "Updating calibration",
-    94,
-    needsCalibrationBackfill
-      ? "Building calibration history from stored games…"
-      : "Writing calibration rows for the fresh window…",
-  );
-  if (needsCalibrationBackfill) {
-    // Compact paginated read of the games table — only the calibration fields
-    // are returned (~1/20th the size of a full game doc), so the multi-season
-    // backfill is fast and each query stays far below response limits.
-    const backfillByDate = new Map<string, CalibrationRow[]>();
-    let cursor: string | null = null;
-    let backfillScanned = 0;
-    do {
-      const page: { games: CalibrationRow[]; cursor: string | null } = await ctx.runQuery(
-        internal.mlb.getCalibrationProjection,
-        { startDate: "2022-03-15", endDate: today, cursor, limit: 500 },
-      );
-      for (const r of page.games) {
-        if (r.winner !== "home" && r.winner !== "away") continue;
-        if (typeof r.pickProb !== "number") continue;
-        const list = backfillByDate.get(r.date) ?? [];
-        list.push(r);
-        backfillByDate.set(r.date, list);
-      }
-      cursor = page.cursor;
-      backfillScanned += page.games.length;
-      // Keep the progress bar visibly moving while the history loads.
-      void report(
-        "Backfilling calibration",
-        94,
-        `Building calibration history — ${backfillScanned.toLocaleString()} games scanned…`,
-      );
-    } while (cursor);
-    for (const [date, rows] of backfillByDate) calibrationRowsByDate.set(date, rows);
-    await report(
-      "Backfilling calibration",
-      95,
-      `Writing calibration rows for ${backfillByDate.size.toLocaleString()} dates…`,
-    );
-  }
+  // refresh. The one-time full-history backfill is NOT done here — it runs as
+  // a separate scheduled action (backfillCalibration) so this action stays
+  // well inside Convex's 10-minute Node action limit.
+  await report("Updating calibration", 94, "Writing calibration rows for the fresh window…");
   const calibrationDates = [...calibrationRowsByDate.keys()];
-  const backfillStage = needsCalibrationBackfill ? "Backfilling calibration" : "Updating calibration";
   const calibrationTotal = calibrationDates.length;
-  // Batch ~40 dates per mutation so the one-time backfill (~700 dates) is
-  // ~18 mutations instead of ~700 action→mutation round trips.
+  // Batch ~40 dates per mutation so the fresh window's rows are a single
+  // mutation instead of dozens of action→mutation round trips.
   const dateGroups: { date: string; rows: CalibrationRow[] }[][] = [];
   for (let i = 0; i < calibrationTotal; i += 40) {
     const group: { date: string; rows: CalibrationRow[] }[] = [];
@@ -893,14 +873,13 @@ async function fastRefresh(
     await ctx.runMutation(internal.mlb.bulkReplaceCalibration, { groups: group });
     calibrationWritten += group.length;
     await report(
-      backfillStage,
+      "Updating calibration",
       calibrationTotal > 0 ? 95 + Math.floor((calibrationWritten / calibrationTotal) * 4) : 95,
       `Writing calibration rows — ${calibrationWritten.toLocaleString()}/${calibrationTotal.toLocaleString()} dates…`,
     );
   });
-  const calibrationRows = [...calibrationRowsByDate.values()].flat();
-  const calibrationSummary =
-    calibrationRows.length > 0 ? buildCalibrationSummary(calibrationRows) : previous.calibrationSummary;
+  // The full-history summary is maintained by the scheduled backfill action.
+  const calibrationSummary = previous.calibrationSummary;
 
   // Compute refreshed powerRankings, preserving everything the model didn't change.
   const newPowerRankings: PowerRanking[] = (
@@ -1396,23 +1375,7 @@ export const refreshModel = action({
     // Progress reporting is best-effort: it must never abort the refresh
     // itself (e.g. on an OCC conflict from a second writer on the shared
     // refreshProgress doc). Swallow write failures and keep going.
-    const report = async (
-      stage: string,
-      pct: number,
-      message: string,
-      extra: { done?: boolean; error?: string } = {},
-    ) => {
-      try {
-        await ctx.runMutation(internal.mlb.setRefreshProgress, {
-          stage,
-          pct,
-          message,
-          ...extra,
-        });
-      } catch {
-        // ignore — progress is informational
-      }
-    };
+    const report = progressReporter(ctx);
 
     const now = new Date();
     const season = String(now.getFullYear());
@@ -1453,6 +1416,18 @@ export const refreshModel = action({
       //    stay frozen as of the last retrain.
       if (previousState) {
         await fastRefresh(ctx, previousState, season, today, report);
+        // One-time calibration-history backfill runs as its own SCHEDULED
+        // action after the refresh returns. Inline, it scans the whole games
+        // table and pushed this action past Convex's 10-minute Node action
+        // timeout — the reason refreshes kept dying with the bar frozen at
+        // "Backfilling calibration 94%". The scheduled action gets its own
+        // execution budget and reports its own progress.
+        const needsBackfill =
+          !previousState.calibrationSummary ||
+          (previousState.calibrationSummary?.total ?? 0) === 0;
+        if (needsBackfill) {
+          await ctx.scheduler.runAfter(0, internal.backfill.backfillCalibration, {});
+        }
         return {
           fast: true,
           season,

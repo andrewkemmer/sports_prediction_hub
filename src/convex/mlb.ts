@@ -313,6 +313,22 @@ export const replaceModelState = internalMutation({
   },
 });
 
+// Patch only the calibration summary onto the model state. Used by the
+// dedicated backfill action so it doesn't have to rewrite the whole (large)
+// model-state doc just to add the summary.
+export const setCalibrationSummary = internalMutation({
+  args: { summary: v.any() },
+  handler: async (ctx, args) => {
+    const existing = await ctx.db
+      .query("modelState")
+      .withIndex("by_key", (q) => q.eq("key", "current"))
+      .first();
+    if (existing) {
+      await ctx.db.patch(existing._id, { calibrationSummary: args.summary });
+    }
+  },
+});
+
 export const replaceGamesForDate = internalMutation({
   args: { date: v.string(), games: v.array(v.any()) },
   handler: async (ctx, args) => {

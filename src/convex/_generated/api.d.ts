@@ -10,6 +10,7 @@
 
 import type * as auth from "../auth.js";
 import type * as auth_emailOtp from "../auth/emailOtp.js";
+import type * as backfill from "../backfill.js";
 import type * as http from "../http.js";
 import type * as ml_model from "../ml/model.js";
 import type * as ml_runs from "../ml/runs.js";
@@ -28,6 +29,7 @@ import type {
 declare const fullApi: ApiFromModules<{
   auth: typeof auth;
   "auth/emailOtp": typeof auth_emailOtp;
+  backfill: typeof backfill;
   http: typeof http;
   "ml/model": typeof ml_model;
   "ml/runs": typeof ml_runs;
