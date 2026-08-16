@@ -103,6 +103,12 @@ function dateRanges(start: string, end: string, chunkDays: number): { start: str
   return ranges;
 }
 
+/** True if `g.date` falls within the last N days of `today`. */
+function isWithinRecentWindow(g: RawGame, today: string, days: number): boolean {
+  const start = addDays(today, -days);
+  return g.date >= start && g.date <= today;
+}
+
 async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
   const results: R[] = new Array(items.length);
   let idx = 0;
@@ -210,15 +216,22 @@ async function fetchSeason(season: string, throughDate: string): Promise<RawGame
   return [...seen.values()].sort((a, b) => (a.gameDate < b.gameDate ? -1 : 1));
 }
 
-/** Fetch the full training window: 2022–2025 full seasons + 2026 through today. */
-async function fetchAllSeasons(currentSeason: string, throughDate: string): Promise<RawGame[]> {
-  const seasons = [...TRAIN_SEASONS, currentSeason];
+/** Fetch every training season's schedule window in parallel. */
+async function fetchAllSeasons(
+  seasons: string[],
+  currentSeason: string,
+  throughDate: string,
+  onProgress?: (done: number, total: number) => void,
+): Promise<RawGame[]> {
   const all: RawGame[] = [];
-  for (const s of seasons) {
+  let completed = 0;
+  await mapLimit(seasons, Math.min(3, seasons.length), async (s) => {
     const end = s === currentSeason ? throughDate : `${s}-${PAST_SEASON_END_MD}`;
     const games = await fetchSeason(s, end);
     all.push(...games);
-  }
+    completed += 1;
+    if (onProgress) onProgress(completed, seasons.length);
+  });
   return all.sort((a, b) => (a.gameDate < b.gameDate ? -1 : 1));
 }
 
@@ -867,18 +880,43 @@ export const refreshModel = action({
       );
 
       // 2. Fetch only the recent window + upcoming games. On a cold start (empty
-      //    database) fall back to the full 2022–2026 fetch exactly once.
+      //    database) fall back to the full 2024–2026 fetch exactly once.
       const hasFullHistory = storedCompleted.length >= 2000;
+      const coldStartSeasons = ["2024", "2025"];
+      const coldStartList = [...coldStartSeasons, season];
       await report(
         "Fetching schedule",
         14,
         hasFullHistory
           ? "Fetching recent results & upcoming games…"
-          : "First run: fetching 2022–2026 game history…",
+          : `First run: fetching ${coldStartList.join("–")} game history…`,
       );
-      const freshRaw = hasFullHistory
-        ? await fetchScheduleRange(addDays(today, -RECENT_WINDOW_DAYS), addDays(today, UPCOMING_WINDOW_DAYS))
-        : await fetchAllSeasons(season, today);
+
+      const stageTicker = (stageLabel: string, total: number, startPct: number, endPct: number) =>
+        (completed: number) => {
+          const c = Math.min(completed, total);
+          void ctx.runMutation(internal.mlb.setRefreshProgress, {
+            stage: `${stageLabel} ${c}/${total}`,
+            pct: startPct + Math.floor((c / total) * (endPct - startPct)),
+            message: `Loading ${stageLabel.toLowerCase()} (${c}/${total})…`,
+          });
+        };
+
+      let freshRaw: RawGame[];
+      if (hasFullHistory) {
+        freshRaw = await fetchScheduleRange(
+          addDays(today, -RECENT_WINDOW_DAYS),
+          addDays(today, UPCOMING_WINDOW_DAYS),
+        );
+      } else {
+        await report(
+          `Fetching seasons 1/${coldStartList.length}`,
+          18,
+          `Loading first season of ${coldStartList.length}…`,
+        );
+        const seasonTicker = stageTicker("Fetching seasons", coldStartList.length, 18, 28);
+        freshRaw = await fetchAllSeasons(coldStartList, season, today, seasonTicker);
+      }
 
       // 3. Merge fresh API data over stored data (fresh wins by gamePk).
       const byPk = new Map<number, RawGame>();
@@ -898,27 +936,50 @@ export const refreshModel = action({
 
       // 4. Fetch pitcher stats only for games whose starters still lack them
       //    (stored games already carry their ERA / K9 / FIP). On a cold start we
-      //    limit this to the current + previous season so the first refresh stays
-      //    fast; older seasons rely on the team pitching/ERA features instead.
+      //    pull stats for the current-season starters only — older-season pitcher
+      //    deltas are folded into the team pitching/ERA feature instead.
       await report("Fetching pitcher stats", 28, "Loading starting-pitcher ERA / FIP…");
       const statsSeasons = new Set([season, String(Number(season) - 1)]);
-      const needsStats = allRaw.filter(
-        (g) =>
-          statsSeasons.has(g.season ?? season) &&
-          ((g.awayPitcher && typeof g.awayPitcher.era !== "number") ||
-            (g.homePitcher && typeof g.homePitcher.era !== "number")),
-      );
+      const needsStats = allRaw
+        .filter(
+          (g) =>
+            statsSeasons.has(g.season ?? season) &&
+            ((g.awayPitcher && typeof g.awayPitcher.era !== "number") ||
+              (g.homePitcher && typeof g.homePitcher.era !== "number")),
+        )
+        .filter((g) => hasFullHistory || g.season === season || isWithinRecentWindow(g, today, 30));
       const pitcherPairs: { id: number; season: string }[] = [];
+      const seenPitcher = new Set<string>();
       for (const g of needsStats) {
         const s = g.season ?? season;
-        if (g.awayPitcher) pitcherPairs.push({ id: g.awayPitcher.id, season: s });
-        if (g.homePitcher) pitcherPairs.push({ id: g.homePitcher.id, season: s });
+        if (g.awayPitcher) {
+          const k = `${g.awayPitcher.id}|${s}`;
+          if (!seenPitcher.has(k)) {
+            seenPitcher.add(k);
+            pitcherPairs.push({ id: g.awayPitcher.id, season: s });
+          }
+        }
+        if (g.homePitcher) {
+          const k = `${g.homePitcher.id}|${s}`;
+          if (!seenPitcher.has(k)) {
+            seenPitcher.add(k);
+            pitcherPairs.push({ id: g.homePitcher.id, season: s });
+          }
+        }
       }
       const pitcherStats = await fetchPitcherStats(pitcherPairs);
+      await report(
+        "Pitcher stats loaded",
+        34,
+        `Loaded ${pitcherStats.size} pitcher seasons.`,
+      );
 
       // 5. Fetch season team OPS / ERA / fielding% (statsapi-only features).
       //    Past seasons are reused from the previously stored model state, so a
-      //    normal refresh only refreshes the current season (~30 requests).
+      //    normal refresh only refreshes the current season (~30 requests). On
+      //    a cold start we still need current-season + the previous year only;
+      //    the deeper history is folded into the team pitching/ERA feature by
+      //    the run model.
       await report("Fetching team stats", 40, "Loading team OPS / ERA / fielding…");
       const previousTeamStats = (previousState?.teamSeasonStats ?? {}) as Record<string, TeamSeasonStats>;
       const teamSeasonPairs = new Map<string, { id: number; season: string }>();
@@ -931,13 +992,21 @@ export const refreshModel = action({
       }
       const teamStatsToFetch = [...teamSeasonPairs.values()].filter((p) => {
         const key = `${p.id}|${p.season}`;
-        return p.season === season || previousTeamStats[key] === undefined;
+        if (hasFullHistory) return p.season === season || previousTeamStats[key] === undefined;
+        // Cold start — only current + previous season; historic team deltas aren't
+        // useful features this late into the model anyway.
+        return key.endsWith(`|${season}`) || key.endsWith(`|${String(Number(season) - 1)}`);
       });
       const freshTeamStats = await fetchTeamSeasonStats(teamStatsToFetch);
       const teamSeasonStats: Record<string, TeamSeasonStats> = {
         ...previousTeamStats,
         ...Object.fromEntries(freshTeamStats),
       };
+      await report(
+        "Team stats loaded",
+        44,
+        `Loaded ${freshTeamStats.size} team-season stat blocks.`,
+      );
       const enriched = attachTeamSeasonStats(attachPitcherStats(allRaw, pitcherStats), teamSeasonStats);
       const completedEnriched = enriched.filter(
         (g) => g.winner === "home" || g.winner === "away",
@@ -945,19 +1014,24 @@ export const refreshModel = action({
 
       // 6. Pull as-of-time injured-list snapshots for every team that has played,
       //    then train, select features/model, calibrate, and decide on Monte Carlo.
-      await report("Fetching injury data", 50, "Loading injured-list snapshots…");
+      //    On a cold start we skip this: the injury feature benefits from a multi-
+      //    month history, and saving the bulk fetch here is what was leaving the
+      //    action hanging past 5 minutes before the user reconnected.
+      await report("Fetching injury data", 50, hasFullHistory ? "Loading injured-list snapshots…" : "Skipping injury history on first run");
       const teamIds = [...new Set(completed.flatMap((g) => [g.home.id, g.away.id]))];
       const previousInjurySnapshots =
         previousState?.season === season
           ? ((previousState.injurySnapshots ?? {}) as Record<string, InjurySnapshot[]>)
           : {};
-      const injurySnapshots = await fetchInjurySnapshots(
-        teamIds,
-        season,
-        `${season}-${SEASON_START_MD}`,
-        today,
-        previousInjurySnapshots,
-      );
+      const injurySnapshots = hasFullHistory
+        ? await fetchInjurySnapshots(
+            teamIds,
+            season,
+            `${season}-${SEASON_START_MD}`,
+            today,
+            previousInjurySnapshots,
+          )
+        : new Map<number, InjurySnapshot[]>();
 
       await report("Training model", 64, "Fitting models & selecting features…");
       const run = runModel(completedEnriched, { season, asOfDate: today }, injurySnapshots);

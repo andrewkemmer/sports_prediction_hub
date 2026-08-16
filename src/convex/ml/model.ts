@@ -1109,13 +1109,19 @@ export function runModel(
 
   if (calib.length >= 20 && train.length >= 20) {
     // Use a quick IRLS pass for candidate screening; the final model below is
-    // refit with more iterations.
+    // refit with more iterations. The backward pass is capped to keep on-demand
+    // refreshes inside Convex's per-action time budget when the feature pool
+    // and calib set are large.
     let currentModel = trainLogistic(train, selected, { iterations: 10 });
     let currentPreds = calib.map((r) => sigmoid(logisticLogit(currentModel, r.features, null)));
     let currentScore = score(currentPreds, calibLabels);
     let improved = true;
-    while (improved && selected.length > 2) {
+    let stagnationRounds = 0;
+    const MAX_BE_ROUNDS = Math.max(4, Math.min(8, selected.length - 2));
+    let rounds = 0;
+    while (improved && selected.length > 2 && rounds < MAX_BE_ROUNDS) {
       improved = false;
+      rounds += 1;
       let bestFeatures = selected;
       let bestScore = currentScore;
       for (const drop of selected) {
@@ -1133,7 +1139,11 @@ export function runModel(
         currentScore = bestScore;
         currentModel = trainLogistic(train, selected, { iterations: 10 });
         currentPreds = calib.map((r) => sigmoid(logisticLogit(currentModel, r.features, null)));
+        stagnationRounds = 0;
         improved = true;
+      } else {
+        stagnationRounds += 1;
+        if (stagnationRounds >= 2) break;
       }
     }
   }
@@ -1171,7 +1181,12 @@ export function runModel(
     }
   }
 
-  const knn = knnModel(train, selected);
+  // kNN is O(train × calib × d) per evaluation — far too slow at 7k+ train
+  // rows during a refresh. Subsample to the 1,500 most-recent training rows,
+  // which still preserves the as-of-time recency signal the model cares about.
+  const KNN_TRAIN_CAP = 1500;
+  const knnTrain = train.length > KNN_TRAIN_CAP ? train.slice(train.length - KNN_TRAIN_CAP) : train;
+  const knn = knnModel(knnTrain, selected);
   const nb = naiveBayesModel(train, selected);
 
   const candPreds: Record<string, number[]> = {
@@ -1229,8 +1244,9 @@ export function runModel(
   const calibratedCalib = chosenPreds.map((p) => applyIsotonic(isotonicPoints, p));
 
   // Monte Carlo decision: enable the stochastic component only if it reduces
-  // holdout Brier (risk) meaningfully.
-  const mcGrid = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6];
+  // holdout Brier (risk) meaningfully. The Gauss-Hermite quadrature is O(1)
+  // per probability, so this is cheap even at the full calibrate-set size.
+  const mcGrid = [0.15, 0.3, 0.45];
   let mcSigma = 0;
   let mcEnabled = false;
   let baseBrier = computeBrier(calibratedCalib, calibLabels);
@@ -1308,12 +1324,14 @@ export function runModel(
 
   // Run-scoring model: predicted scores, totals, and run lines. Fitted on all
   // completed games (a season-talent model) and isotonic-calibrated on the
-  // first 85% so run-line probabilities minimize risk (Brier).
+  // first 85% so run-line probabilities minimize risk (Brier). 200 trials is
+  // plenty for the rank-only isotonic fit; the heavy 10,000-trial simul only
+  // fires later for the upcoming games surfaced in the UI.
   const runModel = fitRunModel(completedGames);
   const rlRaw: number[] = [];
   const rlOutcomes: number[] = [];
   for (const r of rows.slice(0, calibEnd)) {
-    const sim = simulateRuns(runModel, r.game.home.id, r.game.away.id, 0, 500);
+    const sim = simulateRuns(runModel, r.game.home.id, r.game.away.id, 0, 200);
     const margin = (r.game.home.score ?? 0) - (r.game.away.score ?? 0);
     rlRaw.push(sim.homeRunLineProb);
     rlOutcomes.push(margin >= 2 ? 1 : 0);

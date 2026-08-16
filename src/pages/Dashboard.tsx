@@ -63,13 +63,21 @@ export default function Dashboard() {
 
   // The refresh action reports its stage through the `refreshProgress` doc so
   // the UI can render a real progress bar instead of an indeterminate spinner.
+  // An in-flight refresh whose WebSocket dropped still has progress, so we keep
+  // showing the latest stage until either it marks itself `done` or the action
+  // is too old to trust.
   const activeProgress =
     refreshProgress &&
     !refreshProgress.done &&
-    Date.now() - refreshProgress.updatedAt < 10 * 60_000;
+    Date.now() - refreshProgress.updatedAt < 15 * 60_000;
   const progressForUi: RefreshProgressDoc | null =
     refreshing && (!refreshProgress || refreshProgress.done) ? null : (refreshProgress ?? null);
   const showProgress = refreshing || !!activeProgress;
+  // Show a stale-but-failed progress banner so the user can see the prior
+  // refresh's failure reason after a dropped WebSocket reconnect.
+  const lastFailedProgress =
+    refreshProgress && refreshProgress.done && refreshProgress.error && Date.now() - refreshProgress.updatedAt < 30 * 60_000;
+  const lastFailedMessage = refreshProgress?.error ?? null;
 
   // On-demand predictions for a date that has no stored games yet.
   useEffect(() => {
@@ -100,11 +108,23 @@ export default function Dashboard() {
       // Reset the auto-fetch guard so today's view is live.
       requestedDates.current.delete(selectedDate);
     } catch (e) {
-      toast.error("Refresh failed", {
-        description: e instanceof Error ? e.message : "Unknown error",
-      });
-    } finally {
-      setRefreshing(false);
+      // The Convex client throws "Connection lost while action was in flight"
+      // when the browser tab is backgrounded or the WebSocket re-establishes
+      // mid-flight. The action itself runs to completion on the server and
+      // writes its progress + result there, so don't surface a hard "failure"
+      // to the user in that case — keep the live progress bar visible.
+      const message = e instanceof Error ? e.message : "Unknown error";
+      const lostConnection = /connection lost|connection.*closed|client.*closed/i.test(message);
+      if (!lostConnection) {
+        toast.error("Refresh failed", { description: message });
+        setRefreshing(false);
+      } else {
+        toast.info("Refresh still running on the server", {
+          description: "The browser dropped its connection, but the action is still executing. Progress will resume when it completes.",
+        });
+        // Don't clear `refreshing` — the progress bar stays visible until the
+        // server action finishes and updates `refreshProgress.done`.
+      }
     }
   };
 
@@ -166,6 +186,12 @@ export default function Dashboard() {
       {/* Content */}
       <div className="mx-auto w-full max-w-7xl px-4 py-6 sm:px-6">
         {showProgress && <RefreshProgressBar progress={progressForUi} />}
+        {lastFailedProgress && lastFailedMessage && (
+          <div className="mb-4 rounded-xl border border-rose-500/40 bg-rose-500/5 p-3 text-sm text-rose-700 dark:text-rose-300">
+            <span className="font-semibold">Last refresh failed: </span>
+            {lastFailedMessage}
+          </div>
+        )}
         {!modelState ? (
           <EmptyState refreshing={refreshing} onRefresh={handleRefresh} />
         ) : (
