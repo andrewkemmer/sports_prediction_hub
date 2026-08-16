@@ -151,6 +151,7 @@ const schema = defineSchema(
       runLineCalibration: v.optional(v.any()),
       runMarginCalibration: v.optional(v.any()),
       teamSeasonStats: v.optional(v.any()),
+      injurySnapshots: v.optional(v.any()),
       calibrationSummary: v.optional(v.any()),
       todaysRecord: v.any(),
     }).index("by_key", ["key"]),

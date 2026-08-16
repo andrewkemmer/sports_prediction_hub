@@ -274,7 +274,7 @@ function OptimizationParamsPanel({ modelState }: { modelState: ModelStateDoc }) 
   const rows: { label: string; value: string }[] = [
     { label: "Feature selection", value: params.featureSelection },
     { label: "Regularization", value: `L2 λ = ${params.l2Lambda}` },
-    { label: "Optimizer", value: `Batch gradient descent · lr ${params.learningRate} · ${params.epochs} epochs` },
+    { label: "Optimizer", value: `Newton–Raphson (IRLS) · ${params.epochs} iterations` },
     { label: "Home-field grid", value: params.hfaGrid.join(", ") },
     { label: "Stacking blend step", value: `${params.blendStep}` },
     { label: "Monte Carlo σ grid", value: params.mcSigmaGrid.join(", ") },
@@ -430,8 +430,8 @@ function AutoMlPanel({ modelState }: { modelState: ModelStateDoc }) {
             </h3>
             <p className="mt-2 max-w-3xl text-sm leading-6 text-muted-foreground">
               Machine Learning algorithms automatically assess feature predictive signal (via
-              ElasticNet/LASSO L1 regularization and Permutation Importance) and solve for optimal
-              ensemble weights using constrained quadratic optimization to maximize out-of-sample AUC
+              L2-regularized logistic regression with greedy backward elimination) and solve for optimal
+              ensemble weights by minimizing calibration-set Brier loss to maximize out-of-sample AUC
               (&gt; 0.60) while enforcing monotonic probability calibration.
             </p>
           </div>
@@ -520,9 +520,9 @@ function AutoMlPanel({ modelState }: { modelState: ModelStateDoc }) {
                 How Machine Learning Decided Feature Inclusion &amp; Weights:
               </div>
               <p className="mt-1 text-xs leading-5 text-muted-foreground">
-                ElasticNet L1/L2 regularization evaluated each candidate feature. Features with non-zero
-                sparse coefficients were retained and weighted proportionally to their cross-validated AUC
-                lift and variance reduction.
+                L2-regularized logistic regression with greedy backward elimination evaluated each
+                candidate feature set. Features were retained only when they measurably reduced
+                calibration-set Brier loss; the final coefficients are the learned weights.
               </p>
             </div>
           </div>
@@ -696,7 +696,7 @@ function EnsemblePanel({ modelState }: { modelState: ModelStateDoc }) {
           )}
           <span className={cn("text-sm font-medium", modelState.monteCarloEnabled ? "text-emerald-300" : "text-foreground")}>
             {modelState.monteCarloEnabled
-              ? `Enabled — σ = ${modelState.monteCarloSigma.toFixed(2)}, ${modelState.monteCarloTrials} trials`
+              ? `Enabled — σ = ${modelState.monteCarloSigma.toFixed(2)} (Gaussian logit-noise expectation)`
               : "Disabled — deterministic point estimates"}
           </span>
         </div>

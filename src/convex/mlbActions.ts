@@ -15,7 +15,7 @@ import {
   runModel,
   spearmanRank,
 } from "./ml/model";
-import { expectedMargin, RunModel, simulateRuns } from "./ml/runs";
+import { expectedMargin, expectedTotal, RunModel, simulateRuns } from "./ml/runs";
 import { teamMeta } from "./ml/teams";
 import {
   CalibrationSummary,
@@ -41,7 +41,7 @@ const RECENT_WINDOW_DAYS = 7;
 const TRAIN_SEASONS = ["2022", "2023", "2024", "2025"];
 const PAST_SEASON_END_MD = "11-01";
 const RUN_SIM_TRIALS = 10000;
-const RUN_CALIB_TRIALS = 2000;
+const RUN_CALIB_TRIALS = 500;
 
 // ---------------------------------------------------------------------------
 // HTTP / date helpers
@@ -488,9 +488,8 @@ function buildRunProjection(
 ): RunProjection {
   const runLine = marketRunLine ?? 1.5;
   const marginShift = marginShiftForGame(runModel, runMarginCal, game.home.id, game.away.id, homeWinProb);
-  const first = simulateRuns(runModel, game.home.id, game.away.id, 0, trials, runLine, marginShift);
-  const line = marketTotal ?? first.total;
-  const sim = line === 0 ? first : simulateRuns(runModel, game.home.id, game.away.id, line, trials, runLine, marginShift);
+  const line = marketTotal ?? expectedTotal(runModel, game.home.id, game.away.id);
+  const sim = simulateRuns(runModel, game.home.id, game.away.id, line, trials, runLine, marginShift);
   // Isotonic calibration is fit on the ±1.5 run line; other lines use raw MC.
   const homeRL =
     runLineIso.length > 0 && runLine === 1.5
@@ -551,6 +550,7 @@ async function fetchInjurySnapshots(
   season: string,
   startDate: string,
   endDate: string,
+  previous?: Record<string, InjurySnapshot[]>,
 ): Promise<Map<number, InjurySnapshot[]>> {
   const dates: string[] = [];
   let cursor = startDate;
@@ -560,9 +560,18 @@ async function fetchInjurySnapshots(
   }
   if (dates[dates.length - 1] !== endDate) dates.push(endDate);
 
+  // Reuse snapshots cached on the model state and only fetch missing dates,
+  // so an on-demand refresh makes ~30 roster requests instead of ~360+.
+  const out = new Map<number, InjurySnapshot[]>();
   const jobs: { teamId: number; date: string }[] = [];
   for (const teamId of teamIds) {
-    for (const date of dates) jobs.push({ teamId, date });
+    const cached = previous?.[String(teamId)] ?? [];
+    const have = new Set(cached.map((s) => s.date));
+    const list = [...cached];
+    for (const date of dates) {
+      if (!have.has(date)) jobs.push({ teamId, date });
+    }
+    out.set(teamId, list);
   }
 
   const results = await mapLimit(jobs, 16, async (job) => ({
@@ -571,11 +580,8 @@ async function fetchInjurySnapshots(
     count: await fetchInjuryCount(job.teamId, job.date, season),
   }));
 
-  const out = new Map<number, InjurySnapshot[]>();
   for (const r of results) {
-    const list = out.get(r.teamId) ?? [];
-    list.push({ date: r.date, count: r.count });
-    out.set(r.teamId, list);
+    out.get(r.teamId)!.push({ date: r.date, count: r.count });
   }
   for (const list of out.values()) list.sort((a, b) => (a.date < b.date ? -1 : 1));
   return out;
@@ -700,6 +706,28 @@ function gameDocToRaw(doc: any): RawGame {
     winner: doc.winner,
     season: doc.season,
     weather: doc.weather,
+  };
+}
+
+/** Prefer stored pitcher stats when a fresh API game re-fetches the same starter. */
+function mergePitcher(fresh?: PitcherInfo, stored?: PitcherInfo): PitcherInfo | undefined {
+  if (!fresh) return stored;
+  if (!stored) return fresh;
+  if (fresh.id !== stored.id) return fresh; // probable starter changed
+  return {
+    ...fresh,
+    era: typeof fresh.era === "number" ? fresh.era : stored.era,
+    k9: typeof fresh.k9 === "number" ? fresh.k9 : stored.k9,
+    fip: typeof fresh.fip === "number" ? fresh.fip : stored.fip,
+  };
+}
+
+/** Merge a freshly fetched game over its stored copy without discarding cached stats. */
+function mergeRawWithStored(fresh: RawGame, stored: RawGame): RawGame {
+  return {
+    ...fresh,
+    awayPitcher: mergePitcher(fresh.awayPitcher, stored.awayPitcher),
+    homePitcher: mergePitcher(fresh.homePitcher, stored.homePitcher),
   };
 }
 
@@ -831,7 +859,10 @@ export const refreshModel = action({
     // 3. Merge fresh API data over stored data (fresh wins by gamePk).
     const byPk = new Map<number, RawGame>();
     for (const g of storedGames) byPk.set(g.gamePk, g);
-    for (const g of freshRaw) byPk.set(g.gamePk, g);
+    for (const g of freshRaw) {
+      const stored = byPk.get(g.gamePk);
+      byPk.set(g.gamePk, stored ? mergeRawWithStored(g, stored) : g);
+    }
     const allRaw = [...byPk.values()];
 
     const completed = allRaw.filter((g) => g.winner === "home" || g.winner === "away");
@@ -885,11 +916,16 @@ export const refreshModel = action({
     // 2. Pull as-of-time injured-list snapshots for every team that has played,
     //    then train, select features/model, calibrate, and decide on Monte Carlo.
     const teamIds = [...new Set(completed.flatMap((g) => [g.home.id, g.away.id]))];
+    const previousInjurySnapshots =
+      previousState?.season === season
+        ? ((previousState.injurySnapshots ?? {}) as Record<string, InjurySnapshot[]>)
+        : {};
     const injurySnapshots = await fetchInjurySnapshots(
       teamIds,
       season,
       `${season}-${SEASON_START_MD}`,
       today,
+      previousInjurySnapshots,
     );
     const run = runModel(completedEnriched, { season, asOfDate: today }, injurySnapshots);
     const { result, model, rows, teamState } = run;
@@ -1006,6 +1042,7 @@ export const refreshModel = action({
         runLineCalibration: result.runLineCalibration,
         runMarginCalibration: runMarginCal,
         teamSeasonStats,
+        injurySnapshots: Object.fromEntries(injurySnapshots),
         calibrationSummary,
         spearmanRho,
         topDecileWinRate,

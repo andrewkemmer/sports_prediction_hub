@@ -112,6 +112,17 @@ export function expectedMargin(model: RunModel, homeId: number, awayId: number):
   return lambdaHome - lambdaAway;
 }
 
+/** Expected combined runs (home + away) from the run model's Poisson means. */
+export function expectedTotal(model: RunModel, homeId: number, awayId: number): number {
+  const parkMul = model.parkFactor[homeId] ?? 1;
+  return (
+    model.leagueRuns *
+    ((model.teamOffense[homeId] ?? 1) * (model.teamDefense[awayId] ?? 1) +
+      (model.teamOffense[awayId] ?? 1) * (model.teamDefense[homeId] ?? 1)) *
+    parkMul
+  );
+}
+
 /**
  * Monte Carlo run simulation for a matchup. `line` is the total over/under
  * reference (market total when available, otherwise the model mean total),

@@ -421,9 +421,33 @@ export interface LogisticModel {
   featureStats: Record<FeatureKey, { mean: number; std: number }>;
 }
 
+/** Solve a small dense linear system A·x = b with partial pivoting. */
+function solveLinearSystem(A: number[][], b: number[]): number[] {
+  const n = A.length;
+  const aug = A.map((row, i) => [...row, b[i]]);
+  for (let col = 0; col < n; col++) {
+    let pivot = col;
+    for (let r = col + 1; r < n; r++) {
+      if (Math.abs(aug[r][col]) > Math.abs(aug[pivot][col])) pivot = r;
+    }
+    if (Math.abs(aug[pivot][col]) < 1e-12) continue;
+    [aug[col], aug[pivot]] = [aug[pivot], aug[col]];
+    const pv = aug[col][col];
+    for (let c = col; c <= n; c++) aug[col][c] /= pv;
+    for (let r = 0; r < n; r++) {
+      if (r === col) continue;
+      const f = aug[r][col];
+      if (f === 0) continue;
+      for (let c = col; c <= n; c++) aug[r][c] -= f * aug[col][c];
+    }
+  }
+  return aug.map((row) => row[n]);
+}
+
 export function trainLogistic(
   rows: FeatureRow[],
   featureNames: FeatureKey[],
+  opts?: { iterations?: number },
 ): LogisticModel {
   const featureStats = {} as Record<FeatureKey, { mean: number; std: number }>;
   for (const f of featureNames) {
@@ -437,27 +461,49 @@ export function trainLogistic(
   const n = rows.length;
   const m = featureNames.length;
   const pos = y.reduce((a, b) => a + b, 0);
-  let weights = featureNames.map(() => 0);
-  let bias = Math.log((pos + 1) / (n - pos + 1));
-  const lr = 0.1;
+  const d = m + 1; // feature columns + intercept column
+  const Xaug = X.map((xi) => [...xi, 1]);
+  let w = new Array<number>(d).fill(0);
+  w[m] = Math.log((pos + 1) / (n - pos + 1));
+  const iterations = opts?.iterations ?? 20;
   const lambda = 0.001;
-  const epochs = 1200;
-  for (let e = 0; e < epochs; e++) {
-    const gradW = featureNames.map(() => 0);
-    let gradB = 0;
+
+  // Newton-Raphson / IRLS for ridge logistic regression. This converges in a
+  // handful of iterations instead of the previous ~1200 batch gradient steps,
+  // which is what keeps on-demand refreshes fast now that the feature set is
+  // wider.
+  for (let it = 0; it < iterations; it++) {
+    const A = Array.from({ length: d }, () => new Array<number>(d).fill(0));
+    const rhs = new Array<number>(d).fill(0);
     for (let i = 0; i < n; i++) {
-      const z = bias + dot(weights, X[i]);
-      const p = sigmoid(z);
-      const err = p - y[i];
-      gradB += err;
-      for (let j = 0; j < m; j++) gradW[j] += err * X[i][j];
+      let eta = 0;
+      for (let j = 0; j < d; j++) eta += w[j] * Xaug[i][j];
+      const p = clamp(sigmoid(eta), 1e-6, 1 - 1e-6);
+      const weight = Math.max(p * (1 - p), 1e-6);
+      const z = eta + (y[i] - p) / weight;
+      const wz = weight * z;
+      for (let j = 0; j < d; j++) {
+        rhs[j] += wz * Xaug[i][j];
+        for (let k = j; k < d; k++) {
+          A[j][k] += weight * Xaug[i][j] * Xaug[i][k];
+        }
+      }
     }
-    bias -= (lr * gradB) / n;
-    for (let j = 0; j < m; j++) {
-      weights[j] -= (lr * (gradW[j] / n + lambda * weights[j]));
+    for (let j = 0; j < d; j++) {
+      for (let k = j + 1; k < d; k++) A[k][j] = A[j][k];
+      if (j < m) A[j][j] += lambda; // ridge the features, not the intercept
     }
+    const next = solveLinearSystem(A, rhs);
+    if (next.some((v) => !Number.isFinite(v))) break;
+    w = next;
   }
-  return { featureNames, weights, bias, featureStats };
+
+  return {
+    featureNames,
+    weights: w.slice(0, m),
+    bias: w[m],
+    featureStats,
+  };
 }
 
 export function logisticLogit(
@@ -709,29 +755,31 @@ export function applyIsotonic(points: { x: number; y: number }[], p: number): nu
 // Monte Carlo (stochastic component)
 // ---------------------------------------------------------------------------
 
+/**
+ * Expected win probability after adding Gaussian noise N(0, σ²) to the logit:
+ * E[sigmoid(logit(p) + σ·Z)]. Evaluated with 7-point Gauss-Hermite quadrature,
+ * which matches the infinite-trial Monte Carlo mean but is O(1), deterministic,
+ * and far faster than simulating thousands of draws per game.
+ */
+const GAUSS_HERMITE_NODES = [0, 0.816287882858965, 1.673551628767471, 2.651961356835233];
+const GAUSS_HERMITE_WEIGHTS = [
+  0.810264617556807,
+  0.425607252610128,
+  0.054515582819125,
+  0.000971781245099519,
+];
+const INV_SQRT_PI = 1 / Math.sqrt(Math.PI);
+
 export function monteCarloAdjust(p: number, sigma: number, trials: number): number {
   if (sigma <= 0 || trials <= 0) return p;
   const lp = logit(p);
-  let s0 = 0x12345678;
-  let s1 = 0x9abcdef0;
-  const rand = () => {
-    let x = s0;
-    const y = s1;
-    s0 = y;
-    x ^= x << 13;
-    x ^= x >>> 17;
-    x ^= x << 5;
-    s1 = x;
-    return ((x + y) >>> 0) / 4294967296;
-  };
-  let sum = 0;
-  for (let i = 0; i < trials; i++) {
-    const u1 = Math.max(rand(), 1e-9);
-    const u2 = rand();
-    const z = Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
-    sum += sigmoid(lp + z * sigma);
+  const s = sigma * Math.SQRT2;
+  let sum = GAUSS_HERMITE_WEIGHTS[0] * sigmoid(lp);
+  for (let i = 1; i < GAUSS_HERMITE_NODES.length; i++) {
+    const node = GAUSS_HERMITE_NODES[i] * s;
+    sum += GAUSS_HERMITE_WEIGHTS[i] * (sigmoid(lp + node) + sigmoid(lp - node));
   }
-  return sum / trials;
+  return clamp(sum * INV_SQRT_PI, 0.001, 0.999);
 }
 
 // ---------------------------------------------------------------------------
@@ -1060,7 +1108,9 @@ export function runModel(
   const score = (preds: number[], labels: number[]) => computeBrier(preds, labels) - 0.5 * computeAuc(preds, labels);
 
   if (calib.length >= 20 && train.length >= 20) {
-    let currentModel = trainLogistic(train, selected);
+    // Use a quick IRLS pass for candidate screening; the final model below is
+    // refit with more iterations.
+    let currentModel = trainLogistic(train, selected, { iterations: 10 });
     let currentPreds = calib.map((r) => sigmoid(logisticLogit(currentModel, r.features, null)));
     let currentScore = score(currentPreds, calibLabels);
     let improved = true;
@@ -1070,7 +1120,7 @@ export function runModel(
       let bestScore = currentScore;
       for (const drop of selected) {
         const candidate = selected.filter((f) => f !== drop);
-        const m = trainLogistic(train, candidate);
+        const m = trainLogistic(train, candidate, { iterations: 10 });
         const preds = calib.map((r) => sigmoid(logisticLogit(m, r.features, null)));
         const s = score(preds, calibLabels);
         if (s < bestScore) {
@@ -1081,7 +1131,7 @@ export function runModel(
       if (bestFeatures.length < selected.length && bestScore < currentScore - 1e-5) {
         selected = bestFeatures;
         currentScore = bestScore;
-        currentModel = trainLogistic(train, selected);
+        currentModel = trainLogistic(train, selected, { iterations: 10 });
         currentPreds = calib.map((r) => sigmoid(logisticLogit(currentModel, r.features, null)));
         improved = true;
       }
@@ -1245,15 +1295,15 @@ export function runModel(
   // Diagnostics: 5-fold cross-validation and hyperparameter audit trail.
   const crossValidation = crossValidate(rows, selected, 5);
   const optimizationParams: OptimizationParams = {
-    learningRate: 0.1,
+    learningRate: 0,
     l2Lambda: 0.001,
-    epochs: 1200,
+    epochs: 20,
     hfaGrid: HFA_GRID,
     blendStep: 0.05,
     mcSigmaGrid: mcGrid,
     cvFolds: 5,
     isotonicMethod: "Isotonic (PAV)",
-    featureSelection: "Greedy backward elimination (L2 logistic)",
+    featureSelection: "Greedy backward elimination (L2 logistic, IRLS)",
   };
 
   // Run-scoring model: predicted scores, totals, and run lines. Fitted on all
@@ -1263,7 +1313,7 @@ export function runModel(
   const rlRaw: number[] = [];
   const rlOutcomes: number[] = [];
   for (const r of rows.slice(0, calibEnd)) {
-    const sim = simulateRuns(runModel, r.game.home.id, r.game.away.id, 0, 2000);
+    const sim = simulateRuns(runModel, r.game.home.id, r.game.away.id, 0, 500);
     const margin = (r.game.home.score ?? 0) - (r.game.away.score ?? 0);
     rlRaw.push(sim.homeRunLineProb);
     rlOutcomes.push(margin >= 2 ? 1 : 0);
