@@ -60,6 +60,9 @@ export default function Dashboard() {
 
   const games = useQuery(api.mlb.getGamesByDate, { date: selectedDate });
   const requestedDates = useRef(new Set<string>());
+  // Timestamp of the most recent refresh click, used to tell a *new* run's
+  // progress writes apart from a previous run's stale `done` doc.
+  const refreshStartedAt = useRef(0);
 
   // The refresh action reports its stage through the `refreshProgress` doc so
   // the UI can render a real progress bar instead of an indeterminate spinner.
@@ -99,8 +102,20 @@ export default function Dashboard() {
       .finally(() => setDateLoading(false));
   }, [selectedDate, games, modelState, predictDate]);
 
+  // Once the server-side action marks the progress doc `done` — on normal
+  // success, or later on after a dropped WebSocket where the action kept
+  // running server-side — exit the refreshing state. Without this, a
+  // successful refresh left `refreshing` true forever: the button stayed on
+  // "Refreshing…" and the progress bar pinned at its default "4%" text.
+  useEffect(() => {
+    if (refreshing && refreshProgress?.done && refreshProgress.updatedAt >= refreshStartedAt.current) {
+      setRefreshing(false);
+    }
+  }, [refreshing, refreshProgress]);
+
   const handleRefresh = async () => {
     if (refreshing) return;
+    refreshStartedAt.current = Date.now();
     setRefreshing(true);
     try {
       const res = await refresh({});
@@ -109,6 +124,7 @@ export default function Dashboard() {
       });
       // Reset the auto-fetch guard so today's view is live.
       requestedDates.current.delete(selectedDate);
+      setRefreshing(false);
     } catch (e) {
       // The Convex client throws "Connection lost while action was in flight"
       // when the browser tab is backgrounded or the WebSocket re-establishes
