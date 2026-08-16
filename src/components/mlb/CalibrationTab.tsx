@@ -114,7 +114,7 @@ export function CalibrationTab({ modelState }: { modelState: ModelStateDoc }) {
   const [startDate, setStartDate] = useState(trainStart);
   const [endDate, setEndDate] = useState(modelState.asOfDate);
   const [search, setSearch] = useState("");
-  const [pageCursor, setPageCursor] = useState<string | undefined>(undefined);
+  const [pageCursor, setPageCursor] = useState<string | null>(null);
   const [nextCursor, setNextCursor] = useState<string | null>(null);
   const [rows, setRows] = useState<GameResultRow[]>([]);
 
@@ -131,14 +131,14 @@ export function CalibrationTab({ modelState }: { modelState: ModelStateDoc }) {
   // Reset pagination whenever the selected range changes.
   useEffect(() => {
     setRows([]);
-    setPageCursor(undefined);
+    setPageCursor(null);
     setNextCursor(null);
   }, [startDate, endDate]);
 
   // Accumulate loaded pages (dedupe by gamePk).
   useEffect(() => {
     if (!gamesPage) return;
-    if (pageCursor === undefined) {
+    if (pageCursor === null) {
       setRows(gamesPage.games);
     } else {
       setRows((prev) => {
@@ -174,7 +174,7 @@ export function CalibrationTab({ modelState }: { modelState: ModelStateDoc }) {
 
   const resetPagination = () => {
     setRows([]);
-    setPageCursor(undefined);
+    setPageCursor(null);
     setNextCursor(null);
   };
 

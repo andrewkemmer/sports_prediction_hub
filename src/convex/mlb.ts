@@ -26,7 +26,7 @@ export const getGamesByDate = query({
 // Load all stored games in bounded pages. The refresh action uses this to
 // reuse already-stored seasons instead of re-fetching them from the API.
 export const getGamesPage = internalQuery({
-  args: { cursor: v.optional(v.string()), limit: v.optional(v.number()) },
+  args: { cursor: v.union(v.string(), v.null()), limit: v.optional(v.number()) },
   handler: async (ctx, args) => {
     const page = await ctx.db
       .query("games")
@@ -193,7 +193,7 @@ export const getCalibrationGames = query({
   args: {
     startDate: v.string(),
     endDate: v.string(),
-    cursor: v.optional(v.string()),
+    cursor: v.union(v.string(), v.null()),
     limit: v.optional(v.number()),
   },
   handler: async (ctx, args) => {
