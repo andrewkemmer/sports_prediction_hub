@@ -143,12 +143,15 @@ export function simulateRuns(
     else awayCover += 1;
   }
 
+  // Over/under are quoted conditional on no push (total == line counts as no
+  // bet), so they always sum to 100%.
+  const overUnder = over + under;
   return {
     homeScore: homeSum / trials,
     awayScore: awaySum / trials,
     total: (homeSum + awaySum) / trials,
-    overProb: over / trials,
-    underProb: under / trials,
+    overProb: overUnder > 0 ? over / overUnder : 0.5,
+    underProb: overUnder > 0 ? under / overUnder : 0.5,
     homeRunLineProb: homeCover / trials,
     awayRunLineProb: awayCover / trials,
   };

@@ -32,6 +32,7 @@ import {
 const MLB_BASE = "https://statsapi.mlb.com";
 const SEASON_START_MD = "03-15";
 const UPCOMING_WINDOW_DAYS = 3;
+const RECENT_WINDOW_DAYS = 7;
 const TRAIN_SEASONS = ["2022", "2023", "2024", "2025"];
 const PAST_SEASON_END_MD = "11-01";
 const RUN_SIM_TRIALS = 10000;
@@ -258,7 +259,7 @@ async function fetchPitcherStats(
     seen.add(key);
     return true;
   });
-  await mapLimit(unique, 8, async (p) => {
+  await mapLimit(unique, 16, async (p) => {
     try {
       const data = await fetchJson(
         `${MLB_BASE}/api/v1/people/${p.id}/stats?stats=season&group=pitching&season=${p.season}`,
@@ -424,7 +425,7 @@ function buildRunProjection(
 // Injury data (single consolidated source: MLB Stats API rosters)
 // ---------------------------------------------------------------------------
 
-const INJURY_SNAPSHOT_DAYS = 7;
+const INJURY_SNAPSHOT_DAYS = 14;
 
 /** Whether a roster entry's status indicates an injured-list / day-to-day stint. */
 function isInjuredStatus(status: { code?: string; description?: string } | undefined): boolean {
@@ -477,7 +478,7 @@ async function fetchInjurySnapshots(
     for (const date of dates) jobs.push({ teamId, date });
   }
 
-  const results = await mapLimit(jobs, 6, async (job) => ({
+  const results = await mapLimit(jobs, 16, async (job) => ({
     teamId: job.teamId,
     date: job.date,
     count: await fetchInjuryCount(job.teamId, job.date, season),
@@ -594,6 +595,42 @@ function predictionFor(game: RawGame, model: TrainedModel, teamState: TeamState)
 // Actions
 // ---------------------------------------------------------------------------
 
+/** Convert a stored game document back into a raw game for retraining. */
+function gameDocToRaw(doc: any): RawGame {
+  return {
+    gamePk: doc.gamePk,
+    date: doc.date,
+    gameDate: doc.gameDate,
+    dayNight: doc.dayNight,
+    status: doc.status,
+    detailedState: doc.detailedState,
+    away: doc.away,
+    home: doc.home,
+    awayPitcher: doc.awayPitcher,
+    homePitcher: doc.homePitcher,
+    venue: doc.venue,
+    innings: doc.innings,
+    winner: doc.winner,
+    season: doc.season,
+    weather: doc.weather,
+  };
+}
+
+/** Load every stored game in bounded pages (fast, no external API). */
+async function loadStoredGames(ctx: any): Promise<RawGame[]> {
+  const all: RawGame[] = [];
+  let cursor: string | null = null;
+  do {
+    const page: { games: any[]; cursor: string | null } = await ctx.runQuery(
+      internal.mlb.getGamesPage,
+      { cursor, limit: 1000 },
+    );
+    for (const g of page.games) all.push(gameDocToRaw(g));
+    cursor = page.cursor;
+  } while (cursor);
+  return all;
+}
+
 export const refreshModel = action({
   args: {},
   handler: async (ctx) => {
@@ -601,29 +638,51 @@ export const refreshModel = action({
     const season = String(now.getFullYear());
     const today = etDateString(now);
 
-    // 1. Fetch 2022–2025 full seasons + 2026 through today (regular season only).
-    const allGames = await fetchAllSeasons(season, today);
-    const completed = allGames.filter((g) => g.winner === "home" || g.winner === "away");
+    // 1. Reuse previously stored games so complete seasons are not re-fetched
+    //    from the external API on every refresh (this was the ~5-minute cost).
+    const storedGames = await loadStoredGames(ctx);
+    const storedCompleted = storedGames.filter(
+      (g) => g.winner === "home" || g.winner === "away",
+    );
+
+    // 2. Fetch only the recent window + upcoming games. On a cold start (empty
+    //    database) fall back to the full 2022–2026 fetch exactly once.
+    const hasFullHistory = storedCompleted.length >= 2000;
+    const freshRaw = hasFullHistory
+      ? await fetchScheduleRange(addDays(today, -RECENT_WINDOW_DAYS), addDays(today, UPCOMING_WINDOW_DAYS))
+      : await fetchAllSeasons(season, today);
+
+    // 3. Merge fresh API data over stored data (fresh wins by gamePk).
+    const byPk = new Map<number, RawGame>();
+    for (const g of storedGames) byPk.set(g.gamePk, g);
+    for (const g of freshRaw) byPk.set(g.gamePk, g);
+    const allRaw = [...byPk.values()];
+
+    const completed = allRaw.filter((g) => g.winner === "home" || g.winner === "away");
     if (completed.length < 40) {
       throw new Error(
-        `Only ${completed.length} completed regular-season games found in MLB Stats API. Cannot train yet.`,
+        `Only ${completed.length} completed regular-season games found. Cannot train yet.`,
       );
     }
 
-    // 1b. Fetch the upcoming window (current season) for on-demand predictions.
-    const windowEnd = addDays(today, UPCOMING_WINDOW_DAYS);
-    const upcomingRaw = await fetchScheduleRange(today, windowEnd);
-
-    // 1c. Season pitching stats (ERA / K9 / FIP) for every starter in scope,
-    //     keyed by (pitcher, season) so past seasons use that season's stats.
+    // 4. Fetch pitcher stats only for games whose starters still lack them
+    //    (stored games already carry their ERA / K9 / FIP).
+    const needsStats = allRaw.filter(
+      (g) =>
+        (g.awayPitcher && typeof g.awayPitcher.era !== "number") ||
+        (g.homePitcher && typeof g.homePitcher.era !== "number"),
+    );
     const pitcherPairs: { id: number; season: string }[] = [];
-    for (const g of [...completed, ...upcomingRaw]) {
+    for (const g of needsStats) {
       const s = g.season ?? season;
       if (g.awayPitcher) pitcherPairs.push({ id: g.awayPitcher.id, season: s });
       if (g.homePitcher) pitcherPairs.push({ id: g.homePitcher.id, season: s });
     }
     const pitcherStats = await fetchPitcherStats(pitcherPairs);
-    const completedEnriched = attachPitcherStats(completed, pitcherStats);
+    const enriched = attachPitcherStats(allRaw, pitcherStats);
+    const completedEnriched = enriched.filter(
+      (g) => g.winner === "home" || g.winner === "away",
+    );
 
     // 2. Pull as-of-time injured-list snapshots for every team that has played,
     //    then train, select features/model, calibrate, and decide on Monte Carlo.
@@ -664,22 +723,39 @@ export const refreshModel = action({
     const highConf = completedDocs.filter((d) => d.pickProb >= 0.65);
     const topDecileWinRate = highConf.length > 0 ? highConf.filter((d) => d.isCorrect).length / highConf.length : 0;
 
-    // 4. Upcoming games (today through +3 days) with starter stat context,
-    //    run projections, and market odds.
-    const upcomingEnriched = attachPitcherStats(upcomingRaw, pitcherStats);
-    const upcomingDocs: GameDoc[] = upcomingEnriched
-      .filter((g) => g.winner !== "home" && g.winner !== "away")
-      .map((g) => {
-        const odds = marketOddsForGame(marketOdds, g);
-        return buildGameDoc(
-          g,
-          predictionFor(g, model, teamState),
-          pitcherStats,
-          { home: teamState.injuries[g.home.id] ?? 0, away: teamState.injuries[g.away.id] ?? 0 },
-          buildRunProjection(runModelState, runLineIso, g, odds?.total, odds?.runLine, RUN_SIM_TRIALS),
-          odds,
+    // 4. Build fresh docs only for the recent/upcoming window so we never
+    //    rewrite thousands of unchanged historical dates on refresh.
+    const freshDates = new Set(freshRaw.map((g) => g.date));
+    const rowsByPk = new Map(rows.map((r) => [r.game.gamePk, r]));
+    const freshDocs: GameDoc[] = [];
+    for (const g of enriched) {
+      if (!freshDates.has(g.date)) continue;
+      if (g.winner === "home" || g.winner === "away") {
+        const row = rowsByPk.get(g.gamePk);
+        if (!row) continue;
+        freshDocs.push(
+          buildGameDoc(
+            g,
+            applyModel(model, row.features, row.homeElo, row.awayElo),
+            pitcherStats,
+            undefined,
+            buildRunProjection(runModelState, runLineIso, g, undefined, undefined, RUN_CALIB_TRIALS),
+          ),
         );
-      });
+      } else {
+        const odds = marketOddsForGame(marketOdds, g);
+        freshDocs.push(
+          buildGameDoc(
+            g,
+            predictionFor(g, model, teamState),
+            pitcherStats,
+            { home: teamState.injuries[g.home.id] ?? 0, away: teamState.injuries[g.away.id] ?? 0 },
+            buildRunProjection(runModelState, runLineIso, g, odds?.total, odds?.runLine, RUN_SIM_TRIALS),
+            odds,
+          ),
+        );
+      }
+    }
 
     // 5. Today's record.
     const todaysRecord = buildTodaysRecord(completedDocs, today);
@@ -730,15 +806,14 @@ export const refreshModel = action({
       },
     });
 
-    // 7. Store game docs grouped by date.
+    // 7. Store fresh game docs grouped by date (recent window + upcoming only).
     const byDate = new Map<string, GameDoc[]>();
-    for (const doc of [...completedDocs, ...upcomingDocs]) {
+    for (const doc of freshDocs) {
       const list = byDate.get(doc.date) ?? [];
       list.push(doc);
       byDate.set(doc.date, list);
     }
-    const dates = [...byDate.keys()];
-    await mapLimit(dates, 8, (date) =>
+    await mapLimit([...byDate.keys()], 8, (date) =>
       ctx.runMutation(internal.mlb.replaceGamesForDate, { date, games: byDate.get(date)! }),
     );
 
@@ -753,7 +828,7 @@ export const refreshModel = action({
       ece: result.ece,
       selectedModel: result.selectedModel,
       monteCarloEnabled: result.monteCarloEnabled,
-      storedGames: completedDocs.length + upcomingDocs.length,
+      storedGames: freshDocs.length,
     };
   },
 });

@@ -23,6 +23,18 @@ export const getGamesByDate = query({
       .collect(),
 });
 
+// Load all stored games in bounded pages. The refresh action uses this to
+// reuse already-stored seasons instead of re-fetching them from the API.
+export const getGamesPage = internalQuery({
+  args: { cursor: v.optional(v.string()), limit: v.optional(v.number()) },
+  handler: async (ctx, args) => {
+    const page = await ctx.db
+      .query("games")
+      .paginate({ numItems: Math.min(args.limit ?? 1000, 2000), cursor: args.cursor ?? null });
+    return { games: page.page, cursor: page.continueCursor };
+  },
+});
+
 // Completed-game row used by both calibration metrics and the game history table.
 interface CalibrationRow {
   gamePk: number;
