@@ -1,5 +1,5 @@
 import { v } from "convex/values";
-import { internalMutation, internalQuery, query } from "./_generated/server";
+import { internalMutation, internalQuery, query, QueryCtx } from "./_generated/server";
 import { calibrationCurvePoints, computeAuc, computeBrier, evaluate } from "./ml/model";
 import type { CalibrationBin, ConfidencePoint, CurvePoint } from "./ml/types";
 
@@ -23,19 +23,38 @@ export const getGamesByDate = query({
       .collect(),
 });
 
-// Calibration dashboard data: completed games in a date range plus favorite-framed
-// calibration metrics (one side per game — predicted probability > 50%).
-export const getCalibrationResults = query({
-  args: { startDate: v.string(), endDate: v.string() },
-  handler: async (ctx, args) => {
-    const all = await ctx.db
+// Completed-game row used by both calibration metrics and the game history table.
+interface CalibrationRow {
+  gamePk: number;
+  date: string;
+  away: { abbrev: string; name: string; score?: number };
+  home: { abbrev: string; name: string; score?: number };
+  winner?: string;
+  pickTeam: string;
+  pickProb: number;
+  isCorrect?: boolean;
+  isUpset?: boolean;
+  predictedTotal?: number;
+  homeRunLineProb?: number;
+  actualTotal?: number;
+  actualMargin?: number;
+}
+
+async function loadCalibrationRows(
+  ctx: QueryCtx,
+  startDate: string,
+  endDate: string,
+): Promise<CalibrationRow[]> {
+  const rows: CalibrationRow[] = [];
+  let cursor: string | null = null;
+  do {
+    const page = await ctx.db
       .query("games")
-      .withIndex("by_date", (q) => q.gte("date", args.startDate).lte("date", args.endDate))
-      .collect();
-    const games = all
-      .filter((g) => g.winner === "home" || g.winner === "away")
-      .sort((a, b) => (a.date < b.date ? 1 : -1))
-      .map((g) => ({
+      .withIndex("by_date", (q) => q.gte("date", startDate).lte("date", endDate))
+      .paginate({ numItems: 1000, cursor });
+    for (const g of page.page) {
+      if (g.winner !== "home" && g.winner !== "away") continue;
+      rows.push({
         gamePk: g.gamePk,
         date: g.date,
         away: { abbrev: g.away.abbrev, name: g.away.name, score: g.away.score },
@@ -49,13 +68,27 @@ export const getCalibrationResults = query({
         homeRunLineProb: g.runProjection?.homeRunLineProb,
         actualTotal: (g.away.score ?? 0) + (g.home.score ?? 0),
         actualMargin: (g.home.score ?? 0) - (g.away.score ?? 0),
-      }));
+      });
+    }
+    cursor = page.continueCursor;
+  } while (cursor !== null);
 
+  return rows.sort((a, b) =>
+    a.date < b.date ? 1 : a.date > b.date ? -1 : a.gamePk < b.gamePk ? 1 : -1,
+  );
+}
+
+// Calibration metrics computed server-side over the full range so the client
+// only receives a small aggregate (never thousands of game rows at once).
+export const getCalibrationResults = query({
+  args: { startDate: v.string(), endDate: v.string() },
+  handler: async (ctx, args) => {
+    const games = await loadCalibrationRows(ctx, args.startDate, args.endDate);
     const total = games.length;
     const correct = games.filter((g) => g.isCorrect).length;
 
     // Moneyline (favorite framing) metrics.
-    let moneylineMetrics = {
+    let metrics = {
       auc: 0,
       brier: 0,
       logLoss: 0,
@@ -69,7 +102,7 @@ export const getCalibrationResults = query({
       const labels = games.map((g) => (g.isCorrect ? 1 : 0));
       const evalResult = evaluate(preds, labels);
       const curve = calibrationCurvePoints(preds, labels, 8);
-      moneylineMetrics = {
+      metrics = {
         auc: evalResult.auc,
         brier: evalResult.brier,
         logLoss: evalResult.logLoss,
@@ -119,14 +152,40 @@ export const getCalibrationResults = query({
     }
 
     return {
-      games,
-      metrics: moneylineMetrics,
+      metrics,
       totalsMetrics,
       runLineMetrics,
       total,
       correct,
       accuracy: total > 0 ? correct / total : 0,
     };
+  },
+});
+
+// Paginated game history for the calibration table.
+export const getCalibrationGames = query({
+  args: {
+    startDate: v.string(),
+    endDate: v.string(),
+    cursor: v.optional(v.string()),
+    limit: v.optional(v.number()),
+  },
+  handler: async (ctx, args) => {
+    const rows = await loadCalibrationRows(ctx, args.startDate, args.endDate);
+    const limit = Math.max(1, Math.min(args.limit ?? 100, 300));
+    let start = 0;
+    if (args.cursor) {
+      const [cd, cpk] = args.cursor.split("|");
+      const pk = Number(cpk);
+      start = rows.findIndex((g) => g.date < cd || (g.date === cd && g.gamePk < pk));
+      if (start === -1) start = rows.length;
+    }
+    const page = rows.slice(start, start + limit);
+    const cursor =
+      start + limit < rows.length
+        ? `${page[page.length - 1].date}|${page[page.length - 1].gamePk}`
+        : null;
+    return { games: page, cursor };
   },
 });
 

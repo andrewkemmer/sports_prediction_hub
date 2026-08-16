@@ -4,7 +4,7 @@ import { formatNumber, formatPct, formatTrainedAt } from "@/lib/format";
 import { cn } from "@/lib/utils";
 import { useQuery } from "convex/react";
 import { Check, X, Zap } from "lucide-react";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import {
   Area,
   Bar,
@@ -37,7 +37,6 @@ interface GameResultRow {
 }
 
 interface CalibrationQueryResult {
-  games: GameResultRow[];
   metrics: {
     auc: number;
     brier: number;
@@ -52,6 +51,11 @@ interface CalibrationQueryResult {
   total: number;
   correct: number;
   accuracy: number;
+}
+
+interface CalibrationGamesPage {
+  games: GameResultRow[];
+  cursor: string | null;
 }
 
 type CalibView = "moneyline" | "totals" | "runline";
@@ -109,13 +113,41 @@ export function CalibrationTab({ modelState }: { modelState: ModelStateDoc }) {
   const [view, setView] = useState<CalibView>("moneyline");
   const [startDate, setStartDate] = useState(trainStart);
   const [endDate, setEndDate] = useState(modelState.asOfDate);
-  const [visibleCount, setVisibleCount] = useState(25);
   const [search, setSearch] = useState("");
+  const [pageCursor, setPageCursor] = useState<string | undefined>(undefined);
+  const [nextCursor, setNextCursor] = useState<string | null>(null);
+  const [rows, setRows] = useState<GameResultRow[]>([]);
 
   const results = useQuery(api.mlb.getCalibrationResults, {
     startDate,
     endDate,
   }) as CalibrationQueryResult | undefined;
+
+  const gamesPage = useQuery(
+    api.mlb.getCalibrationGames,
+    { startDate, endDate, cursor: pageCursor, limit: 100 },
+  ) as CalibrationGamesPage | undefined;
+
+  // Reset pagination whenever the selected range changes.
+  useEffect(() => {
+    setRows([]);
+    setPageCursor(undefined);
+    setNextCursor(null);
+  }, [startDate, endDate]);
+
+  // Accumulate loaded pages (dedupe by gamePk).
+  useEffect(() => {
+    if (!gamesPage) return;
+    if (pageCursor === undefined) {
+      setRows(gamesPage.games);
+    } else {
+      setRows((prev) => {
+        const ids = new Set(prev.map((g) => g.gamePk));
+        return [...prev, ...gamesPage.games.filter((g) => !ids.has(g.gamePk))];
+      });
+    }
+    setNextCursor(gamesPage.cursor);
+  }, [gamesPage, pageCursor]);
 
   const metrics = results?.metrics;
   const totalsMetrics = results?.totalsMetrics;
@@ -128,16 +160,17 @@ export function CalibrationTab({ modelState }: { modelState: ModelStateDoc }) {
   const logLoss = metrics?.logLoss ?? modelState.logLoss;
   const ece = metrics?.ece ?? modelState.ece;
 
-  const allGames = results?.games ?? [];
-  const totalGames = results?.total ?? allGames.length;
-  const correctCount = results?.correct ?? allGames.filter((g) => g.isCorrect).length;
+  const allGames = rows;
+  const totalGames = results?.total ?? 0;
+  const correctCount = results?.correct ?? 0;
   const q = search.trim().toLowerCase();
   const filteredGames = q
     ? allGames.filter((g) =>
         `${g.away.name} ${g.away.abbrev} ${g.home.name} ${g.home.abbrev}`.toLowerCase().includes(q),
       )
     : allGames;
-  const visibleGames = filteredGames.slice(0, visibleCount);
+  const visibleGames = filteredGames;
+  const listLoading = gamesPage === undefined && rows.length === 0;
 
   const onStartChange = (v: string) => {
     setStartDate(v);
@@ -471,10 +504,7 @@ export function CalibrationTab({ modelState }: { modelState: ModelStateDoc }) {
           <input
             type="text"
             value={search}
-            onChange={(e) => {
-              setSearch(e.target.value);
-              setVisibleCount(25);
-            }}
+            onChange={(e) => setSearch(e.target.value)}
             placeholder="Filter by team…"
             className="h-9 w-full max-w-xs rounded-lg border border-border bg-background px-3 text-sm text-foreground outline-none placeholder:text-muted-foreground focus:border-ring/50"
           />
@@ -598,9 +628,11 @@ export function CalibrationTab({ modelState }: { modelState: ModelStateDoc }) {
                     colSpan={view === "moneyline" ? 6 : 5}
                     className="py-8 text-center text-sm text-muted-foreground"
                   >
-                    {allGames.length === 0
-                      ? "No completed games in this range — adjust the dates or click Refresh."
-                      : "No games match your filter."}
+                    {listLoading
+                      ? "Loading games…"
+                      : allGames.length === 0
+                        ? "No completed games in this range — adjust the dates or click Refresh."
+                        : "No games match your filter."}
                   </td>
                 </tr>
               )}
@@ -608,13 +640,13 @@ export function CalibrationTab({ modelState }: { modelState: ModelStateDoc }) {
           </table>
         </div>
 
-        {visibleCount < filteredGames.length && (
+        {nextCursor && (
           <button
             type="button"
-            onClick={() => setVisibleCount((c) => c + 50)}
+            onClick={() => setPageCursor(nextCursor)}
             className="mt-3 w-full cursor-pointer rounded-lg border border-border/80 bg-white/[0.02] py-2 text-xs font-medium text-blue-400 transition-colors hover:bg-blue-500/10"
           >
-            Show more ({formatNumber(filteredGames.length - visibleCount)} remaining)
+            Load more games
           </button>
         )}
       </div>
