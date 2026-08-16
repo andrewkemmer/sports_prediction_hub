@@ -84,13 +84,17 @@ function toCalibrationRow(g: CalibrationGame): CalibrationRow {
   };
 }
 
-// Calibration metrics computed server-side over the full range so the client
-// only receives a small aggregate (never thousands of game rows at once).
+// Calibration metrics computed over the selected date range. Uses a single
+// (non-paginated) collection so Convex's single-paginated-query rule is never
+// triggered; only small aggregates are returned to the client.
 export const getCalibrationResults = query({
   args: { startDate: v.string(), endDate: v.string() },
   handler: async (ctx, args) => {
-    // Accumulate scalar metrics in a single pass over the date range instead
-    // of materializing a full row for every game (keeps memory bounded).
+    const games = await ctx.db
+      .query("games")
+      .withIndex("by_date", (q) => q.gte("date", args.startDate).lte("date", args.endDate))
+      .collect();
+
     const preds: number[] = [];
     const labels: number[] = [];
     let total = 0;
@@ -102,38 +106,29 @@ export const getCalibrationResults = query({
     const rlPreds: number[] = [];
     const rlLabels: number[] = [];
 
-    let cursor: string | null = null;
-    do {
-      const page = await ctx.db
-        .query("games")
-        .withIndex("by_date", (q) => q.gte("date", args.startDate).lte("date", args.endDate))
-        .paginate({ numItems: 1000, cursor });
-      for (const g of page.page) {
-        if (g.winner !== "home" && g.winner !== "away") continue;
-        total += 1;
-        if (g.isCorrect) correct += 1;
-        preds.push(g.pickProb);
-        labels.push(g.isCorrect ? 1 : 0);
+    for (const g of games) {
+      if (g.winner !== "home" && g.winner !== "away") continue;
+      total += 1;
+      if (g.isCorrect) correct += 1;
+      preds.push(g.pickProb);
+      labels.push(g.isCorrect ? 1 : 0);
 
-        const predictedTotal = g.runProjection?.total;
-        const actualTotal = (g.away.score ?? 0) + (g.home.score ?? 0);
-        if (typeof predictedTotal === "number") {
-          tN += 1;
-          const err = predictedTotal - actualTotal;
-          tAbs += Math.abs(err);
-          tSq += err * err;
-          tBias += err;
-        }
-
-        const homeRunLineProb = g.runProjection?.homeRunLineProb;
-        if (typeof homeRunLineProb === "number") {
-          const margin = (g.home.score ?? 0) - (g.away.score ?? 0);
-          rlPreds.push(homeRunLineProb);
-          rlLabels.push(margin >= 2 ? 1 : 0);
-        }
+      const predictedTotal = g.runProjection?.total;
+      if (typeof predictedTotal === "number") {
+        tN += 1;
+        const err = predictedTotal - ((g.away.score ?? 0) + (g.home.score ?? 0));
+        tAbs += Math.abs(err);
+        tSq += err * err;
+        tBias += err;
       }
-      cursor = page.continueCursor;
-    } while (cursor !== null);
+
+      const homeRunLineProb = g.runProjection?.homeRunLineProb;
+      if (typeof homeRunLineProb === "number") {
+        const margin = (g.home.score ?? 0) - (g.away.score ?? 0);
+        rlPreds.push(homeRunLineProb);
+        rlLabels.push(margin >= 2 ? 1 : 0);
+      }
+    }
 
     // Moneyline (favorite framing) metrics.
     let metrics = {
@@ -199,7 +194,7 @@ export const getCalibrationGames = query({
   handler: async (ctx, args) => {
     // Paginate directly on the date index (newest first) so each call reads
     // only a small page instead of the entire multi-season dataset.
-    const limit = Math.max(1, Math.min(args.limit ?? 100, 300));
+    const limit = Math.max(1, Math.min(args.limit ?? 100, 1000));
     const page = await ctx.db
       .query("games")
       .withIndex("by_date", (q) => q.gte("date", args.startDate).lte("date", args.endDate))
