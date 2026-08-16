@@ -234,7 +234,8 @@ export const replaceModelState = internalMutation({
       .query("modelState")
       .withIndex("by_key", (q) => q.eq("key", "current"))
       .first();
-    const doc = { ...args.state, key: "current" };
+    const { _id: _ignored, _creationTime: _ct, ...state } = args.state as Record<string, unknown>;
+    const doc = { ...state, key: "current" } as any;
     if (existing) {
       await ctx.db.patch(existing._id, doc);
     } else {
@@ -251,7 +252,12 @@ export const replaceGamesForDate = internalMutation({
       .withIndex("by_date", (q) => q.eq("date", args.date))
       .collect();
     for (const g of existing) await ctx.db.delete(g._id);
-    for (const g of args.games) await ctx.db.insert("games", g);
+    for (const g of args.games) {
+      // Stored docs (re-read from the DB) carry Convex's own `_id` and
+      // `_creationTime`; strip them so insert() can mint fresh ones.
+      const { _id: _ignored, _creationTime: _ct, ...rest } = g as Record<string, unknown>;
+      await ctx.db.insert("games", rest as any);
+    }
   },
 });
 
@@ -263,7 +269,10 @@ export const replaceCalibrationForDate = internalMutation({
       .withIndex("by_date", (q) => q.eq("date", args.date))
       .collect();
     for (const r of existing) await ctx.db.delete(r._id);
-    for (const r of args.rows) await ctx.db.insert("calibration", r);
+    for (const r of args.rows) {
+      const { _id: _ignored, _creationTime: _ct, ...rest } = r as Record<string, unknown>;
+      await ctx.db.insert("calibration", rest as any);
+    }
   },
 });
 
