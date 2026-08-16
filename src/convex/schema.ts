@@ -23,6 +23,9 @@ const teamInfo = v.object({
   score: v.optional(v.number()),
   wins: v.optional(v.number()),
   losses: v.optional(v.number()),
+  ops: v.optional(v.number()),
+  era: v.optional(v.number()),
+  fieldingPct: v.optional(v.number()),
 });
 
 const pitcherInfo = v.object({
@@ -89,6 +92,25 @@ const schema = defineSchema(
       marketOdds: v.optional(v.any()),
     }).index("by_date", ["date"]),
 
+    // Lean per-game calibration projection. Kept small (~1/10 the size of a
+    // game doc) so full-range calibration queries never approach Convex's
+    // per-transaction read limit.
+    calibration: defineTable({
+      gamePk: v.number(),
+      date: v.string(),
+      away: v.object({ abbrev: v.string(), name: v.string(), score: v.optional(v.number()) }),
+      home: v.object({ abbrev: v.string(), name: v.string(), score: v.optional(v.number()) }),
+      winner: v.optional(v.string()),
+      pickTeam: v.string(),
+      pickProb: v.number(),
+      isCorrect: v.optional(v.boolean()),
+      isUpset: v.optional(v.boolean()),
+      predictedTotal: v.optional(v.number()),
+      homeRunLineProb: v.optional(v.number()),
+      actualTotal: v.optional(v.number()),
+      actualMargin: v.optional(v.number()),
+    }).index("by_date", ["date"]),
+
     // Singleton document (key = "current") describing the trained model.
     modelState: defineTable({
       key: v.string(),
@@ -127,6 +149,9 @@ const schema = defineSchema(
       topDecileWinRate: v.optional(v.number()),
       runModel: v.optional(v.any()),
       runLineCalibration: v.optional(v.any()),
+      runMarginCalibration: v.optional(v.any()),
+      teamSeasonStats: v.optional(v.any()),
+      calibrationSummary: v.optional(v.any()),
       todaysRecord: v.any(),
     }).index("by_key", ["key"]),
   },

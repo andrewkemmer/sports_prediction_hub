@@ -102,10 +102,22 @@ export function fitRunModel(games: RawGame[]): RunModel {
   return { leagueRuns, teamOffense, teamDefense, parkFactor };
 }
 
+/** Expected home − away run margin from the run model's Poisson means. */
+export function expectedMargin(model: RunModel, homeId: number, awayId: number): number {
+  const parkMul = model.parkFactor[homeId] ?? 1;
+  const lambdaHome =
+    model.leagueRuns * (model.teamOffense[homeId] ?? 1) * (model.teamDefense[awayId] ?? 1) * parkMul;
+  const lambdaAway =
+    model.leagueRuns * (model.teamOffense[awayId] ?? 1) * (model.teamDefense[homeId] ?? 1) * parkMul;
+  return lambdaHome - lambdaAway;
+}
+
 /**
  * Monte Carlo run simulation for a matchup. `line` is the total over/under
- * reference (market total when available, otherwise the model mean total) and
- * `runLine` is the spread magnitude (1.5 = standard run line, 2.5 = alternate).
+ * reference (market total when available, otherwise the model mean total),
+ * `runLine` is the spread magnitude (1.5 = standard run line, 2.5 = alternate),
+ * and `marginShift` shifts the two Poisson means by ±shift (total preserved) to
+ * reconcile the displayed scores with the win-probability model.
  */
 export function simulateRuns(
   model: RunModel,
@@ -114,13 +126,18 @@ export function simulateRuns(
   line: number,
   trials = 10000,
   runLine = 1.5,
+  marginShift = 0,
 ): RunSimulation {
   const offense = model.teamOffense;
   const defense = model.teamDefense;
   const park = model.parkFactor;
   const parkMul = park[homeId] ?? 1;
-  const lambdaHome = model.leagueRuns * (offense[homeId] ?? 1) * (defense[awayId] ?? 1) * parkMul;
-  const lambdaAway = model.leagueRuns * (offense[awayId] ?? 1) * (defense[homeId] ?? 1) * parkMul;
+  const baseHome = model.leagueRuns * (offense[homeId] ?? 1) * (defense[awayId] ?? 1) * parkMul;
+  const baseAway = model.leagueRuns * (offense[awayId] ?? 1) * (defense[homeId] ?? 1) * parkMul;
+  // Keep each mean non-negative and preserve the combined total.
+  const shift = clamp(marginShift, -Math.min(baseHome, baseAway) + 0.05, Math.min(baseHome, baseAway) - 0.05);
+  const lambdaHome = baseHome + shift;
+  const lambdaAway = baseAway - shift;
   const coverThreshold = Math.ceil(runLine); // 1.5 → 2, 2.5 → 3
 
   const rand = makeRand((homeId * 1000003 + awayId * 7919) >>> 0);

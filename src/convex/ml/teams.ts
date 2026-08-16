@@ -44,3 +44,39 @@ export const TEAMS: Record<number, TeamMeta> = {
 export function teamMeta(id: number): TeamMeta {
   return TEAMS[id] ?? { abbrev: "TBD", name: `Team ${id}`, fullName: `Team ${id}`, color: "#8b93a7" };
 }
+
+// Approximate multi-year ballpark run factors keyed by home team id
+// (league average = 1.00). Used as a ballpark-context feature and a prior
+// for the run-scoring model. Coors Field is the most hitter-friendly park.
+export const PARK_FACTORS: Record<number, number> = {
+  108: 0.98, // LAA — Angel Stadium
+  109: 1.02, // ARI — Chase Field
+  110: 1.03, // BAL — Oriole Park at Camden Yards
+  111: 1.04, // BOS — Fenway Park
+  112: 1.02, // CHC — Wrigley Field
+  113: 1.07, // CIN — Great American Ball Park
+  114: 1.0, // CLE — Progressive Field
+  115: 1.19, // COL — Coors Field
+  116: 0.96, // DET — Comerica Park
+  117: 0.99, // HOU — Minute Maid Park
+  118: 1.05, // KC — Kauffman Stadium
+  119: 0.98, // LAD — Dodger Stadium
+  120: 0.99, // WSH — Nationals Park
+  121: 0.94, // NYM — Citi Field
+  133: 0.97, // ATH — Sutter Health Park
+  134: 0.97, // PIT — PNC Park
+  135: 0.95, // SD — Petco Park
+  136: 0.95, // SEA — T-Mobile Park
+  137: 0.98, // SF — Oracle Park
+  138: 0.96, // STL — Busch Stadium
+  139: 0.94, // TB — Tropicana Field
+  140: 1.03, // TEX — Globe Life Field
+  141: 1.01, // TOR — Rogers Centre
+  142: 0.99, // MIN — Target Field
+  143: 1.02, // PHI — Citizens Bank Park
+  144: 1.01, // ATL — Truist Park
+  145: 1.0, // CWS — Rate Field
+  146: 0.95, // MIA — loanDepot park
+  147: 1.02, // NYY — Yankee Stadium
+  158: 0.98, // MIL — American Family Field
+};

@@ -16,6 +16,9 @@ export interface TeamInfo {
   score?: number;
   wins?: number;
   losses?: number;
+  ops?: number; // season team OPS (hitting / batter production)
+  era?: number; // season team ERA (pitching staff incl. bullpen)
+  fieldingPct?: number; // season fielding percentage (defensive-efficiency proxy)
 }
 
 export interface ShapContribution {
@@ -85,6 +88,12 @@ export interface FeatureValues {
   homeField: number; // always 1
   spFipDiff: number; // away SP FIP - home SP FIP (positive favors home)
   spEraDiff: number; // away SP ERA - home SP ERA (positive favors home)
+  opsDiff: number; // home team OPS - away team OPS (positive favors home)
+  teamEraDiff: number; // away team ERA - home team ERA (positive favors home)
+  defEffDiff: number; // home fieldingPct - away fieldingPct (positive favors home)
+  parkFactor: number; // home ballpark run factor (>1 hitter-friendly)
+  tempDev: number; // game temperature deviation from 72°F
+  windMph: number; // game wind speed
 }
 
 export const FEATURE_KEYS = [
@@ -96,6 +105,12 @@ export const FEATURE_KEYS = [
   "homeField",
   "spFipDiff",
   "spEraDiff",
+  "opsDiff",
+  "teamEraDiff",
+  "defEffDiff",
+  "parkFactor",
+  "tempDev",
+  "windMph",
 ] as const;
 
 export type FeatureKey = (typeof FEATURE_KEYS)[number];
@@ -109,6 +124,12 @@ export const FEATURE_LABELS: Record<FeatureKey, string> = {
   homeField: "Home field",
   spFipDiff: "Starting Pitcher FIP / xERA Delta",
   spEraDiff: "Starting Pitcher ERA Delta",
+  opsDiff: "Team OPS edge",
+  teamEraDiff: "Bullpen / Staff ERA edge",
+  defEffDiff: "Defensive efficiency edge",
+  parkFactor: "Ballpark factor",
+  tempDev: "Weather temperature",
+  windMph: "Weather wind",
 };
 
 /** A training row: features computed strictly as-of the game time. */
@@ -303,4 +324,32 @@ export interface OptimizationParams {
   cvFolds: number;
   isotonicMethod: string;
   featureSelection: string;
+}
+
+/**
+ * Mapping from win probability to expected run margin, used to reconcile the
+ * run-scoring model's predicted scores with the win-probability model.
+ * `margin = intercept + slope * logit(homeWinProb)`.
+ */
+export interface RunMarginCalibration {
+  slope: number;
+  intercept: number;
+}
+
+/** Precomputed full-range calibration metrics (stored on the model state). */
+export interface CalibrationSummary {
+  metrics: {
+    auc: number;
+    brier: number;
+    logLoss: number;
+    ece: number;
+    bins: CalibrationBin[];
+    confidenceDistribution: ConfidencePoint[];
+    calibrationCurve: CurvePoint[];
+  };
+  totalsMetrics: { n: number; mae: number; rmse: number; bias: number };
+  runLineMetrics: { n: number; auc: number; brier: number; accuracy: number };
+  total: number;
+  correct: number;
+  accuracy: number;
 }

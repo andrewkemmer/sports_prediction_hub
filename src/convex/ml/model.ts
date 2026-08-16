@@ -30,12 +30,14 @@ import {
   PowerRanking,
   RawGame,
   RollingBrierPoint,
+  RunMarginCalibration,
   ShapContribution,
   StackingWeight,
   TeamState,
   TrainedModel,
 } from "./types";
 import { fitRunModel, RunModel, simulateRuns } from "./runs";
+import { PARK_FACTORS } from "./teams";
 
 const ELO_INIT = 1500;
 const ELO_HFA_UPDATE = 30; // home advantage baked into Elo updates only
@@ -87,6 +89,7 @@ export interface ModelRunResult {
   optimizationParams: OptimizationParams;
   runModel: RunModel;
   runLineCalibration: { x: number; y: number }[];
+  runMarginCalibration: RunMarginCalibration;
 }
 
 export interface Prediction {
@@ -230,6 +233,15 @@ function buildFeatures(game: RawGame, state: MutableState): FeatureValues {
   const homeRest = clamp(daysBetween(state.lastGameDate[game.home.id] ?? "", game.date), 0, 10);
   const awayRest = clamp(daysBetween(state.lastGameDate[game.away.id] ?? "", game.date), 0, 10);
 
+  const homeOps = game.home.ops;
+  const awayOps = game.away.ops;
+  const homeTeamEra = game.home.era;
+  const awayTeamEra = game.away.era;
+  const homeFielding = game.home.fieldingPct;
+  const awayFielding = game.away.fieldingPct;
+  const tempF = game.weather?.tempF;
+  const wind = game.weather?.windMph;
+
   return {
     eloDiff: (homeElo - awayElo) / 100,
     winPctDiff: homeWp - awayWp,
@@ -239,6 +251,12 @@ function buildFeatures(game: RawGame, state: MutableState): FeatureValues {
     homeField: 1,
     spFipDiff: starterDelta(game.homePitcher, game.awayPitcher, "fip"),
     spEraDiff: starterDelta(game.homePitcher, game.awayPitcher, "era"),
+    opsDiff: typeof homeOps === "number" && typeof awayOps === "number" ? homeOps - awayOps : 0,
+    teamEraDiff: typeof awayTeamEra === "number" && typeof homeTeamEra === "number" ? awayTeamEra - homeTeamEra : 0,
+    defEffDiff: typeof homeFielding === "number" && typeof awayFielding === "number" ? homeFielding - awayFielding : 0,
+    parkFactor: PARK_FACTORS[game.home.id] ?? 1,
+    tempDev: typeof tempF === "number" ? tempF - 72 : 0,
+    windMph: typeof wind === "number" ? wind : 0,
   };
 }
 
@@ -983,6 +1001,35 @@ function eloProb(row: FeatureRow, hfa: number): number {
   return sigmoid(((row.homeElo + hfa - row.awayElo) / 400) * Math.log(10));
 }
 
+/**
+ * Fit the mapping `expected run margin = intercept + slope · logit(homeWinProb)`
+ * on all completed games. This reconciles the run-scoring model (Poisson means)
+ * with the win-probability model so the two never contradict each other —
+ * e.g. an underdog being shown to score more runs than the favorite.
+ */
+function fitRunMarginCalibration(rows: FeatureRow[], model: TrainedModel): RunMarginCalibration {
+  const xs: number[] = [];
+  const ys: number[] = [];
+  for (const r of rows) {
+    const p = applyModel(model, r.features, r.homeElo, r.awayElo).homeWinProb;
+    const margin = (r.game.home.score ?? 0) - (r.game.away.score ?? 0);
+    xs.push(logit(p));
+    ys.push(margin);
+  }
+  if (xs.length < 40) return { slope: 0, intercept: 0 };
+  const n = xs.length;
+  const mx = mean(xs);
+  const my = mean(ys);
+  let sxy = 0;
+  let sxx = 0;
+  for (let i = 0; i < n; i++) {
+    sxy += (xs[i] - mx) * (ys[i] - my);
+    sxx += (xs[i] - mx) * (xs[i] - mx);
+  }
+  const slope = sxx > 1e-9 ? sxy / sxx : 0;
+  return { slope, intercept: my - slope * mx };
+}
+
 export function runModel(
   completedGames: RawGame[],
   opts: { season: string; asOfDate: string },
@@ -1155,6 +1202,9 @@ export function runModel(
     eloHfa,
   };
 
+  // Reconcile the run-scoring model with the win-probability model.
+  const runMarginCalibration = fitRunMarginCalibration(rows, model);
+
   const predict = (game: RawGame): Prediction =>
     applyModel(
       model,
@@ -1292,6 +1342,7 @@ export function runModel(
     optimizationParams,
     runModel,
     runLineCalibration,
+    runMarginCalibration,
   };
 
   return { result, model, teamState, rows, predict };
