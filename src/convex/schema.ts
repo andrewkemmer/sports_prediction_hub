@@ -111,6 +111,19 @@ const schema = defineSchema(
       actualMargin: v.optional(v.number()),
     }).index("by_date", ["date"]),
 
+    // Live progress for the long-running model refresh action. The client
+    // subscribes to this so the refresh button can show a real progress bar.
+    refreshProgress: defineTable({
+      key: v.string(),
+      stage: v.string(),
+      pct: v.number(),
+      message: v.string(),
+      startedAt: v.number(),
+      updatedAt: v.number(),
+      done: v.boolean(),
+      error: v.optional(v.string()),
+    }).index("by_key", ["key"]),
+
     // Singleton document (key = "current") describing the trained model.
     modelState: defineTable({
       key: v.string(),
