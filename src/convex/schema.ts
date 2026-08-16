@@ -118,6 +118,8 @@ const schema = defineSchema(
       rollingBrier: v.optional(v.any()),
       brierBaseline: v.optional(v.number()),
       modelVersions: v.optional(v.any()),
+      spearmanRho: v.optional(v.number()),
+      topDecileWinRate: v.optional(v.number()),
       todaysRecord: v.any(),
     }).index("by_key", ["key"]),
   },

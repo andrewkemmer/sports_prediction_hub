@@ -9,6 +9,7 @@ import {
   calibrationCurvePoints,
   evaluate,
   runModel,
+  spearmanRank,
 } from "./ml/model";
 import { teamMeta } from "./ml/teams";
 import {
@@ -423,6 +424,9 @@ export const refreshModel = action({
     const fullLabels = completedDocs.map((d) => (d.isCorrect ? 1 : 0));
     const fullCurve = calibrationCurvePoints(fullPreds, fullLabels, 12);
     const fullEval = evaluate(fullPreds, fullLabels);
+    const spearmanRho = spearmanRank(fullPreds, fullLabels);
+    const highConf = completedDocs.filter((d) => d.pickProb >= 0.65);
+    const topDecileWinRate = highConf.length > 0 ? highConf.filter((d) => d.isCorrect).length / highConf.length : 0;
 
     // 4. Upcoming games (today through +3 days) with starter stat context.
     const windowEnd = addDays(today, UPCOMING_WINDOW_DAYS);
@@ -480,6 +484,8 @@ export const refreshModel = action({
         rollingBrier: result.rollingBrier,
         brierBaseline: result.brierBaseline,
         modelVersions: result.modelVersions,
+        spearmanRho,
+        topDecileWinRate,
         todaysRecord,
       },
     });

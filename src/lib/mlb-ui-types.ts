@@ -60,5 +60,7 @@ export interface ModelStateDoc {
   rollingBrier?: RollingBrierPoint[];
   brierBaseline?: number;
   modelVersions?: ModelVersion[];
+  spearmanRho?: number;
+  topDecileWinRate?: number;
   todaysRecord: TodaysRecord;
 }

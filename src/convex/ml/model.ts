@@ -466,6 +466,38 @@ export function computeLogLoss(preds: number[], labels: number[]): number {
   );
 }
 
+/** Spearman rank correlation between predictions and binary outcomes. */
+export function spearmanRank(preds: number[], labels: number[]): number {
+  const n = preds.length;
+  if (n < 2) return 0;
+  const rank = (vals: number[]): number[] => {
+    const idx = vals.map((v, i) => ({ v, i })).sort((a, b) => a.v - b.v);
+    const out = new Array(n).fill(0);
+    for (let i = 0; i < n; i++) {
+      let j = i;
+      while (j + 1 < n && idx[j + 1].v === idx[i].v) j++;
+      const avg = (i + j) / 2 + 1;
+      for (let k = i; k <= j; k++) out[idx[k].i] = avg;
+      i = j;
+    }
+    return out;
+  };
+  const rx = rank(preds);
+  const ry = rank(labels);
+  const center = (n + 1) / 2;
+  let num = 0;
+  let dx2 = 0;
+  let dy2 = 0;
+  for (let i = 0; i < n; i++) {
+    const dx = rx[i] - center;
+    const dy = ry[i] - center;
+    num += dx * dy;
+    dx2 += dx * dx;
+    dy2 += dy * dy;
+  }
+  return dx2 === 0 || dy2 === 0 ? 0 : num / Math.sqrt(dx2 * dy2);
+}
+
 function confidenceBins(preds: number[], labels: number[]): CalibrationBin[] {
   const bins: { sumP: number; sumY: number; count: number }[] = [];
   for (let b = 0; b < 10; b++) bins.push({ sumP: 0, sumY: 0, count: 0 });
