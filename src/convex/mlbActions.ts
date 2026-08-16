@@ -841,7 +841,23 @@ async function fastRefresh(
       : "Writing calibration rows for the fresh window…",
   );
   if (needsCalibrationBackfill) {
-    const storedDocs = await loadStoredDocs(ctx, "2022-03-15", today);
+    let backfillLoaded = 0;
+    const storedDocs = await loadStoredDocs(ctx, "2022-03-15", today, (loaded) => {
+      backfillLoaded = loaded;
+      // Keep the progress bar visibly moving while the full history loads.
+      void report(
+        "Backfilling calibration",
+        94,
+        `Building calibration history — ${loaded.toLocaleString()} games loaded…`,
+      );
+    });
+    if (backfillLoaded > 0) {
+      await report(
+        "Backfilling calibration",
+        95,
+        `Writing calibration rows for ${backfillLoaded.toLocaleString()} games…`,
+      );
+    }
     const backfillByDate = new Map<string, CalibrationRow[]>();
     for (const d of storedDocs) {
       if (d.winner !== "home" && d.winner !== "away") continue;
@@ -1214,16 +1230,24 @@ async function loadStoredGames(ctx: any, startDate: string, endDate: string): Pr
  * prediction fields (pickProb / isCorrect / runProjection) intact. Used for
  * the one-time calibration backfill.
  */
-async function loadStoredDocs(ctx: any, startDate: string, endDate: string): Promise<GameDoc[]> {
+async function loadStoredDocs(
+  ctx: any,
+  startDate: string,
+  endDate: string,
+  onPage?: (loaded: number) => void,
+): Promise<GameDoc[]> {
   const all: GameDoc[] = [];
   let cursor: string | null = null;
   do {
+    // 200-doc pages keep each query's read comfortably under Convex's
+    // per-transaction limit even for docs carrying lineups + SHAP.
     const page: { games: GameDoc[]; cursor: string | null } = await ctx.runQuery(
       internal.mlb.getGamesByDateRange,
-      { startDate, endDate, cursor, limit: 300 },
+      { startDate, endDate, cursor, limit: 200 },
     );
     all.push(...page.games);
     cursor = page.cursor;
+    if (onPage) onPage(all.length);
   } while (cursor);
   return all;
 }
