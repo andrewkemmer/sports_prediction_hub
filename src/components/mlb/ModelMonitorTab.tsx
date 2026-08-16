@@ -1,170 +1,291 @@
 import type { ModelStateDoc } from "@/lib/mlb-ui-types";
-import { formatTrainedAt } from "@/lib/format";
+import { formatMonthDayYear } from "@/lib/format";
 import { cn } from "@/lib/utils";
-import { Check, Database, Dices, Sparkles, X } from "lucide-react";
+import { AlertTriangle } from "lucide-react";
+import {
+  CartesianGrid,
+  Line,
+  LineChart,
+  ReferenceLine,
+  ResponsiveContainer,
+  Tooltip,
+  XAxis,
+  YAxis,
+} from "recharts";
 
-function Section({
-  title,
-  icon,
-  children,
+const tooltipStyle = {
+  backgroundColor: "#161b22",
+  border: "1px solid rgba(255,255,255,0.1)",
+  borderRadius: 8,
+  color: "#e6e8ee",
+  fontSize: 12,
+};
+
+function shortDate(ymd: string): string {
+  const d = new Date(`${ymd}T00:00:00Z`);
+  if (Number.isNaN(d.getTime())) return ymd;
+  return d.toLocaleDateString("en-US", {
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+    timeZone: "UTC",
+  });
+}
+
+function shortMonthDay(ymd: string): string {
+  const d = new Date(`${ymd}T00:00:00Z`);
+  if (Number.isNaN(d.getTime())) return ymd;
+  return d.toLocaleDateString("en-US", { month: "short", day: "numeric", timeZone: "UTC" });
+}
+
+function StatCard({
+  dot,
+  label,
+  value,
+  sub,
+  subClass,
 }: {
-  title: string;
-  icon?: React.ReactNode;
-  children: React.ReactNode;
+  dot: string;
+  label: string;
+  value: string;
+  sub: string;
+  subClass: string;
 }) {
   return (
     <div className="rounded-2xl border border-border bg-card p-5">
-      <div className="mb-4 flex items-center gap-2">
-        {icon}
-        <h3 className="text-sm font-semibold text-foreground">{title}</h3>
+      <div className="flex items-center gap-2">
+        <span className={cn("size-2 rounded-full", dot)} />
+        <span className="text-[11px] font-semibold uppercase tracking-widest text-muted-foreground">{label}</span>
       </div>
-      {children}
+      <div className="mt-2 text-xl font-bold text-foreground">{value}</div>
+      <div className={cn("mt-1 text-xs", subClass)}>{sub}</div>
     </div>
   );
 }
 
 export function ModelMonitorTab({ modelState }: { modelState: ModelStateDoc }) {
-  const candidates = modelState.candidates ?? [];
-  const features = modelState.featureImportances ?? [];
+  const drift = modelState.featureDrift ?? [];
+  const rolling = modelState.rollingBrier ?? [];
+  const versions = modelState.modelVersions ?? [];
+  const record = modelState.todaysRecord;
+
+  const now = Date.now();
+  const daysAgo = Math.max(0, Math.floor((now - modelState.trainedAt) / 86400000));
+  const nextRetrain = modelState.trainedAt + 86400000;
+
+  const warns = drift.filter((d) => d.status === "WARN");
+  const firstWarn = warns[0];
+
+  const upsets = record?.upsets ?? [];
+  const upsetText = upsets
+    .map((u) => `${u.team} over ${u.loser} at ${u.prob}%`)
+    .join(", ");
 
   return (
-    <div className="flex flex-col gap-4">
+    <div className="flex flex-col gap-5">
+      {/* Header */}
       <div>
-        <h2 className="text-xl font-bold tracking-tight">Model Monitor</h2>
+        <h2 className="text-xl font-bold tracking-tight">Model &amp; Data Drift Monitor</h2>
         <p className="mt-2 text-sm text-muted-foreground">
-          How the model was trained, which features and model were selected, and whether a
-          stochastic (Monte Carlo) component was adopted.
+          Tracking model health, feature drift, and performance over time
         </p>
       </div>
 
-      <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
-        {/* Selected model */}
-        <Section title="Selected Model" icon={<Sparkles className="size-4 text-primary" />}>
-          <div className="flex items-center gap-2">
-            <span className="rounded-full bg-primary/15 px-2.5 py-0.5 text-xs font-semibold text-primary">
-              {modelState.selectedModel}
-            </span>
-            <span className="text-xs text-muted-foreground">Trained {formatTrainedAt(modelState.trainedAt)} ET</span>
-          </div>
-          <p className="mt-3 text-sm leading-6 text-muted-foreground">{modelState.modelDescription}</p>
-          <div className="mt-4 grid grid-cols-2 gap-3">
-            <div className="rounded-lg border border-border/70 p-3">
-              <div className="text-[10px] uppercase tracking-wider text-muted-foreground">Training games</div>
-              <div className="mt-1 text-lg font-semibold tabular-nums">{modelState.gamesTrained}</div>
-            </div>
-            <div className="rounded-lg border border-border/70 p-3">
-              <div className="text-[10px] uppercase tracking-wider text-muted-foreground">Holdout (test)</div>
-              <div className="mt-1 text-lg font-semibold tabular-nums">{modelState.holdoutCount}</div>
-            </div>
-          </div>
-        </Section>
-
-        {/* Monte Carlo decision */}
-        <Section
-          title="Stochastic Component (Monte Carlo)"
-          icon={<Dices className="size-4 text-amber-400" />}
-        >
-          <div
-            className={cn(
-              "flex items-center gap-2 rounded-lg border p-3",
-              modelState.monteCarloEnabled
-                ? "border-emerald-500/25 bg-emerald-500/10"
-                : "border-border/70 bg-white/[0.02]",
-            )}
-          >
-            {modelState.monteCarloEnabled ? (
-              <Check className="size-4 text-emerald-400" />
-            ) : (
-              <X className="size-4 text-muted-foreground" />
-            )}
-            <span className={cn("text-sm font-medium", modelState.monteCarloEnabled ? "text-emerald-300" : "text-foreground")}>
-              {modelState.monteCarloEnabled
-                ? `Enabled — σ = ${modelState.monteCarloSigma.toFixed(2)}, ${modelState.monteCarloTrials} trials`
-                : "Disabled — deterministic point estimates"}
-            </span>
-          </div>
-          <p className="mt-3 text-sm leading-6 text-muted-foreground">{modelState.monteCarloRationale}</p>
-        </Section>
+      {/* Metric cards */}
+      <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
+        <StatCard
+          dot="bg-emerald-500"
+          label="Last Retrain"
+          value={formatMonthDayYear(modelState.trainedAt)}
+          sub={`Model healthy — ${daysAgo === 0 ? "today" : `${daysAgo} day${daysAgo === 1 ? "" : "s"} ago`}`}
+          subClass="text-emerald-400"
+        />
+        <StatCard
+          dot="bg-blue-500"
+          label="Next Retrain"
+          value={formatMonthDayYear(nextRetrain)}
+          sub="Nightly schedule — tonight"
+          subClass="text-muted-foreground"
+        />
+        <StatCard
+          dot={warns.length > 0 ? "bg-amber-500" : "bg-emerald-500"}
+          label="Drift Alerts"
+          value={`${warns.length} Warning${warns.length === 1 ? "" : "s"}`}
+          sub={firstWarn ? `${firstWarn.label} — elevated PSI` : "All features stable"}
+          subClass={firstWarn ? "text-amber-400" : "text-emerald-400"}
+        />
       </div>
 
-      {/* Candidate models */}
-      <Section title="Model Selection (candidate comparison)">
+      {/* Upset monitoring note */}
+      {(upsets.length > 0 || record) && (
+        <div className="rounded-2xl border border-border bg-card p-5">
+          <div className="flex items-center gap-2 text-sm font-bold text-amber-400">
+            <AlertTriangle className="size-4" />
+            Upset Monitoring Note — {shortDate(record?.date ?? modelState.asOfDate)}
+          </div>
+          <p className="mt-2 text-sm leading-6 text-muted-foreground">
+            {upsets.length > 0 ? (
+              <>
+                {upsets.length} upset{upsets.length === 1 ? "" : "s"} today ({upsetText}) — monitoring for
+                regime shift. Model went {record?.wins}-{record?.losses} overall but high-confidence picks
+                (&gt;65%) showed vulnerability. Will assess after tonight's retrain.
+              </>
+            ) : (
+              <>No upsets recorded — monitoring for regime shift on tonight's retrain.</>
+            )}
+          </p>
+        </div>
+      )}
+
+      {/* Feature drift analysis */}
+      <div className="rounded-2xl border border-border bg-card p-5">
+        <h3 className="mb-4 text-sm font-semibold text-foreground">Feature Drift Analysis (PSI Scores)</h3>
         <div className="overflow-x-auto">
           <table className="w-full min-w-[560px] text-sm">
             <thead>
               <tr className="border-b border-border/70 text-left text-[11px] uppercase tracking-wider text-muted-foreground">
-                <th className="pb-2 font-medium">Model</th>
-                <th className="pb-2 text-right font-medium">AUC</th>
-                <th className="pb-2 text-right font-medium">Brier</th>
-                <th className="pb-2 text-right font-medium">Log-loss</th>
-                <th className="pb-2 text-right font-medium">ECE</th>
+                <th className="pb-2 font-medium">Feature</th>
+                <th className="pb-2 text-right font-medium">Current Mean</th>
+                <th className="pb-2 text-right font-medium">Baseline Mean</th>
+                <th className="pb-2 text-right font-medium">PSI</th>
                 <th className="pb-2 text-right font-medium">Status</th>
               </tr>
             </thead>
             <tbody>
-              {candidates.map((c) => (
-                <tr key={c.name} className="border-b border-border/50 last:border-0">
-                  <td className="py-2.5 font-medium text-foreground">{c.name}</td>
-                  <td className="py-2.5 text-right tabular-nums text-foreground">{c.auc.toFixed(3)}</td>
-                  <td className="py-2.5 text-right tabular-nums text-foreground">{c.brier.toFixed(3)}</td>
-                  <td className="py-2.5 text-right tabular-nums text-muted-foreground">{c.logLoss.toFixed(3)}</td>
-                  <td className="py-2.5 text-right tabular-nums text-muted-foreground">{c.ece.toFixed(3)}</td>
+              {drift.map((d) => (
+                <tr key={d.feature} className="border-b border-border/50 last:border-0">
+                  <td className="py-2.5 font-medium text-foreground">{d.label}</td>
+                  <td className="py-2.5 text-right tabular-nums text-foreground">{d.currentMean.toFixed(3)}</td>
+                  <td className="py-2.5 text-right tabular-nums text-muted-foreground">{d.baselineMean.toFixed(3)}</td>
+                  <td className={cn("py-2.5 text-right tabular-nums", d.status === "WARN" ? "text-amber-400" : "text-foreground")}>
+                    {d.psi.toFixed(3)}
+                  </td>
                   <td className="py-2.5 text-right">
-                    {c.selected ? (
-                      <span className="rounded-full bg-emerald-500/15 px-2 py-0.5 text-xs font-semibold text-emerald-300">
-                        Selected
-                      </span>
-                    ) : (
-                      <span className="text-xs text-muted-foreground">—</span>
-                    )}
+                    <span
+                      className={cn(
+                        "rounded-full px-2 py-0.5 text-xs font-semibold",
+                        d.status === "WARN" ? "bg-amber-500/15 text-amber-300" : "bg-emerald-500/15 text-emerald-300",
+                      )}
+                    >
+                      {d.status}
+                    </span>
                   </td>
                 </tr>
               ))}
+              {drift.length === 0 && (
+                <tr>
+                  <td colSpan={5} className="py-8 text-center text-sm text-muted-foreground">
+                    No drift data yet.
+                  </td>
+                </tr>
+              )}
             </tbody>
           </table>
         </div>
-      </Section>
+      </div>
 
-      {/* Feature selection */}
-      <Section title="Feature Selection (greedy backward elimination)">
-        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-          {features.map((f) => {
-            const maxImp = Math.max(...features.map((x) => x.importance), 1e-6);
-            return (
-              <div key={f.feature} className="rounded-lg border border-border/70 p-3">
-                <div className="flex items-center justify-between">
-                  <span className="text-sm font-medium text-foreground">{f.label}</span>
-                  <span className="text-xs text-muted-foreground tabular-nums">
-                    uni AUC {f.univariateAuc.toFixed(3)}
-                  </span>
-                </div>
-                <div className="mt-2.5 flex items-center gap-2.5">
-                  <div className="h-2 flex-1 overflow-hidden rounded-full bg-white/5">
-                    <div
-                      className="h-full rounded-full bg-primary/70"
-                      style={{ width: `${Math.max(4, (f.importance / maxImp) * 100)}%` }}
-                    />
-                  </div>
-                  <span className="w-20 text-right text-[11px] tabular-nums text-muted-foreground">
-                    w = {f.weight.toFixed(3)}
-                  </span>
-                </div>
-              </div>
-            );
-          })}
+      {/* Rolling Brier score */}
+      <div className="rounded-2xl border border-border bg-card p-5">
+        <div className="mb-4 flex items-center justify-between">
+          <h3 className="text-sm font-semibold text-foreground">Rolling Brier Score (Last 30 Days)</h3>
+          <div className="flex items-center gap-4 text-xs text-muted-foreground">
+            <span className="flex items-center gap-1.5">
+              <span className="size-2.5 rounded-sm bg-orange-400" /> Brier Score
+            </span>
+            <span className="flex items-center gap-1.5">
+              <span className="h-0 w-4 border-t border-dashed border-muted-foreground" /> Baseline (prior version)
+            </span>
+          </div>
         </div>
-      </Section>
+        {rolling.length === 0 ? (
+          <div className="flex h-64 items-center justify-center text-sm text-muted-foreground">
+            No rolling risk data yet.
+          </div>
+        ) : (
+        <div className="h-64 w-full">
+          <ResponsiveContainer width="100%" height="100%">
+            <LineChart data={rolling} margin={{ top: 8, right: 16, bottom: 8, left: -8 }}>
+              <CartesianGrid stroke="rgba(255,255,255,0.06)" strokeDasharray="3 3" />
+              <XAxis
+                dataKey="date"
+                tickFormatter={shortMonthDay}
+                stroke="#8b93a7"
+                tick={{ fill: "#8b93a7", fontSize: 10 }}
+                minTickGap={24}
+              />
+              <YAxis
+                domain={["dataMin - 0.01", "dataMax + 0.01"]}
+                stroke="#8b93a7"
+                tick={{ fill: "#8b93a7", fontSize: 10 }}
+                tickFormatter={(v: number) => v.toFixed(3)}
+              />
+              <Tooltip
+                contentStyle={tooltipStyle}
+                labelFormatter={(l: string) => shortDate(l)}
+                formatter={(value: number | string) => Number(value).toFixed(3)}
+              />
+              <ReferenceLine
+                y={modelState.brierBaseline ?? modelState.brier}
+                stroke="#8b93a7"
+                strokeDasharray="4 4"
+              />
+              <Line
+                type="monotone"
+                dataKey="brier"
+                name="Brier Score"
+                stroke="#fb923c"
+                strokeWidth={2}
+                dot={{ r: 3, fill: "#fb923c", strokeWidth: 0 }}
+              />
+            </LineChart>
+          </ResponsiveContainer>
+        </div>
+        )}
+      </div>
 
-      {/* Data source */}
-      <Section title="Data Source" icon={<Database className="size-4 text-teal-400" />}>
-        <p className="text-sm leading-6 text-muted-foreground">
-          All historical game, score, standings, probable-pitcher, player statistics, and weekly
-          injured-list rosters come from a single consolidated source — the official MLB Stats API (
-          <span className="font-medium text-foreground">statsapi.mlb.com</span>). No secondary data
-          sources are used. The model retrains and regenerates predictions on demand whenever you
-          click <span className="font-medium text-foreground">Refresh</span>.
-        </p>
-      </Section>
+      {/* Model version history */}
+      <div className="rounded-2xl border border-border bg-card p-5">
+        <h3 className="mb-4 text-sm font-semibold text-foreground">Model Version History</h3>
+        <div className="overflow-x-auto">
+          <table className="w-full min-w-[600px] text-sm">
+            <thead>
+              <tr className="border-b border-border/70 text-left text-[11px] uppercase tracking-wider text-muted-foreground">
+                <th className="pb-2 font-medium">Version</th>
+                <th className="pb-2 font-medium">Date</th>
+                <th className="pb-2 text-right font-medium">AUC</th>
+                <th className="pb-2 text-right font-medium">Brier</th>
+                <th className="pb-2 font-medium">Notes</th>
+              </tr>
+            </thead>
+            <tbody>
+              {versions.map((v) => (
+                <tr key={v.version} className="border-b border-border/50 last:border-0">
+                  <td className="py-2.5 font-semibold text-cyan-300">{v.version}</td>
+                  <td className="py-2.5 text-muted-foreground">{shortDate(v.date)}</td>
+                  <td className="py-2.5 text-right tabular-nums text-foreground">{v.auc.toFixed(3)}</td>
+                  <td className="py-2.5 text-right tabular-nums text-foreground">{v.brier.toFixed(3)}</td>
+                  <td className="py-2.5 text-muted-foreground">{v.notes}</td>
+                </tr>
+              ))}
+              {versions.length === 0 && (
+                <tr>
+                  <td colSpan={5} className="py-8 text-center text-sm text-muted-foreground">
+                    No version history yet.
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {/* Model summary + data source footnote */}
+      <p className="text-xs leading-5 text-muted-foreground">
+        Model: <span className="text-foreground">{modelState.selectedModel}</span> ·{" "}
+        {modelState.featureNames.length} features selected · Monte Carlo{" "}
+        {modelState.monteCarloEnabled ? "enabled" : "disabled"} · Data:{" "}
+        <span className="text-foreground">statsapi.mlb.com</span> (single consolidated source)
+      </p>
     </div>
   );
 }

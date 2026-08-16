@@ -1,5 +1,5 @@
 import type { CalibrationBin, ModelStateDoc } from "@/lib/mlb-ui-types";
-import { formatPct, formatTrainedAt } from "@/lib/format";
+import { formatDateShort, formatNumber, formatPct, formatTrainedAt } from "@/lib/format";
 import { cn } from "@/lib/utils";
 import { Zap } from "lucide-react";
 import {
@@ -34,15 +34,17 @@ function MetricCard({
   label: string;
   value: number;
   color: string;
-  sub: string;
+  sub?: string;
 }) {
   return (
-    <div className="rounded-2xl border border-border bg-card p-5">
-      <div className="text-[11px] font-medium uppercase tracking-wider text-muted-foreground">{label}</div>
-      <div className="mt-2 text-3xl font-bold tabular-nums" style={{ color }}>
+    <div className="rounded-2xl border border-border bg-card p-6">
+      <div className="text-center text-[11px] font-semibold uppercase tracking-widest text-muted-foreground">
+        {label}
+      </div>
+      <div className="mt-3 text-center text-4xl font-bold tabular-nums" style={{ color }}>
         {value.toFixed(3)}
       </div>
-      <div className="mt-1 text-xs text-muted-foreground">{sub}</div>
+      {sub && <div className="mt-1 text-center text-xs text-muted-foreground">{sub}</div>}
     </div>
   );
 }
@@ -64,14 +66,12 @@ export function CalibrationTab({ modelState }: { modelState: ModelStateDoc }) {
     <div className="flex flex-col gap-5">
       {/* Header */}
       <div>
-        <div className="flex flex-wrap items-center gap-3">
-          <h2 className="text-xl font-bold tracking-tight">Model Calibration Dashboard</h2>
-          <span className="rounded-full border border-border bg-card px-3 py-1 text-xs text-muted-foreground">
-            As of {modelState.asOfDate} · n = {modelState.gamesTrained} games · Trained{" "}
-            {formatTrainedAt(modelState.trainedAt)} ET
-          </span>
-        </div>
-        <p className="mt-2 text-sm text-muted-foreground">
+        <h2 className="text-xl font-bold tracking-tight">Model Calibration Dashboard</h2>
+        <span className="mt-3 inline-block rounded-full border border-border bg-card px-3 py-1 text-xs text-muted-foreground">
+          As of {formatDateShort(modelState.asOfDate)} · n = {formatNumber(modelState.gamesTrained)} games ·
+          Trained {formatTrainedAt(modelState.trainedAt)} ET
+        </span>
+        <p className="mt-3 text-sm text-muted-foreground">
           Assessing prediction reliability and accuracy across probability buckets.
         </p>
       </div>
@@ -85,8 +85,8 @@ export function CalibrationTab({ modelState }: { modelState: ModelStateDoc }) {
               {record.wins}-{record.losses}
             </span>
             <span className="text-sm text-muted-foreground">
-              {record.completed} completed games · {record.correct} correct picks ({formatPct(record.accuracy, 1)}) ·
-              {record.upsets.length} upsets
+              {record.completed} completed games · {record.correct} correct picks (
+              {formatPct(record.accuracy, 1)}) · {record.upsets.length} upsets
             </span>
           </div>
           {record.upsets.length > 0 && (
@@ -105,25 +105,13 @@ export function CalibrationTab({ modelState }: { modelState: ModelStateDoc }) {
         </div>
       )}
 
-      {/* Metric cards */}
-      <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
-        <MetricCard label="AUC-ROC" value={modelState.auc} color="#22d3ee" sub="Rank discrimination" />
-        <MetricCard label="Brier Score" value={modelState.brier} color="#34d399" sub="Lower is better" />
-        <MetricCard label="Log-Loss" value={modelState.logLoss} color="#ffd700" sub="Penalizes confidence" />
-        <MetricCard label="Cal. Error" value={modelState.ece} color="#c4b5fd" sub="ECE metric" />
-      </div>
-      <p className="-mt-2 text-xs text-muted-foreground">
-        AUC, Brier, log-loss, and calibration error are computed on a chronologically held-out test
-        set (last 15% of games). Reliability and confidence charts use the full 2026 season.
-      </p>
-
       {/* Calibration curve */}
       <div className="rounded-2xl border border-border bg-card p-5">
         <div className="mb-4 flex items-center justify-between">
           <h3 className="text-sm font-semibold text-foreground">Calibration Curve</h3>
           <div className="flex items-center gap-4 text-xs text-muted-foreground">
             <span className="flex items-center gap-1.5">
-              <span className="size-2.5 rounded-sm bg-[#4d7fff]" /> Model (n={modelState.gamesTrained})
+              <span className="size-2.5 rounded-sm bg-[#4d7fff]" /> Model (n={formatNumber(modelState.gamesTrained)})
             </span>
             <span className="flex items-center gap-1.5">
               <span className="h-0 w-4 border-t border-dashed border-muted-foreground" /> Perfect calibration
@@ -175,12 +163,84 @@ export function CalibrationTab({ modelState }: { modelState: ModelStateDoc }) {
         </div>
       </div>
 
-      {/* Reliability diagram + confidence distribution */}
-      <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
-        {/* Reliability table */}
-        <div className="rounded-2xl border border-border bg-card p-5">
-          <h3 className="mb-4 text-sm font-semibold text-foreground">Reliability Diagram — Binned Data</h3>
-          <table className="w-full text-sm">
+      {/* Metric cards */}
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+        <MetricCard label="AUC-ROC" value={modelState.auc} color="#22d3ee" />
+        <MetricCard label="Brier Score" value={modelState.brier} color="#34d399" />
+        <MetricCard label="Log-Loss" value={modelState.logLoss} color="#fcd34d" sub="Penalizes confidence" />
+        <MetricCard label="Cal. Error" value={modelState.ece} color="#e879f9" sub="ECE metric" />
+      </div>
+      <p className="-mt-1 text-xs text-muted-foreground">
+        AUC, Brier, log-loss, and calibration error are computed on a chronologically held-out test
+        set (last 15% of games). Reliability and confidence charts use the full 2026 season.
+      </p>
+
+      {/* Confidence distribution & accuracy */}
+      <div className="rounded-2xl border border-border bg-card p-5">
+        <div className="mb-4 flex items-center justify-between">
+          <h3 className="text-sm font-semibold text-foreground">Prediction Confidence Distribution &amp; Accuracy</h3>
+          <div className="flex items-center gap-4 text-xs text-muted-foreground">
+            <span className="flex items-center gap-1.5">
+              <span className="size-2.5 rounded-sm bg-emerald-400" /> Actual accuracy %
+            </span>
+            <span className="flex items-center gap-1.5">
+              <span className="size-2.5 rounded-sm bg-blue-500/60" /> Game count
+            </span>
+          </div>
+        </div>
+        <div className="h-72 w-full">
+          <ResponsiveContainer width="100%" height="100%">
+            <ComposedChart data={distribution} margin={{ top: 8, right: 0, bottom: 8, left: -12 }}>
+              <CartesianGrid stroke="rgba(255,255,255,0.06)" strokeDasharray="3 3" />
+              <XAxis dataKey="label" stroke="#8b93a7" tick={{ fill: "#8b93a7", fontSize: 10 }} />
+              <YAxis
+                yAxisId="left"
+                stroke="#8b93a7"
+                tick={{ fill: "#8b93a7", fontSize: 10 }}
+                allowDecimals={false}
+              />
+              <YAxis
+                yAxisId="right"
+                orientation="right"
+                domain={[0.45, 0.8]}
+                ticks={[0.45, 0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8]}
+                tickFormatter={(v: number) => `${Math.round(v * 100)}%`}
+                stroke="#8b93a7"
+                tick={{ fill: "#8b93a7", fontSize: 10 }}
+              />
+              <Tooltip
+                contentStyle={tooltipStyle}
+                formatter={(value: number | string, name: string) =>
+                  name === "accuracy" ? `${(Number(value) * 100).toFixed(1)}%` : value
+                }
+              />
+              <Bar yAxisId="left" dataKey="count" name="Game Count" fill="rgba(77,125,255,0.45)" radius={[4, 4, 0, 0]} />
+              <Area
+                yAxisId="right"
+                dataKey="accuracy"
+                name="accuracy"
+                stroke="none"
+                fill="#34d399"
+                fillOpacity={0.12}
+              />
+              <Line
+                yAxisId="right"
+                dataKey="accuracy"
+                name="accuracy"
+                stroke="#34d399"
+                strokeWidth={2}
+                dot={{ r: 3, fill: "#34d399", strokeWidth: 0 }}
+              />
+            </ComposedChart>
+          </ResponsiveContainer>
+        </div>
+      </div>
+
+      {/* Reliability diagram */}
+      <div className="rounded-2xl border border-border bg-card p-5">
+        <h3 className="mb-4 text-sm font-semibold text-foreground">Reliability Diagram — Binned Data</h3>
+        <div className="overflow-x-auto">
+          <table className="w-full min-w-[520px] text-sm">
             <thead>
               <tr className="text-left text-[11px] uppercase tracking-wider text-muted-foreground">
                 <th className="pb-2 font-medium">Bucket</th>
@@ -212,67 +272,6 @@ export function CalibrationTab({ modelState }: { modelState: ModelStateDoc }) {
               )}
             </tbody>
           </table>
-        </div>
-
-        {/* Confidence distribution & accuracy */}
-        <div className="rounded-2xl border border-border bg-card p-5">
-          <div className="mb-4 flex items-center justify-between">
-            <h3 className="text-sm font-semibold text-foreground">Prediction Confidence Distribution & Accuracy</h3>
-            <div className="flex items-center gap-4 text-xs text-muted-foreground">
-              <span className="flex items-center gap-1.5">
-                <span className="size-2.5 rounded-sm bg-emerald-400" /> Actual accuracy %
-              </span>
-              <span className="flex items-center gap-1.5">
-                <span className="size-2.5 rounded-sm bg-blue-500/60" /> Game count
-              </span>
-            </div>
-          </div>
-          <div className="h-72 w-full">
-            <ResponsiveContainer width="100%" height="100%">
-              <ComposedChart data={distribution} margin={{ top: 8, right: 0, bottom: 8, left: -12 }}>
-                <CartesianGrid stroke="rgba(255,255,255,0.06)" strokeDasharray="3 3" />
-                <XAxis dataKey="label" stroke="#8b93a7" tick={{ fill: "#8b93a7", fontSize: 10 }} />
-                <YAxis
-                  yAxisId="left"
-                  stroke="#8b93a7"
-                  tick={{ fill: "#8b93a7", fontSize: 10 }}
-                  allowDecimals={false}
-                />
-                <YAxis
-                  yAxisId="right"
-                  orientation="right"
-                  domain={[0.45, 0.8]}
-                  ticks={[0.45, 0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8]}
-                  tickFormatter={(v: number) => `${Math.round(v * 100)}%`}
-                  stroke="#8b93a7"
-                  tick={{ fill: "#8b93a7", fontSize: 10 }}
-                />
-                <Tooltip
-                  contentStyle={tooltipStyle}
-                  formatter={(value: number | string, name: string) =>
-                    name === "accuracy" ? `${(Number(value) * 100).toFixed(1)}%` : value
-                  }
-                />
-                <Bar yAxisId="left" dataKey="count" name="Game Count" fill="rgba(77,125,255,0.45)" radius={[4, 4, 0, 0]} />
-                <Area
-                  yAxisId="right"
-                  dataKey="accuracy"
-                  name="accuracy"
-                  stroke="none"
-                  fill="#34d399"
-                  fillOpacity={0.12}
-                />
-                <Line
-                  yAxisId="right"
-                  dataKey="accuracy"
-                  name="accuracy"
-                  stroke="#34d399"
-                  strokeWidth={2}
-                  dot={{ r: 3, fill: "#34d399", strokeWidth: 0 }}
-                />
-              </ComposedChart>
-            </ResponsiveContainer>
-          </div>
         </div>
       </div>
     </div>

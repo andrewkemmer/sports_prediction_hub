@@ -138,6 +138,9 @@ export interface PowerRanking {
   last10WinPct: number;
   lastGameDate: string;
   injuries: number;
+  runDiff: number;
+  homeWinPct: number;
+  awayWinPct: number;
 }
 
 /** A team's injured-list count captured on a given date. */
@@ -147,7 +150,8 @@ export interface InjurySnapshot {
 }
 
 export interface UpsetItem {
-  team: string;
+  team: string; // winning team abbrev
+  loser: string; // losing team abbrev
   prob: number;
 }
 
@@ -160,6 +164,28 @@ export interface TodaysRecord {
   correct: number;
   accuracy: number;
   upsets: UpsetItem[];
+}
+
+export interface FeatureDriftItem {
+  feature: string;
+  label: string;
+  currentMean: number;
+  baselineMean: number;
+  psi: number;
+  status: "OK" | "WARN";
+}
+
+export interface RollingBrierPoint {
+  date: string;
+  brier: number;
+}
+
+export interface ModelVersion {
+  version: string;
+  date: string;
+  auc: number;
+  brier: number;
+  notes: string;
 }
 
 /** A trained, deployable model (reconstructable from modelState). */

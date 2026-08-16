@@ -104,36 +104,10 @@ export default function Dashboard() {
     <main className="min-h-screen bg-background text-foreground">
       {/* Header */}
       <header className="sticky top-0 z-20 border-b border-border/70 bg-background/80 backdrop-blur">
-        <div className="mx-auto flex w-full max-w-7xl flex-col gap-3 px-4 py-3 sm:px-6">
-          <div className="flex items-center justify-between gap-3">
-            <div className="flex items-center gap-2.5">
-              <BaseballMark />
-              <div>
-                <h1 className="text-base font-bold tracking-tight">MLB Predictions</h1>
-                <p className="text-[11px] text-muted-foreground">
-                  {user?.name ? `Signed in as ${user.name}` : "Machine-learned win probabilities"}
-                </p>
-              </div>
-            </div>
-            <div className="flex items-center gap-2">
-              <button
-                type="button"
-                onClick={handleRefresh}
-                disabled={refreshing}
-                className="flex cursor-pointer items-center gap-1.5 rounded-lg border border-border bg-card px-3 py-1.5 text-xs font-medium text-foreground transition-colors hover:border-ring/50 disabled:cursor-not-allowed disabled:opacity-60"
-              >
-                <RefreshCw className={cn("size-3.5", refreshing && "animate-spin")} />
-                {refreshing ? "Refreshing…" : "Refresh"}
-              </button>
-              <button
-                type="button"
-                onClick={handleSignOut}
-                className="flex cursor-pointer items-center gap-1.5 rounded-lg border border-border bg-card px-2.5 py-1.5 text-xs text-muted-foreground transition-colors hover:text-foreground"
-                title="Sign out"
-              >
-                <LogOut className="size-3.5" />
-              </button>
-            </div>
+        <div className="mx-auto flex w-full max-w-7xl flex-wrap items-center gap-x-4 gap-y-2 px-4 py-3 sm:px-6">
+          <div className="flex items-center gap-2.5">
+            <BaseballMark />
+            <h1 className="text-base font-bold tracking-tight">MLB Predictions</h1>
           </div>
 
           <nav className="flex items-center gap-1 overflow-x-auto">
@@ -154,6 +128,26 @@ export default function Dashboard() {
               </button>
             ))}
           </nav>
+
+          <div className="ml-auto flex items-center gap-2">
+            <button
+              type="button"
+              onClick={handleRefresh}
+              disabled={refreshing}
+              className="flex cursor-pointer items-center gap-1.5 rounded-lg border border-border bg-card px-3 py-1.5 text-xs font-medium text-foreground transition-colors hover:border-ring/50 disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              <RefreshCw className={cn("size-3.5", refreshing && "animate-spin")} />
+              {refreshing ? "Refreshing…" : "Refresh"}
+            </button>
+            <button
+              type="button"
+              onClick={handleSignOut}
+              className="flex cursor-pointer items-center gap-1.5 rounded-lg border border-border bg-card px-2.5 py-1.5 text-xs text-muted-foreground transition-colors hover:text-foreground"
+              title={user?.name ? `Signed in as ${user.name} — sign out` : "Sign out"}
+            >
+              <LogOut className="size-3.5" />
+            </button>
+          </div>
         </div>
       </header>
 

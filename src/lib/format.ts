@@ -69,6 +69,22 @@ export function addDaysYmd(ymd: string, days: number): string {
   return d.toISOString().slice(0, 10);
 }
 
+export function formatMonthDayYear(ms: number): string {
+  const d = new Date(ms);
+  if (Number.isNaN(d.getTime())) return "—";
+  return d.toLocaleDateString("en-US", {
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+    timeZone: "America/New_York",
+  });
+}
+
+export function formatNumber(n: number): string {
+  if (!Number.isFinite(n)) return "—";
+  return Math.round(n).toLocaleString("en-US");
+}
+
 export function formatTrainedAt(ms: number): string {
   const d = new Date(ms);
   if (Number.isNaN(d.getTime())) return "—";

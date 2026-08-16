@@ -475,6 +475,10 @@ export const refreshModel = action({
         featureImportances: result.featureImportances,
         candidates: result.candidates,
         powerRankings: result.powerRankings,
+        featureDrift: result.featureDrift,
+        rollingBrier: result.rollingBrier,
+        brierBaseline: result.brierBaseline,
+        modelVersions: result.modelVersions,
         todaysRecord,
       },
     });
@@ -544,6 +548,7 @@ function buildTodaysRecord(completedDocs: GameDoc[], today: string): TodaysRecor
     .filter((d) => d.isUpset)
     .map((d) => ({
       team: d.winner === "home" ? d.home.abbrev : d.away.abbrev,
+      loser: d.winner === "home" ? d.away.abbrev : d.home.abbrev,
       prob: Math.round((d.winner === "home" ? d.homeWinProb : d.awayWinProb) * 100),
     }));
   return {

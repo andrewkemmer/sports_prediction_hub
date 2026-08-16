@@ -18,13 +18,16 @@ import {
   CurvePoint,
   FEATURE_KEYS,
   FEATURE_LABELS,
+  FeatureDriftItem,
   FeatureImportance,
   FeatureKey,
   FeatureRow,
   FeatureValues,
   InjurySnapshot,
+  ModelVersion,
   PowerRanking,
   RawGame,
+  RollingBrierPoint,
   ShapContribution,
   TeamState,
   TrainedModel,
@@ -71,6 +74,10 @@ export interface ModelRunResult {
   featureImportances: FeatureImportance[];
   candidates: CandidateModel[];
   powerRankings: PowerRanking[];
+  featureDrift: FeatureDriftItem[];
+  rollingBrier: RollingBrierPoint[];
+  brierBaseline: number;
+  modelVersions: ModelVersion[];
 }
 
 export interface Prediction {
@@ -131,6 +138,19 @@ function dot(a: number[], b: number[]): number {
   return s;
 }
 
+function round(n: number, digits: number): number {
+  const f = Math.pow(10, digits);
+  return Math.round(n * f) / f;
+}
+
+function shiftDate(ymd: string, days: number): string {
+  if (!ymd) return "";
+  const d = new Date(`${ymd}T00:00:00Z`);
+  if (Number.isNaN(d.getTime())) return ymd;
+  d.setUTCDate(d.getUTCDate() + days);
+  return d.toISOString().slice(0, 10);
+}
+
 function daysBetween(from: string, to: string): number {
   if (!from || !to) return 4;
   const a = Date.parse(from);
@@ -149,10 +169,22 @@ interface MutableState {
   lastGameDate: Record<number, string>;
   records: Record<number, { wins: number; losses: number }>;
   injuries: Record<number, number>;
+  runDiff: Record<number, number>;
+  homeRecords: Record<number, { wins: number; losses: number }>;
+  awayRecords: Record<number, { wins: number; losses: number }>;
 }
 
 function newState(): MutableState {
-  return { elo: {}, formHistory: {}, lastGameDate: {}, records: {}, injuries: {} };
+  return {
+    elo: {},
+    formHistory: {},
+    lastGameDate: {},
+    records: {},
+    injuries: {},
+    runDiff: {},
+    homeRecords: {},
+    awayRecords: {},
+  };
 }
 
 function formOf(state: MutableState, id: number): number {
@@ -222,6 +254,23 @@ function updateState(state: MutableState, game: RawGame): void {
   state.records[home] = hr;
   state.records[away] = ar;
 
+  const hScore = game.home.score ?? 0;
+  const aScore = game.away.score ?? 0;
+  state.runDiff[home] = (state.runDiff[home] ?? 0) + (hScore - aScore);
+  state.runDiff[away] = (state.runDiff[away] ?? 0) + (aScore - hScore);
+
+  const hHome = state.homeRecords[home] ?? { wins: 0, losses: 0 };
+  const aAway = state.awayRecords[away] ?? { wins: 0, losses: 0 };
+  if (homeActual === 1) {
+    hHome.wins += 1;
+    aAway.losses += 1;
+  } else {
+    hHome.losses += 1;
+    aAway.wins += 1;
+  }
+  state.homeRecords[home] = hHome;
+  state.awayRecords[away] = aAway;
+
   state.lastGameDate[home] = game.date;
   state.lastGameDate[away] = game.date;
 }
@@ -246,11 +295,17 @@ function lookupInjuries(
   return best;
 }
 
+export interface TeamStats {
+  runDiff: Record<number, number>;
+  homeRecords: Record<number, { wins: number; losses: number }>;
+  awayRecords: Record<number, { wins: number; losses: number }>;
+}
+
 export function computeEloAndFeatures(
   games: RawGame[],
   injurySnapshots?: Map<number, InjurySnapshot[]>,
   latestDate?: string,
-): { rows: FeatureRow[]; teamState: TeamState } {
+): { rows: FeatureRow[]; teamState: TeamState; teamStats: TeamStats } {
   const sorted = [...games].sort((a, b) => (a.gameDate < b.gameDate ? -1 : 1));
   const state = newState();
   const rows: FeatureRow[] = [];
@@ -285,7 +340,12 @@ export function computeEloAndFeatures(
   for (const id of Object.keys(state.formHistory)) {
     teamState.form[Number(id)] = formOf(state, Number(id));
   }
-  return { rows, teamState };
+  const teamStats: TeamStats = {
+    runDiff: state.runDiff,
+    homeRecords: state.homeRecords,
+    awayRecords: state.awayRecords,
+  };
+  return { rows, teamState, teamStats };
 }
 
 /** Build features for a not-yet-seen game given the current team state. */
@@ -296,6 +356,9 @@ export function buildFeaturesForGame(game: RawGame, state: TeamState): FeatureVa
     lastGameDate: state.lastGameDate,
     records: state.records,
     injuries: state.injuries,
+    runDiff: {},
+    homeRecords: {},
+    awayRecords: {},
   };
   // Provide form as a synthetic 10-game history so buildFeatures can reuse it.
   for (const id of Object.keys(state.form)) {
@@ -535,6 +598,123 @@ export function monteCarloAdjust(p: number, sigma: number, trials: number): numb
 }
 
 // ---------------------------------------------------------------------------
+// Drift monitoring, rolling risk, and version history
+// ---------------------------------------------------------------------------
+
+/**
+ * Simplified PSI-style drift score: KL divergence between the baseline
+ * (training) and recent feature distributions under a Gaussian assumption,
+ * `(mu_cur - mu_base)^2 / (2 * sigma_base^2)`. Small = stable, large = drift.
+ */
+function computeFeatureDrift(
+  rows: FeatureRow[],
+  selected: FeatureKey[],
+): FeatureDriftItem[] {
+  const n = rows.length;
+  if (n === 0) return [];
+  const baselineEnd = Math.floor(n * 0.7);
+  const recentStart = Math.max(baselineEnd, n - 40);
+  const baseline = rows.slice(0, baselineEnd);
+  const recent = rows.slice(recentStart);
+  return selected.map((f) => {
+    const bvals = baseline.map((r) => r.features[f]);
+    const cvals = recent.map((r) => r.features[f]);
+    const bMean = mean(bvals);
+    const cMean = mean(cvals);
+    const bStd = std(bvals) || 1;
+    const psi = ((cMean - bMean) * (cMean - bMean)) / (2 * bStd * bStd);
+    return {
+      feature: f,
+      label: FEATURE_LABELS[f],
+      currentMean: round(cMean, 3),
+      baselineMean: round(bMean, 3),
+      psi: round(psi, 3),
+      status: psi >= 0.1 ? "WARN" : "OK",
+    };
+  });
+}
+
+/** Rolling (per-day) Brier score over the last 30 days of the season. */
+function computeRollingBrier(
+  rows: FeatureRow[],
+  model: TrainedModel,
+  asOfDate: string,
+): { points: RollingBrierPoint[]; baseline: number } {
+  const cutoff = shiftDate(asOfDate, -30);
+  const byDate = new Map<string, { sum: number; count: number }>();
+  let totalSum = 0;
+  let totalCount = 0;
+  for (const r of rows) {
+    if (r.game.date < cutoff) continue;
+    const p = applyModel(model, r.features, r.homeElo, r.awayElo).homeWinProb;
+    const sq = (p - r.label) * (p - r.label);
+    totalSum += sq;
+    totalCount += 1;
+    const b = byDate.get(r.game.date) ?? { sum: 0, count: 0 };
+    b.sum += sq;
+    b.count += 1;
+    byDate.set(r.game.date, b);
+  }
+  const points: RollingBrierPoint[] = [...byDate.entries()]
+    .sort((a, b) => (a[0] < b[0] ? -1 : 1))
+    .map(([date, v]) => ({ date, brier: round(v.sum / Math.max(1, v.count), 3) }));
+  return { points, baseline: round(totalSum / Math.max(1, totalCount), 3) };
+}
+
+/** Data-driven version history from progressively larger training windows. */
+function buildModelVersions(
+  rows: FeatureRow[],
+  asOfDate: string,
+  finalEval: EvalResult,
+): ModelVersion[] {
+  const n = rows.length;
+  const stages: { frac: number; features: FeatureKey[]; note: string }[] = [
+    {
+      frac: 0.25,
+      features: ["eloDiff", "winPctDiff", "homeField"],
+      note: "Baseline model: Elo, win % and home-field features",
+    },
+    {
+      frac: 0.5,
+      features: ["eloDiff", "winPctDiff", "formDiff", "restDiff", "homeField"],
+      note: "Added recent form and rest-day features",
+    },
+    {
+      frac: 0.75,
+      features: ["eloDiff", "winPctDiff", "formDiff", "restDiff", "injuryDiff", "homeField"],
+      note: "Added injured-list edge and isotonic calibration",
+    },
+  ];
+  const versions: ModelVersion[] = [];
+  for (const stage of stages) {
+    const end = Math.floor(n * stage.frac);
+    if (end < 60) continue;
+    const trainEnd = Math.floor(end * 0.85);
+    const train = rows.slice(0, trainEnd);
+    const test = rows.slice(trainEnd, end);
+    if (train.length < 40 || test.length < 20) continue;
+    const m = trainLogistic(train, stage.features);
+    const preds = test.map((r) => sigmoid(logisticLogit(m, r.features, null)));
+    const labels = test.map((r) => r.label);
+    versions.push({
+      version: `v${versions.length + 1}.0.0`,
+      date: rows[end - 1]?.game.date ?? asOfDate,
+      auc: round(computeAuc(preds, labels), 3),
+      brier: round(computeBrier(preds, labels), 3),
+      notes: stage.note,
+    });
+  }
+  versions.push({
+    version: `v${versions.length + 1}.0.0`,
+    date: asOfDate,
+    auc: round(finalEval.auc, 3),
+    brier: round(finalEval.brier, 3),
+    notes: "Current model: ML feature selection, ensemble and Monte Carlo decision",
+  });
+  return versions.reverse();
+}
+
+// ---------------------------------------------------------------------------
 // Model pipeline
 // ---------------------------------------------------------------------------
 
@@ -583,7 +763,7 @@ export function runModel(
   opts: { season: string; asOfDate: string },
   injurySnapshots?: Map<number, InjurySnapshot[]>,
 ): ModelRun {
-  const { rows, teamState } = computeEloAndFeatures(completedGames, injurySnapshots, opts.asOfDate);
+  const { rows, teamState, teamStats } = computeEloAndFeatures(completedGames, injurySnapshots, opts.asOfDate);
   const n = rows.length;
 
   const trainEnd = Math.floor(n * 0.7);
@@ -749,6 +929,12 @@ export function runModel(
   const testPreds = test.map((r) => applyModel(model, r.features, r.homeElo, r.awayElo).homeWinProb);
   const testEval = evaluate(testPreds, testLabels);
 
+  // Drift monitoring, rolling risk, and version history (same pipeline).
+  const featureDrift = computeFeatureDrift(rows, selected);
+  const rolling = computeRollingBrier(rows, model, opts.asOfDate);
+  const modelVersions = buildModelVersions(rows, opts.asOfDate, testEval);
+  const brierBaseline = modelVersions.length > 1 ? modelVersions[1].brier : rolling.baseline;
+
   // Feature importances (univariate AUC on the full dataset + coefficient).
   const fullLabels = rows.map((r) => r.label);
   const featureImportances: FeatureImportance[] = selected.map((f) => {
@@ -767,7 +953,11 @@ export function runModel(
     .map((id) => {
       const teamId = Number(id);
       const rec = teamState.records[teamId] ?? { wins: 0, losses: 0 };
+      const homeRec = teamStats.homeRecords[teamId] ?? { wins: 0, losses: 0 };
+      const awayRec = teamStats.awayRecords[teamId] ?? { wins: 0, losses: 0 };
       const meta = teamMeta.get(teamId) ?? { name: `Team ${teamId}`, abbrev: "TBD" };
+      const homeTotal = homeRec.wins + homeRec.losses;
+      const awayTotal = awayRec.wins + awayRec.losses;
       return {
         teamId,
         name: meta.name,
@@ -779,6 +969,9 @@ export function runModel(
         last10WinPct: teamState.form[teamId] ?? 0.5,
         lastGameDate: teamState.lastGameDate[teamId] ?? "",
         injuries: teamState.injuries[teamId] ?? 0,
+        runDiff: teamStats.runDiff[teamId] ?? 0,
+        homeWinPct: homeTotal > 0 ? homeRec.wins / homeTotal : 0,
+        awayWinPct: awayTotal > 0 ? awayRec.wins / awayTotal : 0,
       };
     })
     .sort((a, b) => b.elo - a.elo);
@@ -815,6 +1008,10 @@ export function runModel(
     featureImportances,
     candidates,
     powerRankings,
+    featureDrift,
+    rollingBrier: rolling.points,
+    brierBaseline,
+    modelVersions,
   };
 
   return { result, model, teamState, rows, predict };

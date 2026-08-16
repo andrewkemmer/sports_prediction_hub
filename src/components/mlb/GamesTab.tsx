@@ -1,7 +1,7 @@
 import { Calendar } from "@/components/ui/calendar";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import type { GameDoc, ModelStateDoc } from "@/lib/mlb-ui-types";
-import { formatDateLong, formatPct } from "@/lib/format";
+import { formatDateLong, formatDateShort, formatPct } from "@/lib/format";
 import { cn } from "@/lib/utils";
 import { Check, ChevronLeft, ChevronRight, Loader2 } from "lucide-react";
 import { useState } from "react";
@@ -44,70 +44,78 @@ export function GamesTab({
     filter === "final" ? final : filter === "live" ? live : filter === "upcoming" ? upcoming : games;
 
   const record = modelState.todaysRecord;
+  const nightCount = games.filter((g) => g.dayNight === "night").length;
 
-  const filters: { id: Filter; label: string; count: number }[] = [
+  const allFilters: { id: Filter; label: string; count: number }[] = [
     { id: "all", label: "All Games", count: games.length },
     { id: "final", label: "Final", count: final.length },
     { id: "live", label: "Live", count: live.length },
     { id: "upcoming", label: "Upcoming", count: upcoming.length },
   ];
+  const filters = allFilters.filter((f) => f.id === "all" || f.count > 0);
 
   return (
     <div className="flex flex-col gap-4">
-      {/* Date + status bar */}
+      {/* Row 1: summary / status bar */}
       <div className="flex flex-wrap items-center gap-2">
-        <div className="flex items-center gap-1.5">
-          <button
-            type="button"
-            onClick={onPrev}
-            className="flex size-8 cursor-pointer items-center justify-center rounded-lg border border-border bg-card text-muted-foreground transition-colors hover:text-foreground"
-          >
-            <ChevronLeft className="size-4" />
-          </button>
-          <Popover>
-            <PopoverTrigger asChild>
-              <button
-                type="button"
-                className="cursor-pointer rounded-lg border border-border bg-card px-3 py-1.5 text-sm font-medium text-foreground transition-colors hover:border-ring/50"
-              >
-                {formatDateLong(selectedDate)}
-              </button>
-            </PopoverTrigger>
-            <PopoverContent className="w-auto p-0" align="start">
-              <Calendar
-                mode="single"
-                selected={new Date(`${selectedDate}T00:00:00`)}
-                onSelect={(d) => d && onDateChange(toYmd(d))}
-              />
-            </PopoverContent>
-          </Popover>
-          <button
-            type="button"
-            onClick={onNext}
-            className="flex size-8 cursor-pointer items-center justify-center rounded-lg border border-border bg-card text-muted-foreground transition-colors hover:text-foreground"
-          >
-            <ChevronRight className="size-4" />
-          </button>
-        </div>
-
+        <span className="text-sm font-semibold text-foreground">{formatDateShort(selectedDate)}</span>
         {games.length > 0 && (
-          <span className="rounded-full border border-border bg-card px-2.5 py-1 text-xs text-muted-foreground">
+          <span className="text-sm text-muted-foreground">
             {filtered.length} of {games.length} games shown
           </span>
         )}
-
-        {record && record.total > 0 && (
-          <span className="flex items-center gap-1.5 rounded-full border border-emerald-500/25 bg-emerald-500/10 px-2.5 py-1 text-xs text-emerald-300">
-            <Check className="size-3.5" />
-            {record.wins}-{record.losses} today
+        {nightCount > 0 && (
+          <span className="rounded-full bg-blue-500/15 px-2.5 py-1 text-xs font-medium text-blue-300">
+            {nightCount} evening games begin 7 PM ET+
           </span>
         )}
         {record && record.total > 0 && (
-          <span className="text-xs text-muted-foreground">{formatPct(record.accuracy, 1)} accuracy</span>
+          <>
+            <span className="flex items-center gap-1.5 rounded-full bg-emerald-500/15 px-2.5 py-1 text-xs font-semibold text-emerald-300">
+              <Check className="size-3.5" />
+              {record.wins}-{record.losses} Today
+            </span>
+            <span className="text-xs text-muted-foreground">{formatPct(record.accuracy, 1)} accuracy</span>
+          </>
         )}
       </div>
 
-      {/* Filter tabs */}
+      {/* Row 2: centered date selector */}
+      <div className="flex items-center justify-center gap-2">
+        <button
+          type="button"
+          onClick={onPrev}
+          className="flex size-8 cursor-pointer items-center justify-center rounded-lg border border-border bg-card text-muted-foreground transition-colors hover:text-foreground"
+        >
+          <ChevronLeft className="size-4" />
+        </button>
+        <Popover>
+          <PopoverTrigger asChild>
+            <button
+              type="button"
+              className="cursor-pointer rounded-full border border-blue-500/30 bg-blue-500/10 px-5 py-2 text-sm font-medium text-foreground transition-colors hover:border-blue-500/50"
+            >
+              {formatDateLong(selectedDate)}
+            </button>
+          </PopoverTrigger>
+          <PopoverContent className="w-auto p-0" align="center">
+            <Calendar
+              mode="single"
+              selected={new Date(`${selectedDate}T00:00:00`)}
+              onSelect={(d) => d && onDateChange(toYmd(d))}
+            />
+          </PopoverContent>
+        </Popover>
+        <button
+          type="button"
+          onClick={onNext}
+          className="flex size-8 cursor-pointer items-center justify-center rounded-lg border border-border bg-card text-muted-foreground transition-colors hover:text-foreground"
+        >
+          <ChevronRight className="size-4" />
+        </button>
+      </div>
+
+      {/* Row 3: filter pills */}
       <div className="flex items-center gap-1.5">
         {filters.map((f) => (
           <button

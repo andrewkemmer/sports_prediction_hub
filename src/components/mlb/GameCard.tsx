@@ -389,13 +389,15 @@ export function GameCard({ game }: { game: GameDoc }) {
               {game.shap.map((s) => (
                 <ShapRow key={s.feature} item={s} max={maxShap} />
               ))}
-              <div className="pt-1.5">
-                <DeepDive game={game} />
-              </div>
             </div>
           )}
         </div>
       )}
+
+      {/* Deep dive */}
+      <div className="px-4 pb-3 pt-1">
+        <DeepDive game={game} />
+      </div>
 
       {/* Result banner */}
       {winnerName && (

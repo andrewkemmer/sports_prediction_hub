@@ -4,9 +4,12 @@ import type {
   CandidateModel,
   ConfidencePoint,
   CurvePoint,
+  FeatureDriftItem,
   FeatureImportance,
   GameDoc,
+  ModelVersion,
   PowerRanking,
+  RollingBrierPoint,
   TodaysRecord,
 } from "@/convex/ml/types";
 
@@ -15,9 +18,12 @@ export type {
   CandidateModel,
   ConfidencePoint,
   CurvePoint,
+  FeatureDriftItem,
   FeatureImportance,
   GameDoc,
+  ModelVersion,
   PowerRanking,
+  RollingBrierPoint,
   TodaysRecord,
 };
 
@@ -50,5 +56,9 @@ export interface ModelStateDoc {
   featureImportances: FeatureImportance[];
   candidates: CandidateModel[];
   powerRankings: PowerRanking[];
+  featureDrift?: FeatureDriftItem[];
+  rollingBrier?: RollingBrierPoint[];
+  brierBaseline?: number;
+  modelVersions?: ModelVersion[];
   todaysRecord: TodaysRecord;
 }
