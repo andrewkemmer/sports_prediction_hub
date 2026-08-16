@@ -1,7 +1,7 @@
 "use node";
 
 import { v } from "convex/values";
-import { internal } from "./_generated/api";
+import { api, internal } from "./_generated/api";
 import { action } from "./_generated/server";
 import {
   applyIsotonic,
@@ -106,7 +106,7 @@ function dateRanges(start: string, end: string, chunkDays: number): { start: str
 }
 
 /** True if `g.date` falls within the last N days of `today`. */
-isWithinRecentWind(g: RawGame, today: string, days: number): boolean {
+function isWithinRecentWind(g: RawGame, today: string, days: number): boolean {
   const start = addDays(today, -days);
   return g.date >= start && g.date <= today;
 }
@@ -223,7 +223,7 @@ async function fetchAllSeasons(
   seasons: string[],
   currentSeason: string,
   throughDate: string,
-  onProgress?: (done: number, total: number) => void, ZZx): Promise<RawGame[]> {
+  onProgress?: (done: number, total: number) => void): Promise<RawGame[]> {
   const all: RawGame[] = [];
   let completed = 0;
   await mapLimit(seasons, Math.min(3, seasons.length), async (s) => {
@@ -268,7 +268,7 @@ function inningsPitchedValue(ip: unknown): number {
 const FIP_CONSTANT = 3.1;
 
 async function fetchPitcherStats(
-  pairs: { id: number; season: string }[], ZZx): Promise<Map<string, PitcherSeasonStats>> {
+  pairs: { id: number; season: string }[]): Promise<Map<string, PitcherSeasonStats>> {
   const out = new Map<string, PitcherSeasonStats>();
   const seen = new Set<string>();
   const unique = pairs.filter((p) => {
@@ -280,7 +280,7 @@ async function fetchPitcherStats(
   await mapLimit(unique, 16, async (p) => {
     try {
       const data = await fetchJson(
-        `${MLB_BASE}/api/v1/people/${p.id}/stats?stats=season&group=pitching&season=${p.season}`, ZZx);
+        `${MLB_BASE}/api/v1/people/${p.id}/stats?stats=season&group=pitching&season=${p.season}`);
       const stat = data?.stats?.[0]?.splits?.[0]?.stat;
       if (stat) {
         const era = statNumber(stat.era);
@@ -307,7 +307,7 @@ async function fetchPitcherStats(
 /** Attach ERA/K9/FIP to each game's probable pitchers in place (new array). */
 function attachPitcherStats(
   games: RawGame[],
-  stats: Map<string, PitcherSeasonStats>, ZZx): RawGame[] {
+  stats: Map<string, PitcherSeasonStats>): RawGame[] {
   return games.map((g) => ({
     ...g,
     awayPitcher: g.awayPitcher
@@ -330,7 +330,7 @@ interface TeamSeasonStats {
 }
 
 async function fetchTeamSeasonStats(
-  pairs: { id: number; season: string }[], ZZx): Promise<Map<string, TeamSeasonStats>> {
+  pairs: { id: number; season: string }[]): Promise<Map<string, TeamSeasonStats>> {
   const out = new Map<string, TeamSeasonStats>();
   const seen = new Set<string>();
   const unique = pairs.filter((p) => {
@@ -342,7 +342,7 @@ async function fetchTeamSeasonStats(
   await mapLimit(unique, 16, async (p) => {
     try {
       const data = await fetchJson(
-        `${MLB_BASE}/api/v1/teams/${p.id}/stats?stats=season&group=hitting,pitching,fielding&season=${p.season}`, ZZx);
+        `${MLB_BASE}/api/v1/teams/${p.id}/stats?stats=season&group=hitting,pitching,fielding&season=${p.season}`);
       const stats = (data?.stats ?? []) as any[];
       const result: TeamSeasonStats = {};
       for (const block of stats) {
@@ -364,7 +364,7 @@ async function fetchTeamSeasonStats(
 /** Attach season team OPS / ERA / fielding% to each game's two teams. */
 function attachTeamSeasonStats(
   games: RawGame[],
-  stats: Record<string, TeamSeasonStats>, ZZx): RawGame[] {
+  stats: Record<string, TeamSeasonStats>): RawGame[] {
   return games.map((g) => {
     const homeStats = stats[`${g.home.id}|${g.season}`];
     const awayStats = stats[`${g.away.id}|${g.season}`];
@@ -475,7 +475,7 @@ function marginShiftForGame(
   cal: RunMarginCalibration,
   homeId: number,
   awayId: number,
-  homeWinProb: number, ZZx): number {
+  homeWinProb: number): number {
   if (!cal || (cal.slope === 0 && cal.intercept === 0)) return 0;
   const baseMargin = expectedMargin(runModel, homeId, awayId);
   const p = Math.min(0.99, Math.max(0.01, homeWinProb));
@@ -491,7 +491,7 @@ function buildRunProjection(
   marketRunLine?: number,
   trials = RUN_SIM_TRIALS,
   homeWinProb = 0.5,
-  runMarginCal: RunMarginCalibration = { slope: 0, intercept: 0 }, ZZx): RunProjection {
+  runMarginCal: RunMarginCalibration = { slope: 0, intercept: 0 }): RunProjection {
   const runLine = marketRunLine ?? 1.5;
   const marginShift = marginShiftForGame(runModel, runMarginCal, game.home.id, game.away.id, homeWinProb);
   const line = marketTotal ?? expectedTotal(runModel, game.home.id, game.away.id);
@@ -556,7 +556,7 @@ async function fetchInjurySnapshots(
   season: string,
   startDate: string,
   endDate: string,
-  previous?: Record<string, InjurySnapshot[]>, ZZx): Promise<Map<number, InjurySnapshot[]>> {
+  previous?: Record<string, InjurySnapshot[]>): Promise<Map<number, InjurySnapshot[]>> {
   const dates: string[] = [];
   let cursor = startDate;
   while (cursor <= endDate) {
@@ -592,8 +592,6 @@ async function fetchInjurySnapshots(
   return out;
 }
 
-isWithinRecentWind(g: RawGame, today: string, days: number): boolean;
-
 /**
  * Apply the result of a freshly completed game to a team state (Elo, wins
  * / losses, lastGameDate). Called in chronological order during the fast
@@ -602,11 +600,13 @@ isWithinRecentWind(g: RawGame, today: string, days: number): boolean;
  */
 function applyGameResultToTeamState(
   teamState: TeamState,
-  game: RawGame, ZZx): void {
+  game: RawGame,
+  eloHfa = 30,
+): void {
   if (game.winner !== "home" && game.winner !== "away") return;
   const homeElo = teamState.elo[game.home.id] ?? 1500;
   const awayElo = teamState.elo[game.away.id] ?? 1500;
-  const expectedHome = 1 / (1 + Math.pow(10, -((homeElo + ) - awayElo) / 400));
+  const expectedHome = 1 / (1 + Math.pow(10, -((homeElo + eloHfa) - awayElo) / 400));
   const homeActual = game.winner === "home" ? 1 : 0;
   const margin = Math.abs((game.home.score ?? 0) - (game.away.score ?? 0));
   const k = 24 * Math.sqrt(Math.max(1, margin));
@@ -633,7 +633,7 @@ function applyGameResultToTeamState(
 async function fetchCurrentInjurySnapshot(
   teamIds: number[],
   date: string,
-  season: string, ZZx): Promise<Map<number, number>> {
+  season: string): Promise<Map<number, number>> {
   const pairs = [...new Set(teamIds)].filter((id) => id > 0);
   const out = new Map<number, number>();
   await mapLimit(pairs, 16, async (teamId) => {
@@ -654,7 +654,7 @@ async function fastRefresh(
   previous: any,
   season: string,
   today: string,
-  report: (stage: string, pct: number, message: string, extra?: { done?: boolean; error?: string }) => Promise<void>, ZZx): Promise<void> {
+  report: (stage: string, pct: number, message: string, extra?: { done?: boolean; error?: string }) => Promise<void>): Promise<void> {
   await report("Reading previous model", 6, "Reusing the trained model…");
   const model = reconstructModel(previous);
   const runModelState = previous.runModel as RunModel | undefined;
@@ -716,7 +716,7 @@ async function fastRefresh(
   const freshCompleted = freshRaw
     .filter((g) => g.winner === "home" || g.winner === "away")
     .sort((a, b) => (a.gameDate < b.gameDate ? -1 : 1));
-  for (const g of freshCompleted) applyGameResultToTeamState(teamState, g);
+  for (const g of freshCompleted) applyGameResultToTeamState(teamState, g, model.eloHfa ?? 30);
 
   await report("Loading lineups", 58, "Loading actual starting lineups…");
   const lineupGames = freshRaw.filter(
@@ -745,38 +745,79 @@ async function fastRefresh(
   const enriched = attachTeamSeasonStats(attachPitcherStats(freshRaw, freshPitcherStats), teamSeasonStats);
   const enrichedWithLineups = attachLineups(enriched, lineups, playerOps);
   const marketOdds = await fetchMarketOdds();
+  const freshByPk = new Map<number, RawGame>(enrichedWithLineups.map((g) => [g.gamePk, g]));
 
-  // Merge approach: existing completed-game docs (from earlier refreshes /
-  // predictDate calls) stay; we only replace the upcoming predictions.
-  const upcomingByDate = new Map<string, GameDoc[]>();
+  // Upcoming games (no result yet) get a fresh pre-game prediction built from
+  // the current team state — which already includes every result applied above.
+  const freshDocsByPk = new Map<number, GameDoc>();
   for (const g of enrichedWithLineups) {
     if (g.winner === "home" || g.winner === "away") continue;
     const odds = marketOddsForGame(marketOdds, g);
     const pred = predictionFor(g, model, teamState);
-    const doc = buildGameDoc(
-      g,
-      pred,
-      freshPitcherStats,
-      { home: teamState.injuries[g.home.id] ?? 0, away: teamState.injuries[g.away.id] ?? 0 },
-      runModelState ? buildRunProjection(runModelState, runLineIso, g, odds?.total, odds?.runLine, RUN_SIM_TRIALS, pred.homeWinProb, runMarginCal) : undefined,
-      odds,
+    freshDocsByPk.set(
+      g.gamePk,
+      buildGameDoc(
+        g,
+        pred,
+        freshPitcherStats,
+        { home: teamState.injuries[g.home.id] ?? 0, away: teamState.injuries[g.away.id] ?? 0 },
+        runModelState ? buildRunProjection(runModelState, runLineIso, g, odds?.total, odds?.runLine, RUN_SIM_TRIALS, pred.homeWinProb, runMarginCal) : undefined,
+        odds,
+      ),
     );
-    const list = upcomingByDate.get(doc.date) ?? [];
-    list.push(doc);
-    upcomingByDate.set(doc.date, list);
   }
 
   await report("Saving", 92, "Persisting refreshed predictions…");
-  const datesToWrite = [...upcomingByDate.keys()];
+  const datesToWrite = [...new Set(enrichedWithLineups.map((g) => g.date))];
+  const newlyCompleted: GameDoc[] = [];
   await mapLimit(datesToWrite, 8, async (date) => {
-    const existingDocs: GameDoc[] = await ctx.runQuery(api.mlb.getGamesByDate, { date });
-    const existingCompleted = existingDocs.filter(
-      (d) => d.winner === "home" || d.winner === "away",
-    ) as GameDoc[];
-    const upcoming = upcomingByDate.get(date) ?? [];
-    const merged = [...existingCompleted, ...upcoming] as GameDoc[];
+    const existingDocs = (await ctx.runQuery(api.mlb.getGamesByDate, { date })) as GameDoc[];
+    const existingByPk = new Map<number, GameDoc>(existingDocs.map((d) => [d.gamePk, d]));
+    const merged: GameDoc[] = [];
+
+    // 1. Stored docs: record results on games that have now completed (without
+    //    re-predicting them, so pre-game predictions stay honest for calibration).
+    for (const [pk, doc] of existingByPk) {
+      const fresh = freshByPk.get(pk);
+      if (fresh && (fresh.winner === "home" || fresh.winner === "away") && !doc.winner) {
+        const updated: GameDoc = {
+          ...doc,
+          winner: fresh.winner,
+          away: { ...doc.away, score: fresh.away.score },
+          home: { ...doc.home, score: fresh.home.score },
+        };
+        updated.isCorrect = updated.pickTeam === fresh.winner;
+        updated.isUpset = updated.pickTeam !== fresh.winner;
+        newlyCompleted.push(updated);
+        merged.push(updated);
+      } else if (!fresh) {
+        // Game from a previous fetch not in this window — keep the stored doc.
+        merged.push(doc);
+      } else if (doc.winner) {
+        // Already completed and recorded in a previous refresh — keep as-is.
+        merged.push(doc);
+      }
+      // Stored upcoming docs are replaced by the fresh prediction below.
+    }
+
+    // 2. Fresh docs for this date (upcoming predictions; completed games
+    //    without a stored doc would be added here too if present).
+    for (const g of enrichedWithLineups) {
+      if (g.date !== date) continue;
+      const doc = freshDocsByPk.get(g.gamePk);
+      if (doc) merged.push(doc);
+    }
+
     await ctx.runMutation(internal.mlb.replaceGamesForDate, { date, games: merged });
   });
+
+  // Today's record from the stored (now completed) games for today.
+  const todayStored = (await ctx.runQuery(api.mlb.getGamesByDate, { date: today })) as GameDoc[];
+  const completedToday = todayStored.filter((d) => d.winner === "home" || d.winner === "away");
+  const todaysRecord =
+    completedToday.length > 0 || newlyCompleted.length === 0
+      ? buildTodaysRecord(completedToday, today)
+      : previous.todaysRecord;
 
   // Compute refreshed powerRankings, preserving everything the model didn't change.
   const newPowerRankings: PowerRanking[] = (
@@ -803,20 +844,11 @@ async function fastRefresh(
       powerRankings: newPowerRankings,
       teamSeasonStats,
       playerOps: playerOpsCache,
-      todaysRecord: previous.todaysRecord ?? {
-        date: today,
-        total: 0,
-        completed: 0,
-        wins: 0,
-        losses: 0,
-        correct: 0,
-        accuracy: 0,
-        upsets: [],
-      },
+      todaysRecord,
     },
   });
 
-  await report("Complete", 100, `Refreshed ${upcomingByDate.size} day${upcomingByDate.size === 1 ? "" : "s"} of predictions`, { done: true });
+  await report("Complete", 100, `Refreshed ${datesToWrite.length} day${datesToWrite.length === 1 ? "" : "s"} of predictions`, { done: true });
 }
 
 // ---------------------------------------------------------------------------
@@ -876,7 +908,7 @@ async function fetchGameLineup(gamePk: number): Promise<LineupData | undefined> 
 async function fetchLineupsForGames(
   games: RawGame[],
   concurrency = 16,
-  onProgress?: (done: number, total: number) => void, ZZx): Promise<Map<number, LineupData>> {
+  onProgress?: (done: number, total: number) => void): Promise<Map<number, LineupData>> {
   const out = new Map<number, LineupData>();
   const seen = new Set<number>();
   const targets = games.filter((g) => {
@@ -901,13 +933,13 @@ async function fetchLineupsForGames(
 async function fetchPlayerSeasonOps(
   ids: number[],
   season: string,
-  cached: Record<string, number> = {}, ZZx): Promise<Map<number, number>> {
+  cached: Record<string, number> = {}): Promise<Map<number, number>> {
   const out = new Map<number, number>();
   const unique = [...new Set(ids)].filter((id) => id > 0 && typeof cached[`${id}|${season}`] !== "number");
   await mapLimit(unique, 24, async (id) => {
     try {
       const data = await fetchJson(
-        `${MLB_BASE}/api/v1/people/${id}/stats?stats=season&group=hitting&season=${season}`, ZZx);
+        `${MLB_BASE}/api/v1/people/${id}/stats?stats=season&group=hitting&season=${season}`);
       const stat = data?.stats?.[0]?.splits?.[0]?.stat;
       const ops = statNumber(stat?.ops);
       if (ops !== undefined) out.set(id, ops);
@@ -940,7 +972,7 @@ function lineupOps(lineup: LineupPlayer[] | undefined): number {
 function attachLineups(
   games: RawGame[],
   lineups: Map<number, LineupData>,
-  playerOps: Map<number, number>, ZZx): RawGame[] {
+  playerOps: Map<number, number>): RawGame[] {
   return games.map((g) => {
     const lu = lineups.get(g.gamePk);
     if (!lu) return g;
@@ -1009,7 +1041,7 @@ function buildGameDoc(
   pitcherStats: Map<string, PitcherSeasonStats>,
   injuries?: { home: number; away: number },
   runProjection?: RunProjection,
-  marketOdds?: MarketOdds, ZZx): GameDoc {
+  marketOdds?: MarketOdds): GameDoc {
   const awayPitcher: PitcherInfo | undefined = game.awayPitcher
     ? { ...game.awayPitcher, ...(pitcherStats.get(`${game.awayPitcher.id}|${game.season}`) ?? {}) }
     : undefined;
@@ -1221,7 +1253,7 @@ function buildCalibrationRows(
   model: TrainedModel,
   runModelState: RunModel,
   runLineIso: { x: number; y: number }[],
-  runMarginCal: RunMarginCalibration, ZZx): CalibrationRow[] {
+  runMarginCal: RunMarginCalibration): CalibrationRow[] {
   return rows.map((row: FeatureRow) => {
     const pred = applyModel(model, row.features, row.homeElo, row.awayElo);
     const g = row.game;
@@ -1277,7 +1309,29 @@ export const refreshModel = action({
 
     try {
       await report("Loading stored games", 4, "Reading previously stored games…");
-      const previousState = await ctx.runQuery(internal.mlb.getLatestModelState, {});
+      const previousState: any = await ctx.runQuery(internal.mlb.getLatestModelState, {});
+
+      // 0. FAST PATH: a trained model already exists, so skip the full reload
+      //    + retrain (the multi-minute path) and just refresh the recent
+      //    results + upcoming predictions from the live API. The model weights
+      //    stay frozen as of the last retrain.
+      if (previousState) {
+        await fastRefresh(ctx, previousState, season, today, report);
+        return {
+          fast: true,
+          season,
+          asOfDate: today,
+          gamesTrained: previousState.gamesTrained ?? 0,
+          holdoutCount: previousState.holdoutCount ?? 0,
+          auc: previousState.auc ?? 0,
+          brier: previousState.brier ?? 0,
+          logLoss: previousState.logLoss ?? 0,
+          ece: previousState.ece ?? 0,
+          selectedModel: previousState.selectedModel ?? "",
+          monteCarloEnabled: previousState.monteCarloEnabled ?? false,
+          storedGames: 0,
+        };
+      }
 
       // 1. Reuse previously stored games so complete seasons are not re-fetched
       //    from the external API on every refresh (this was the ~5-minute cost).
@@ -1285,7 +1339,7 @@ export const refreshModel = action({
       //    trimming them keeps the read well inside Convex's per-action budget.
       const storedGames = await loadStoredGames(ctx, `${Number(season) - 2}-03-15`, today);
       const storedCompleted = storedGames.filter(
-        (g) => g.winner === "home" || g.winner === "away", ZZx);
+        (g) => g.winner === "home" || g.winner === "away");
 
       // 2. Fetch only the recent window + upcoming games. On a cold start (empty
       //    database) fall back to the full 2024–2026 fetch exactly once.
@@ -1297,7 +1351,7 @@ export const refreshModel = action({
         14,
         hasFullHistory
           ? "Fetching recent results & upcoming games…"
-          : `First run: fetching ${coldStartList.join("–")} game history…`, ZZx);
+          : `First run: fetching ${coldStartList.join("–")} game history…`);
 
       const stageTicker = (stageLabel: string, total: number, startPct: number, endPct: number) =>
         (completed: number) => {
@@ -1379,7 +1433,7 @@ export const refreshModel = action({
       await report(
         "Pitcher stats loaded",
         34,
-        `Loaded ${pitcherStats.size} pitcher seasons.`, ZZx);
+        `Loaded ${pitcherStats.size} pitcher seasons.`);
 
       // 5. Fetch season team OPS / ERA / fielding% (statsapi-only features).
       //    Past seasons are reused from the previously stored model state, so a
@@ -1412,7 +1466,7 @@ export const refreshModel = action({
       await report(
         "Team stats loaded",
         44,
-        `Loaded ${freshTeamStats.size} team-season stat blocks.`, ZZx);
+        `Loaded ${freshTeamStats.size} team-season stat blocks.`);
       const enriched = attachTeamSeasonStats(attachPitcherStats(allRaw, pitcherStats), teamSeasonStats);
 
       // 6. Actual starting lineups (last 2 days + upcoming window): fetch the
@@ -1420,7 +1474,7 @@ export const refreshModel = action({
       //    batter's season OPS so the model gets a real lineup-strength feature.
       await report("Fetching lineups", 46, "Loading actual starting lineups…");
       const lineupGames = enriched.filter(
-        (g) => g.date >= addDays(today, -2) && g.date <= addDays(today, UPCOMING_WINDOW_DAYS), ZZx);
+        (g) => g.date >= addDays(today, -2) && g.date <= addDays(today, UPCOMING_WINDOW_DAYS));
       const lineupTicker = stageTicker("Lineups", lineupGames.length, 46, 52);
       const lineups = await fetchLineupsForGames(lineupGames, 16, lineupTicker);
       const batterIds: number[] = [];
