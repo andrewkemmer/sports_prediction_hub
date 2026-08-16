@@ -10,14 +10,14 @@ function eloColor(rank: number): string {
 }
 
 export function PowerRankingsTab({ modelState }: { modelState: ModelStateDoc }) {
-  const rankings = (modelState.powerRankings ?? []).slice(0, 15);
+  const rankings = modelState.powerRankings ?? [];
 
   return (
     <div className="flex flex-col gap-4">
       <div>
         <h2 className="text-xl font-bold tracking-tight">Power Rankings</h2>
         <p className="mt-2 text-sm text-muted-foreground">
-          Current Elo-based power rankings · As of {formatDateShort(modelState.asOfDate)} · Top{" "}
+          Current Elo-based power rankings · As of {formatDateShort(modelState.asOfDate)} · All{" "}
           {rankings.length} teams
         </p>
       </div>

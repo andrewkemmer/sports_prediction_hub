@@ -960,7 +960,7 @@ export function applyModel(
   );
   let p = sigmoid(logitV);
   p = applyIsotonic(model.isotonicPoints, p);
-  if (model.monteCarloEnabled && model.monteCarloSigma > 0) p = monteCarloAdjust(p, model.monteCarloSigma, 800);
+  if (model.monteCarloEnabled && model.monteCarloSigma > 0) p = monteCarloAdjust(p, model.monteCarloSigma, 10000);
   p = clamp(p, 0.01, 0.99);
   const baseline = sigmoid(((homeElo + model.eloHfa - awayElo) / 400) * Math.log(10));
   const edge = p - baseline;
@@ -1128,7 +1128,7 @@ export function runModel(
   let baseBrier = computeBrier(calibratedCalib, calibLabels);
   let bestMcBrier = baseBrier;
   for (const s of mcGrid) {
-    const preds = calibratedCalib.map((p) => monteCarloAdjust(p, s, 800));
+    const preds = calibratedCalib.map((p) => monteCarloAdjust(p, s, 10000));
     const b = computeBrier(preds, calibLabels);
     if (b < bestMcBrier - 0.0005) {
       bestMcBrier = b;
@@ -1249,7 +1249,7 @@ export function runModel(
     isotonicPoints,
     eloHfa,
     monteCarloEnabled: mcEnabled,
-    monteCarloTrials: mcEnabled ? 2000 : 0,
+    monteCarloTrials: mcEnabled ? 10000 : 0,
     monteCarloSigma: mcSigma,
     monteCarloRationale,
     auc: testEval.auc,
