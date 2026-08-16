@@ -841,50 +841,62 @@ async function fastRefresh(
       : "Writing calibration rows for the fresh window…",
   );
   if (needsCalibrationBackfill) {
-    let backfillLoaded = 0;
-    const storedDocs = await loadStoredDocs(ctx, "2022-03-15", today, (loaded) => {
-      backfillLoaded = loaded;
-      // Keep the progress bar visibly moving while the full history loads.
+    // Compact paginated read of the games table — only the calibration fields
+    // are returned (~1/20th the size of a full game doc), so the multi-season
+    // backfill is fast and each query stays far below response limits.
+    const backfillByDate = new Map<string, CalibrationRow[]>();
+    let cursor: string | null = null;
+    let backfillScanned = 0;
+    do {
+      const page: { games: CalibrationRow[]; cursor: string | null } = await ctx.runQuery(
+        internal.mlb.getCalibrationProjection,
+        { startDate: "2022-03-15", endDate: today, cursor, limit: 500 },
+      );
+      for (const r of page.games) {
+        if (r.winner !== "home" && r.winner !== "away") continue;
+        if (typeof r.pickProb !== "number") continue;
+        const list = backfillByDate.get(r.date) ?? [];
+        list.push(r);
+        backfillByDate.set(r.date, list);
+      }
+      cursor = page.cursor;
+      backfillScanned += page.games.length;
+      // Keep the progress bar visibly moving while the history loads.
       void report(
         "Backfilling calibration",
         94,
-        `Building calibration history — ${loaded.toLocaleString()} games loaded…`,
+        `Building calibration history — ${backfillScanned.toLocaleString()} games scanned…`,
       );
-    });
-    if (backfillLoaded > 0) {
-      await report(
-        "Backfilling calibration",
-        95,
-        `Writing calibration rows for ${backfillLoaded.toLocaleString()} games…`,
-      );
-    }
-    const backfillByDate = new Map<string, CalibrationRow[]>();
-    for (const d of storedDocs) {
-      if (d.winner !== "home" && d.winner !== "away") continue;
-      if (typeof d.pickProb !== "number") continue;
-      const list = backfillByDate.get(d.date) ?? [];
-      list.push(calibrationRowFromDoc(d));
-      backfillByDate.set(d.date, list);
-    }
+    } while (cursor);
     for (const [date, rows] of backfillByDate) calibrationRowsByDate.set(date, rows);
+    await report(
+      "Backfilling calibration",
+      95,
+      `Writing calibration rows for ${backfillByDate.size.toLocaleString()} dates…`,
+    );
   }
   const calibrationDates = [...calibrationRowsByDate.keys()];
   const backfillStage = needsCalibrationBackfill ? "Backfilling calibration" : "Updating calibration";
-  let calibrationWritten = 0;
   const calibrationTotal = calibrationDates.length;
-  await mapLimit(calibrationDates, 8, async (date) => {
-    await ctx.runMutation(internal.mlb.replaceCalibrationForDate, {
-      date,
-      rows: calibrationRowsByDate.get(date)!,
-    });
-    calibrationWritten += 1;
-    if (calibrationWritten % 100 === 0 || calibrationWritten === calibrationTotal) {
-      await report(
-        backfillStage,
-        calibrationTotal > 0 ? 95 + Math.floor((calibrationWritten / calibrationTotal) * 4) : 95,
-        `Writing calibration rows — ${calibrationWritten.toLocaleString()}/${calibrationTotal.toLocaleString()} dates…`,
-      );
+  // Batch ~40 dates per mutation so the one-time backfill (~700 dates) is
+  // ~18 mutations instead of ~700 action→mutation round trips.
+  const dateGroups: { date: string; rows: CalibrationRow[] }[][] = [];
+  for (let i = 0; i < calibrationTotal; i += 40) {
+    const group: { date: string; rows: CalibrationRow[] }[] = [];
+    for (const date of calibrationDates.slice(i, i + 40)) {
+      group.push({ date, rows: calibrationRowsByDate.get(date)! });
     }
+    dateGroups.push(group);
+  }
+  let calibrationWritten = 0;
+  await mapLimit(dateGroups, 6, async (group) => {
+    await ctx.runMutation(internal.mlb.bulkReplaceCalibration, { groups: group });
+    calibrationWritten += group.length;
+    await report(
+      backfillStage,
+      calibrationTotal > 0 ? 95 + Math.floor((calibrationWritten / calibrationTotal) * 4) : 95,
+      `Writing calibration rows — ${calibrationWritten.toLocaleString()}/${calibrationTotal.toLocaleString()} dates…`,
+    );
   });
   const calibrationRows = [...calibrationRowsByDate.values()].flat();
   const calibrationSummary =
@@ -1236,33 +1248,6 @@ async function loadStoredGames(ctx: any, startDate: string, endDate: string): Pr
   return all;
 }
 
-/**
- * Load stored game DOCUMENTS for a date range in bounded pages, keeping the
- * prediction fields (pickProb / isCorrect / runProjection) intact. Used for
- * the one-time calibration backfill.
- */
-async function loadStoredDocs(
-  ctx: any,
-  startDate: string,
-  endDate: string,
-  onPage?: (loaded: number) => void,
-): Promise<GameDoc[]> {
-  const all: GameDoc[] = [];
-  let cursor: string | null = null;
-  do {
-    // 200-doc pages keep each query's read comfortably under Convex's
-    // per-transaction limit even for docs carrying lineups + SHAP.
-    const page: { games: GameDoc[]; cursor: string | null } = await ctx.runQuery(
-      internal.mlb.getGamesByDateRange,
-      { startDate, endDate, cursor, limit: 200 },
-    );
-    all.push(...page.games);
-    cursor = page.cursor;
-    if (onPage) onPage(all.length);
-  } while (cursor);
-  return all;
-}
-
 /** Map a stored game document to the compact calibration projection row. */
 function calibrationRowFromDoc(d: GameDoc): CalibrationRow {
   return {
@@ -1427,15 +1412,18 @@ export const refreshModel = action({
     const today = etDateString(now);
 
     try {
-      await report("Loading stored games", 4, "Reading previously stored games…");
       const previousState: any = await ctx.runQuery(internal.mlb.getLatestModelState, {});
 
       // 0a. CONCURRENCY GUARD: if a refresh is already running server-side
       //     (e.g., the page reloaded or the client reconnected mid-flight),
       //     don't start a duplicate one that would re-run the expensive
-      //     calibration backfill. Surface the existing run's stats instead.
+      //     calibration backfill. This check MUST run before we write our own
+      //     progress report — otherwise the guard sees its own fresh `!done`
+      //     doc and every refresh would short-circuit as "already running".
+      //     The 3-minute window matches the client's staleness heuristic, so
+      //     a dead run stops blocking once its progress doc goes stale.
       const inFlight = await ctx.runQuery(api.mlb.getRefreshProgress, {});
-      if (inFlight && !inFlight.done && Date.now() - (inFlight.updatedAt ?? 0) < 15 * 60_000) {
+      if (inFlight && !inFlight.done && Date.now() - (inFlight.updatedAt ?? 0) < 3 * 60_000) {
         return {
           fast: true,
           alreadyRunning: true,
@@ -1452,6 +1440,8 @@ export const refreshModel = action({
           storedGames: 0,
         };
       }
+
+      await report("Loading stored games", 4, "Reading previously stored games…");
 
       // 0. FAST PATH: a trained model already exists, so skip the full reload
       //    + retrain (the multi-minute path) and just refresh the recent

@@ -44,6 +44,43 @@ export const getGamesByDateRange = internalQuery({
   },
 });
 
+// Compact paginated read of the games table for the calibration backfill.
+// Returns only the fields the calibration projection needs (~1/20th the size
+// of a full game doc), so the one-time backfill of a multi-season history is
+// fast and stays well inside per-query response limits.
+export const getCalibrationProjection = internalQuery({
+  args: {
+    startDate: v.string(),
+    endDate: v.string(),
+    cursor: v.union(v.string(), v.null()),
+    limit: v.optional(v.number()),
+  },
+  handler: async (ctx, args) => {
+    const page = await ctx.db
+      .query("games")
+      .withIndex("by_date", (q) => q.gte("date", args.startDate).lte("date", args.endDate))
+      .order("asc")
+      .paginate({ numItems: Math.min(args.limit ?? 500, 500), cursor: args.cursor ?? null });
+    const games = page.page.map((g) => ({
+      gamePk: g.gamePk,
+      date: g.date,
+      away: { abbrev: g.away.abbrev, name: g.away.name, score: g.away.score },
+      home: { abbrev: g.home.abbrev, name: g.home.name, score: g.home.score },
+      winner: g.winner,
+      pickTeam: g.pickTeam,
+      pickProb: g.pickProb,
+      homeWinProb: g.homeWinProb,
+      isCorrect: g.isCorrect,
+      isUpset: g.isUpset,
+      predictedTotal: (g.runProjection as { total?: number } | undefined)?.total,
+      homeRunLineProb: (g.runProjection as { homeRunLineProb?: number } | undefined)?.homeRunLineProb,
+      actualTotal: (g.away.score ?? 0) + (g.home.score ?? 0),
+      actualMargin: (g.home.score ?? 0) - (g.away.score ?? 0),
+    }));
+    return { games, cursor: page.continueCursor };
+  },
+});
+
 // Calibration metrics computed over the selected date range. The default
 // full-range view is served from a precomputed summary stored on the model
 // state; narrower ranges are computed from the lightweight `calibration`
@@ -273,6 +310,28 @@ export const replaceCalibrationForDate = internalMutation({
     for (const r of args.rows) {
       const { _id: _ignored, _creationTime: _ct, ...rest } = r as Record<string, unknown>;
       await ctx.db.insert("calibration", rest as any);
+    }
+  },
+});
+
+// Batched version of replaceCalibrationForDate: rewrites many dates in a
+// handful of mutations instead of one round-trip per date (the one-time
+// backfill can cover ~700 dates — this turns ~700 mutations into ~20).
+export const bulkReplaceCalibration = internalMutation({
+  args: {
+    groups: v.array(v.object({ date: v.string(), rows: v.array(v.any()) })),
+  },
+  handler: async (ctx, args) => {
+    for (const group of args.groups) {
+      const existing = await ctx.db
+        .query("calibration")
+        .withIndex("by_date", (q) => q.eq("date", group.date))
+        .collect();
+      for (const r of existing) await ctx.db.delete(r._id);
+      for (const r of group.rows) {
+        const { _id: _ignored, _creationTime: _ct, ...rest } = r as Record<string, unknown>;
+        await ctx.db.insert("calibration", rest as any);
+      }
     }
   },
 });
