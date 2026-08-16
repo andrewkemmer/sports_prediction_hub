@@ -110,7 +110,7 @@ export default function Dashboard() {
             <h1 className="text-base font-bold tracking-tight">MLB Predictions</h1>
           </div>
 
-          <nav className="flex items-center gap-1 overflow-x-auto">
+          <nav className="flex flex-wrap items-center gap-1">
             {TABS.map((t) => (
               <button
                 key={t.id}
