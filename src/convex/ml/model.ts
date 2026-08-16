@@ -15,6 +15,7 @@ import {
   CalibrationBin,
   CandidateModel,
   ConfidencePoint,
+  CrossValidationResult,
   CurvePoint,
   FEATURE_KEYS,
   FEATURE_LABELS,
@@ -25,10 +26,12 @@ import {
   FeatureValues,
   InjurySnapshot,
   ModelVersion,
+  OptimizationParams,
   PowerRanking,
   RawGame,
   RollingBrierPoint,
   ShapContribution,
+  StackingWeight,
   TeamState,
   TrainedModel,
 } from "./types";
@@ -78,6 +81,9 @@ export interface ModelRunResult {
   rollingBrier: RollingBrierPoint[];
   brierBaseline: number;
   modelVersions: ModelVersion[];
+  stackingWeights: StackingWeight[];
+  crossValidation: CrossValidationResult;
+  optimizationParams: OptimizationParams;
 }
 
 export interface Prediction {
@@ -193,6 +199,18 @@ function formOf(state: MutableState, id: number): number {
   return h.reduce((a, b) => a + b, 0) / h.length;
 }
 
+/** Starting-pitcher delta (away − home) so positive values favor the home team. */
+function starterDelta(
+  homePitcher: RawGame["homePitcher"],
+  awayPitcher: RawGame["awayPitcher"],
+  key: "era" | "fip",
+): number {
+  const away = awayPitcher?.[key];
+  const home = homePitcher?.[key];
+  if (typeof away !== "number" || typeof home !== "number") return 0;
+  return away - home;
+}
+
 function buildFeatures(game: RawGame, state: MutableState): FeatureValues {
   const homeElo = state.elo[game.home.id] ?? ELO_INIT;
   const awayElo = state.elo[game.away.id] ?? ELO_INIT;
@@ -216,6 +234,8 @@ function buildFeatures(game: RawGame, state: MutableState): FeatureValues {
     restDiff: clamp(homeRest - awayRest, -4, 4),
     injuryDiff: (state.injuries[game.away.id] ?? 0) - (state.injuries[game.home.id] ?? 0),
     homeField: 1,
+    spFipDiff: starterDelta(game.homePitcher, game.awayPitcher, "fip"),
+    spEraDiff: starterDelta(game.homePitcher, game.awayPitcher, "era"),
   };
 }
 
@@ -432,6 +452,70 @@ export function logisticLogit(
     if (shap) shap.push({ feature: f, label: FEATURE_LABELS[f], value: features[f], contribution: model.weights[i] * z });
   }
   return logitV;
+}
+
+// ---------------------------------------------------------------------------
+// Additional candidate models (pure TS) for the stacking ensemble
+// ---------------------------------------------------------------------------
+
+function standardized(
+  features: FeatureValues,
+  featureNames: FeatureKey[],
+  stats: Record<FeatureKey, { mean: number; std: number }>,
+): number[] {
+  return featureNames.map((f) => (features[f] - stats[f].mean) / (stats[f].std || 1));
+}
+
+/** k-nearest-neighbour classifier on standardized features (majority vote). */
+function knnModel(train: FeatureRow[], featureNames: FeatureKey[], k = 21) {
+  const stats = {} as Record<FeatureKey, { mean: number; std: number }>;
+  for (const f of featureNames) {
+    const vals = train.map((r) => r.features[f]);
+    stats[f] = { mean: mean(vals), std: std(vals) || 1 };
+  }
+  const zTrain = train.map((r) => standardized(r.features, featureNames, stats));
+  const labels = train.map((r) => r.label);
+  return (features: FeatureValues): number => {
+    const z = standardized(features, featureNames, stats);
+    const dists = zTrain.map((zt, i) => ({
+      d: zt.reduce((s, v, j) => s + (v - z[j]) * (v - z[j]), 0),
+      y: labels[i],
+    }));
+    dists.sort((a, b) => a.d - b.d);
+    const nn = dists.slice(0, k);
+    if (nn.length === 0) return 0.5;
+    return nn.reduce((s, x) => s + x.y, 0) / nn.length;
+  };
+}
+
+/** Gaussian Naive Bayes classifier with Laplace-smoothed priors. */
+function naiveBayesModel(train: FeatureRow[], featureNames: FeatureKey[]) {
+  const n = train.length;
+  const pos = train.filter((r) => r.label === 1);
+  const neg = train.filter((r) => r.label === 0);
+  const prior = (pos.length + 1) / (n + 2);
+  const cond = (rows: FeatureRow[]) =>
+    featureNames.map((f) => {
+      const vals = rows.map((r) => r.features[f]);
+      return { m: mean(vals), v: std(vals) * std(vals) + 1e-6 };
+    });
+  const posStats = cond(pos);
+  const negStats = cond(neg);
+  const gaussLog = (x: number, s: { m: number; v: number }) =>
+    -0.5 * Math.log(2 * Math.PI * s.v) - ((x - s.m) * (x - s.m)) / (2 * s.v);
+  return (features: FeatureValues): number => {
+    let logPos = Math.log(prior);
+    let logNeg = Math.log(1 - prior);
+    for (let j = 0; j < featureNames.length; j++) {
+      logPos += gaussLog(features[featureNames[j]], posStats[j]);
+      logNeg += gaussLog(features[featureNames[j]], negStats[j]);
+    }
+    const maxLog = Math.max(logPos, logNeg);
+    const pPos = Math.exp(logPos - maxLog);
+    const pNeg = Math.exp(logNeg - maxLog);
+    const sum = pPos + pNeg;
+    return sum > 0 ? pPos / sum : prior;
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -713,8 +797,17 @@ function buildModelVersions(
     },
     {
       frac: 0.75,
-      features: ["eloDiff", "winPctDiff", "formDiff", "restDiff", "injuryDiff", "homeField"],
-      note: "Added injured-list edge and isotonic calibration",
+      features: [
+        "eloDiff",
+        "winPctDiff",
+        "formDiff",
+        "restDiff",
+        "injuryDiff",
+        "homeField",
+        "spFipDiff",
+        "spEraDiff",
+      ],
+      note: "Added injured-list edge, starting-pitcher FIP/ERA and isotonic calibration",
     },
   ];
   const versions: ModelVersion[] = [];
@@ -744,6 +837,103 @@ function buildModelVersions(
     notes: "Current model: ML feature selection, ensemble and Monte Carlo decision",
   });
   return versions.reverse();
+}
+
+// ---------------------------------------------------------------------------
+// Stacking ensemble & cross-validation
+// ---------------------------------------------------------------------------
+
+/**
+ * Greedy forward-selection stacking: start from the lowest-Brier candidate and
+ * iteratively blend in the model that most reduces calibration-set Brier,
+ * tuning each new model's weight on a [0..1] grid. Returns convex-combination
+ * ensemble predictions plus normalized per-model weights.
+ */
+function buildStackingWeights(
+  candPreds: Record<string, number[]>,
+  labels: number[],
+): { preds: number[]; brier: number; weights: StackingWeight[] } {
+  const names = Object.keys(candPreds);
+  const ranked = names
+    .map((n) => ({ n, b: computeBrier(candPreds[n], labels) }))
+    .sort((a, b) => a.b - b.b);
+  const order = ranked.map((r) => r.n);
+  const first = candPreds[order[0]];
+  if (first.length === 0) {
+    return { preds: [], brier: Infinity, weights: names.map((n) => ({ name: n, weight: n === order[0] ? 1 : 0 })) };
+  }
+  let ensemble = [...first];
+  let weights = new Map<string, number>([[order[0], 1]]);
+  let curBrier = computeBrier(ensemble, labels);
+  const step = 0.05;
+  for (let i = 1; i < order.length; i++) {
+    const name = order[i];
+    const p = candPreds[name];
+    let bestW = 0;
+    let bestB = curBrier;
+    for (let w = step; w <= 1.0001; w += step) {
+      const blend = ensemble.map((e, j) => (1 - w) * e + w * p[j]);
+      const b = computeBrier(blend, labels);
+      if (b < bestB) {
+        bestB = b;
+        bestW = w;
+      }
+    }
+    if (bestB < curBrier - 0.0005) {
+      const next = new Map<string, number>();
+      for (const [k, v] of weights) next.set(k, v * (1 - bestW));
+      next.set(name, bestW);
+      weights = next;
+      ensemble = ensemble.map((e, j) => (1 - bestW) * e + bestW * p[j]);
+      curBrier = bestB;
+    }
+  }
+  const total = [...weights.values()].reduce((s, v) => s + v, 0) || 1;
+  const weightList: StackingWeight[] = names.map((n) => ({
+    name: n,
+    weight: round((weights.get(n) ?? 0) / total, 3),
+  }));
+  return { preds: ensemble, brier: curBrier, weights: weightList };
+}
+
+/**
+ * Walk-forward 5-fold cross-validation of the logistic model on selected
+ * features. Each fold trains only on data before its test window so
+ * out-of-sample AUC and Brier are never inflated by lookahead.
+ */
+function crossValidate(
+  rows: FeatureRow[],
+  featureNames: FeatureKey[],
+  cvFolds = 5,
+): CrossValidationResult {
+  const n = rows.length;
+  const chunkSize = Math.max(1, Math.floor(n / (cvFolds + 1)));
+  const foldAucs: number[] = [];
+  const foldBriers: number[] = [];
+  const gamesPerFold: number[] = [];
+  for (let f = 1; f <= cvFolds; f++) {
+    const trainEnd = f * chunkSize;
+    const testEnd = f === cvFolds ? n : (f + 1) * chunkSize;
+    const train = rows.slice(0, trainEnd);
+    const test = rows.slice(trainEnd, testEnd);
+    if (train.length < 40 || test.length < 20) continue;
+    const m = trainLogistic(train, featureNames);
+    const preds = test.map((r) => sigmoid(logisticLogit(m, r.features, null)));
+    const labels = test.map((r) => r.label);
+    foldAucs.push(computeAuc(preds, labels));
+    foldBriers.push(computeBrier(preds, labels));
+    gamesPerFold.push(test.length);
+  }
+  return {
+    folds: foldAucs.length,
+    aucMean: round(mean(foldAucs), 3),
+    aucStd: round(std(foldAucs), 3),
+    brierMean: round(mean(foldBriers), 3),
+    brierStd: round(std(foldBriers), 3),
+    foldAucs: foldAucs.map((x) => round(x, 3)),
+    foldBriers: foldBriers.map((x) => round(x, 3)),
+    gamesPerFold,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -873,18 +1063,22 @@ export function runModel(
     }
   }
 
+  const knn = knnModel(train, selected);
+  const nb = naiveBayesModel(train, selected);
+
   const candPreds: Record<string, number[]> = {
     "Elo rating": calib.map((r) => eloProb(r, eloHfa)),
     "Logistic regression": calib.map((r) => sigmoid(logisticLogit(lrModel, r.features, null))),
+    "k-NN (k=21)": calib.map((r) => knn(r.features)),
+    "Naive Bayes": calib.map((r) => nb(r.features)),
     "Blended ensemble": calib.map((_, i) => sigmoid((1 - blendW) * lrLogits[i] + blendW * eloLogits[i])),
   };
 
   const candidates: CandidateModel[] = [];
-  let bestName = "Blended ensemble";
+  let bestSingleName = "Blended ensemble";
   let bestAuc = -1;
   let bestBrier = Infinity;
-  const candidateDefs = Object.keys(candPreds);
-  for (const name of candidateDefs) {
+  for (const name of Object.keys(candPreds)) {
     const p = candPreds[name];
     const m = evaluate(p, calibLabels);
     candidates.push({
@@ -900,16 +1094,25 @@ export function runModel(
       if (m.auc > bestAuc + 0.003) {
         bestAuc = m.auc;
         bestBrier = m.brier;
-        bestName = name;
+        bestSingleName = name;
       } else if (m.brier < bestBrier) {
         bestBrier = m.brier;
-        bestName = name;
+        bestSingleName = name;
       }
     }
   }
-  for (const c of candidates) c.selected = c.name === bestName;
+  for (const c of candidates) c.selected = c.name === bestSingleName;
 
-  const chosenPreds = candPreds[bestName];
+  // Solve for optimal stacking weights across all candidate models.
+  const stacking = buildStackingWeights(candPreds, calibLabels);
+
+  // Prefer the stacked ensemble only when it measurably reduces holdout risk.
+  let bestName = bestSingleName;
+  let chosenPreds = candPreds[bestSingleName];
+  if (stacking.preds.length > 0 && stacking.brier < bestBrier - 0.0005) {
+    bestName = "Stacked ensemble";
+    chosenPreds = stacking.preds;
+  }
 
   // Fit isotonic calibration on the calibrate set.
   const order = chosenPreds.map((p, i) => ({ p, y: calibLabels[i] })).sort((a, b) => a.p - b.p);
@@ -968,13 +1171,29 @@ export function runModel(
   const brierBaseline = modelVersions.length > 1 ? modelVersions[1].brier : rolling.baseline;
 
   // Feature importances (univariate AUC on the full dataset + coefficient).
+  // All candidate features are listed so the UI can show selection decisions.
   const fullLabels = rows.map((r) => r.label);
-  const featureImportances: FeatureImportance[] = selected.map((f) => {
+  const featureImportances: FeatureImportance[] = FEATURE_KEYS.map((f) => {
     const uni = computeAuc(rows.map((r) => r.features[f]), fullLabels);
     const idx = lrModel.featureNames.indexOf(f);
-    const w = lrModel.weights[idx];
-    return { feature: f, label: FEATURE_LABELS[f], weight: w, importance: Math.abs(w), univariateAuc: uni };
+    const active = idx >= 0;
+    const w = active ? lrModel.weights[idx] : 0;
+    return { feature: f, label: FEATURE_LABELS[f], weight: w, importance: Math.abs(w), univariateAuc: uni, active };
   });
+
+  // Diagnostics: 5-fold cross-validation and hyperparameter audit trail.
+  const crossValidation = crossValidate(rows, selected, 5);
+  const optimizationParams: OptimizationParams = {
+    learningRate: 0.1,
+    l2Lambda: 0.001,
+    epochs: 1200,
+    hfaGrid: HFA_GRID,
+    blendStep: 0.05,
+    mcSigmaGrid: mcGrid,
+    cvFolds: 5,
+    isotonicMethod: "Isotonic (PAV)",
+    featureSelection: "Greedy backward elimination (L2 logistic)",
+  };
 
   const teamMeta = new Map<number, { name: string; abbrev: string }>();
   for (const g of completedGames) {
@@ -1008,10 +1227,13 @@ export function runModel(
     })
     .sort((a, b) => b.elo - a.elo);
 
+  const stackedModelCount = stacking.weights.filter((w) => w.weight > 0).length;
   const description =
-    bestName === "Blended ensemble"
-      ? `Ensemble: ${(1 - blendW).toFixed(2)}·logistic + ${blendW.toFixed(2)}·Elo, isotonic-calibrated${mcEnabled ? ", Monte Carlo-smoothed" : ""}.`
-      : `${bestName}, isotonic-calibrated${mcEnabled ? ", Monte Carlo-smoothed" : ""}.`;
+    bestName === "Stacked ensemble"
+      ? `Stacked ensemble of ${stackedModelCount} models (greedy forward selection), isotonic-calibrated${mcEnabled ? ", Monte Carlo-smoothed" : ""}.`
+      : bestName === "Blended ensemble"
+        ? `Ensemble: ${(1 - blendW).toFixed(2)}·logistic + ${blendW.toFixed(2)}·Elo, isotonic-calibrated${mcEnabled ? ", Monte Carlo-smoothed" : ""}.`
+        : `${bestName}, isotonic-calibrated${mcEnabled ? ", Monte Carlo-smoothed" : ""}.`;
 
   const result: ModelRunResult = {
     season: opts.season,
@@ -1044,6 +1266,9 @@ export function runModel(
     rollingBrier: rolling.points,
     brierBaseline,
     modelVersions,
+    stackingWeights: stacking.weights,
+    crossValidation,
+    optimizationParams,
   };
 
   return { result, model, teamState, rows, predict };

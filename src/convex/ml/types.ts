@@ -6,6 +6,7 @@ export interface PitcherInfo {
   name: string;
   era?: number;
   k9?: number;
+  fip?: number; // fielding-independent pitching (computed from K / BB / HR / IP)
 }
 
 export interface TeamInfo {
@@ -49,6 +50,8 @@ export interface FeatureValues {
   restDiff: number; // home rest days - away rest days
   injuryDiff: number; // away injured-list count - home injured-list count (positive favors home)
   homeField: number; // always 1
+  spFipDiff: number; // away SP FIP - home SP FIP (positive favors home)
+  spEraDiff: number; // away SP ERA - home SP ERA (positive favors home)
 }
 
 export const FEATURE_KEYS = [
@@ -58,6 +61,8 @@ export const FEATURE_KEYS = [
   "restDiff",
   "injuryDiff",
   "homeField",
+  "spFipDiff",
+  "spEraDiff",
 ] as const;
 
 export type FeatureKey = (typeof FEATURE_KEYS)[number];
@@ -69,6 +74,8 @@ export const FEATURE_LABELS: Record<FeatureKey, string> = {
   restDiff: "Rest advantage",
   injuryDiff: "Injury edge (IL)",
   homeField: "Home field",
+  spFipDiff: "Starting Pitcher FIP / xERA Delta",
+  spEraDiff: "Starting Pitcher ERA Delta",
 };
 
 /** A training row: features computed strictly as-of the game time. */
@@ -112,9 +119,10 @@ export interface CurvePoint {
 export interface FeatureImportance {
   feature: FeatureKey;
   label: string;
-  weight: number; // standardized logistic coefficient
+  weight: number; // standardized logistic coefficient (0 when not selected)
   importance: number; // |weight|
   univariateAuc: number;
+  active: boolean; // retained by ML feature selection
 }
 
 export interface CandidateModel {
@@ -227,4 +235,35 @@ export interface GameDoc {
   shap?: ShapContribution[];
   homeInjuries?: number;
   awayInjuries?: number;
+}
+
+/** Ensemble stacking weight for one candidate model. */
+export interface StackingWeight {
+  name: string;
+  weight: number; // 0..1 share of the final ensemble (sums to 1)
+}
+
+/** 5-fold cross-validation diagnostics for the final model family. */
+export interface CrossValidationResult {
+  folds: number;
+  aucMean: number;
+  aucStd: number;
+  brierMean: number;
+  brierStd: number;
+  foldAucs: number[];
+  foldBriers: number[];
+  gamesPerFold: number[];
+}
+
+/** Hyperparameters and search grids used by the Auto-ML optimizer. */
+export interface OptimizationParams {
+  learningRate: number;
+  l2Lambda: number;
+  epochs: number;
+  hfaGrid: number[];
+  blendStep: number;
+  mcSigmaGrid: number[];
+  cvFolds: number;
+  isotonicMethod: string;
+  featureSelection: string;
 }

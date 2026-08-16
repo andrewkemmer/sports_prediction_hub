@@ -3,13 +3,16 @@ import type {
   CalibrationBin,
   CandidateModel,
   ConfidencePoint,
+  CrossValidationResult,
   CurvePoint,
   FeatureDriftItem,
   FeatureImportance,
   GameDoc,
   ModelVersion,
+  OptimizationParams,
   PowerRanking,
   RollingBrierPoint,
+  StackingWeight,
   TodaysRecord,
 } from "@/convex/ml/types";
 
@@ -17,13 +20,16 @@ export type {
   CalibrationBin,
   CandidateModel,
   ConfidencePoint,
+  CrossValidationResult,
   CurvePoint,
   FeatureDriftItem,
   FeatureImportance,
   GameDoc,
   ModelVersion,
+  OptimizationParams,
   PowerRanking,
   RollingBrierPoint,
+  StackingWeight,
   TodaysRecord,
 };
 
@@ -60,6 +66,9 @@ export interface ModelStateDoc {
   rollingBrier?: RollingBrierPoint[];
   brierBaseline?: number;
   modelVersions?: ModelVersion[];
+  stackingWeights?: StackingWeight[];
+  crossValidation?: CrossValidationResult;
+  optimizationParams?: OptimizationParams;
   spearmanRho?: number;
   topDecileWinRate?: number;
   todaysRecord: TodaysRecord;

@@ -59,6 +59,15 @@ const FEATURE_META: Record<string, { category: string; description: string }> = 
     category: "Context",
     description: "Home-field advantage term.",
   },
+  spFipDiff: {
+    category: "Starting Pitcher",
+    description:
+      "Fielding-independent pitching edge (FIP/xERA-style), computed from strikeouts, walks and home runs — strips fielding luck and BABIP variance to quantify true run-prevention expectation.",
+  },
+  spEraDiff: {
+    category: "Starting Pitcher",
+    description: "Season ERA differential between the two projected starting pitchers.",
+  },
 };
 
 function shortDate(ymd: string): string {
@@ -180,6 +189,162 @@ function FeatureItem({
   );
 }
 
+function StackingWeightsPanel({ modelState }: { modelState: ModelStateDoc }) {
+  const candidates = modelState.candidates ?? [];
+  const weights = modelState.stackingWeights ?? [];
+  const rows = candidates
+    .map((c) => {
+      const stackWeight = weights.find((w) => w.name === c.name)?.weight ?? (c.selected ? 1 : 0);
+      return { ...c, stackWeight };
+    })
+    .sort((a, b) => b.stackWeight - a.stackWeight);
+
+  return (
+    <div className="rounded-2xl border border-border bg-card p-5">
+      <h3 className="text-sm font-semibold text-foreground">Optimal Model Stacking Weights</h3>
+      <p className="mt-1.5 max-w-3xl text-xs leading-5 text-muted-foreground">
+        Greedy forward-selection solves for convex-combination weights that minimize calibration-set
+        Brier loss. Only models that measurably reduce risk are added to the stack; the remainder
+        carry zero weight.
+      </p>
+      <div className="mt-5 flex flex-col gap-4">
+        {rows.map((c) => (
+          <div key={c.name}>
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="flex items-center gap-2">
+                <span className="text-sm font-medium text-foreground">{c.name}</span>
+                {c.selected && (
+                  <span className="rounded-full bg-emerald-500/15 px-2 py-0.5 text-[10px] font-semibold text-emerald-300">
+                    Best single
+                  </span>
+                )}
+              </div>
+              <div className="flex items-center gap-3 text-xs tabular-nums">
+                <span className="text-muted-foreground">AUC {c.auc.toFixed(3)}</span>
+                <span className="text-muted-foreground">Brier {c.brier.toFixed(3)}</span>
+                <span className="font-semibold text-cyan-300">{Math.round(c.stackWeight * 100)}%</span>
+              </div>
+            </div>
+            <div className="mt-2 h-2 w-full overflow-hidden rounded-full bg-white/5">
+              <div
+                className="h-full rounded-full bg-cyan-400"
+                style={{ width: `${Math.max(0, Math.min(100, c.stackWeight * 100))}%` }}
+              />
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function OptimizationParamsPanel({ modelState }: { modelState: ModelStateDoc }) {
+  const params = modelState.optimizationParams;
+  if (!params) {
+    return (
+      <div className="rounded-2xl border border-border bg-card p-5 text-sm text-muted-foreground">
+        Optimization parameters will appear after the next Auto-ML run.
+      </div>
+    );
+  }
+  const rows: { label: string; value: string }[] = [
+    { label: "Feature selection", value: params.featureSelection },
+    { label: "Regularization", value: `L2 λ = ${params.l2Lambda}` },
+    { label: "Optimizer", value: `Batch gradient descent · lr ${params.learningRate} · ${params.epochs} epochs` },
+    { label: "Home-field grid", value: params.hfaGrid.join(", ") },
+    { label: "Stacking blend step", value: `${params.blendStep}` },
+    { label: "Monte Carlo σ grid", value: params.mcSigmaGrid.join(", ") },
+    { label: "Calibration", value: params.isotonicMethod },
+    { label: "Cross-validation folds", value: `${params.cvFolds}` },
+  ];
+  return (
+    <div className="rounded-2xl border border-border bg-card p-5">
+      <h3 className="text-sm font-semibold text-foreground">Optimization Parameters</h3>
+      <p className="mt-1.5 max-w-3xl text-xs leading-5 text-muted-foreground">
+        Hyperparameters and search grids used by the Auto-ML optimizer on the most recent training run.
+      </p>
+      <div className="mt-4 overflow-x-auto">
+        <table className="w-full min-w-[480px] text-sm">
+          <tbody>
+            {rows.map((r) => (
+              <tr key={r.label} className="border-b border-border/50 last:border-0">
+                <td className="py-2.5 pr-4 text-muted-foreground">{r.label}</td>
+                <td className="py-2.5 text-right font-medium tabular-nums text-foreground">{r.value}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+function CrossValidationPanel({ modelState }: { modelState: ModelStateDoc }) {
+  const cv = modelState.crossValidation;
+  if (!cv) {
+    return (
+      <div className="rounded-2xl border border-border bg-card p-5 text-sm text-muted-foreground">
+        Cross-validation metrics will appear after the next Auto-ML run.
+      </div>
+    );
+  }
+  return (
+    <div className="rounded-2xl border border-border bg-card p-5">
+      <div className="flex flex-wrap items-start justify-between gap-4">
+        <div>
+          <h3 className="text-sm font-semibold text-foreground">
+            {cv.folds}-Fold Cross-Validation ({formatNumber(modelState.gamesTrained)} games)
+          </h3>
+          <p className="mt-1.5 max-w-3xl text-xs leading-5 text-muted-foreground">
+            Walk-forward folds train only on prior data so out-of-sample AUC and Brier are never
+            inflated by lookahead. Reported mean ± standard deviation across folds.
+          </p>
+        </div>
+        <div className="flex gap-4 text-right">
+          <div>
+            <div className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">Mean AUC</div>
+            <div className="text-lg font-bold tabular-nums text-cyan-300">
+              {cv.aucMean.toFixed(3)} ± {cv.aucStd.toFixed(3)}
+            </div>
+          </div>
+          <div>
+            <div className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">Mean Brier</div>
+            <div className="text-lg font-bold tabular-nums text-emerald-300">
+              {cv.brierMean.toFixed(3)} ± {cv.brierStd.toFixed(3)}
+            </div>
+          </div>
+        </div>
+      </div>
+      <div className="mt-4 overflow-x-auto">
+        <table className="w-full min-w-[440px] text-sm">
+          <thead>
+            <tr className="border-b border-border/70 text-left text-[11px] uppercase tracking-wider text-muted-foreground">
+              <th className="pb-2 font-medium">Fold</th>
+              <th className="pb-2 text-right font-medium">Games</th>
+              <th className="pb-2 text-right font-medium">AUC</th>
+              <th className="pb-2 text-right font-medium">Brier</th>
+            </tr>
+          </thead>
+          <tbody>
+            {cv.foldAucs.map((auc, i) => (
+              <tr key={i} className="border-b border-border/50 last:border-0">
+                <td className="py-2.5 font-medium text-foreground">Fold {i + 1}</td>
+                <td className="py-2.5 text-right tabular-nums text-muted-foreground">
+                  {formatNumber(cv.gamesPerFold[i] ?? 0)}
+                </td>
+                <td className="py-2.5 text-right tabular-nums text-foreground">{auc.toFixed(3)}</td>
+                <td className="py-2.5 text-right tabular-nums text-foreground">
+                  {cv.foldBriers[i]?.toFixed(3) ?? "—"}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Sub-panels
 // ---------------------------------------------------------------------------
@@ -187,6 +352,8 @@ function FeatureItem({
 function AutoMlPanel({ modelState }: { modelState: ModelStateDoc }) {
   const runAutoMl = useAction(api.mlbActions.refreshModel);
   const [running, setRunning] = useState(false);
+
+  const [autoSub, setAutoSub] = useState<"features" | "stacking" | "params" | "cv">("features");
 
   const candidates = modelState.candidates ?? [];
   const selected = candidates.find((c) => c.selected) ?? candidates[0];
@@ -196,9 +363,12 @@ function AutoMlPanel({ modelState }: { modelState: ModelStateDoc }) {
   const spearmanRho = modelState.spearmanRho ?? 0;
   const topDecileWinRate = modelState.topDecileWinRate ?? 0;
   const features = modelState.featureImportances ?? [];
-  const totalWeight = features.reduce((s, f) => s + Math.abs(f.weight), 0) || 1;
-  const maxImp = Math.max(...features.map((f) => f.importance), 1e-6);
-  const sortedFeatures = [...features].sort((a, b) => b.importance - a.importance);
+  // `active === undefined` (pre-pitcher-feature states) is treated as selected.
+  const activeFeatures = features.filter((f) => f.active !== false);
+  const inactiveFeatures = features.filter((f) => f.active === false);
+  const totalWeight = activeFeatures.reduce((s, f) => s + Math.abs(f.weight), 0) || 1;
+  const maxImp = Math.max(...activeFeatures.map((f) => f.importance), 1e-6);
+  const sortedFeatures = [...activeFeatures].sort((a, b) => b.importance - a.importance);
 
   const handleRun = async () => {
     if (running) return;
@@ -289,57 +459,82 @@ function AutoMlPanel({ modelState }: { modelState: ModelStateDoc }) {
         />
       </div>
 
-      {/* Sub-nav chips */}
+      {/* Secondary sub-tabs */}
       <div className="flex flex-wrap items-center gap-2">
-        <span className="flex items-center gap-1.5 rounded-full bg-cyan-500 px-3 py-1 text-xs font-semibold text-cyan-950">
-          <SlidersHorizontal className="size-3.5" />
-          Learned Feature Decisions ({sortedFeatures.length}/{features.length} Active)
-        </span>
-        <span className="flex items-center gap-1.5 rounded-full border border-border bg-card px-3 py-1 text-xs text-muted-foreground">
-          <Network className="size-3.5" />
-          Optimal Model Stacking Weights ({candidates.length} Models)
-        </span>
-        <span className="flex items-center gap-1.5 rounded-full border border-border bg-card px-3 py-1 text-xs text-muted-foreground">
-          <SlidersHorizontal className="size-3.5" />
-          Optimization Parameters
-        </span>
-        <span className="flex items-center gap-1.5 rounded-full border border-border bg-card px-3 py-1 text-xs text-muted-foreground">
-          <Check className="size-3.5 text-emerald-400" />
-          Cross-Validation on {formatNumber(modelState.gamesTrained)} games
-        </span>
-      </div>
-
-      {/* Info callout */}
-      <div className="rounded-2xl border border-amber-500/20 bg-amber-500/[0.06] p-4">
-        <div className="flex items-start gap-3">
-          <Sparkles className="mt-0.5 size-4 shrink-0 text-amber-400" />
-          <div>
-            <div className="text-sm font-bold text-foreground">
-              How Machine Learning Decided Feature Inclusion &amp; Weights:
-            </div>
-            <p className="mt-1 text-xs leading-5 text-muted-foreground">
-              ElasticNet L1/L2 regularization evaluated each candidate feature. Features with non-zero
-              sparse coefficients were retained and weighted proportionally to their cross-validated AUC
-              lift and variance reduction.
-            </p>
-          </div>
-        </div>
-      </div>
-
-      {/* Feature list */}
-      <div className="flex flex-col gap-3">
-        {sortedFeatures.map((f, i) => (
-          <FeatureItem
-            key={f.feature}
-            rank={i + 1}
-            label={f.label}
-            category={FEATURE_META[f.feature]?.category ?? "Model Feature"}
-            description={FEATURE_META[f.feature]?.description ?? "Automatically selected predictive feature."}
-            weightPct={Math.round((Math.abs(f.weight) / totalWeight) * 100)}
-            barPct={Math.round((f.importance / maxImp) * 100)}
-          />
+        {(
+          [
+            { id: "features", label: `Learned Feature Decisions (${activeFeatures.length}/${features.length} Active)`, icon: <SlidersHorizontal className="size-3.5" /> },
+            { id: "stacking", label: `Optimal Model Stacking Weights (${candidates.length} Models)`, icon: <Network className="size-3.5" /> },
+            { id: "params", label: "Optimization Parameters", icon: <SlidersHorizontal className="size-3.5" /> },
+            { id: "cv", label: `Cross-Validation on ${formatNumber(modelState.gamesTrained)} games`, icon: <Check className="size-3.5" /> },
+          ] as const
+        ).map((t) => (
+          <button
+            key={t.id}
+            type="button"
+            onClick={() => setAutoSub(t.id)}
+            className={cn(
+              "flex cursor-pointer items-center gap-1.5 rounded-full px-3 py-1 text-xs font-semibold transition-colors",
+              autoSub === t.id
+                ? "bg-cyan-500 text-cyan-950"
+                : "border border-border bg-card text-muted-foreground hover:text-foreground",
+            )}
+          >
+            {t.icon}
+            {t.label}
+          </button>
         ))}
       </div>
+
+      {/* Info callout (feature decisions only) */}
+      {autoSub === "features" && (
+        <div className="rounded-2xl border border-amber-500/20 bg-amber-500/[0.06] p-4">
+          <div className="flex items-start gap-3">
+            <Sparkles className="mt-0.5 size-4 shrink-0 text-amber-400" />
+            <div>
+              <div className="text-sm font-bold text-foreground">
+                How Machine Learning Decided Feature Inclusion &amp; Weights:
+              </div>
+              <p className="mt-1 text-xs leading-5 text-muted-foreground">
+                ElasticNet L1/L2 regularization evaluated each candidate feature. Features with non-zero
+                sparse coefficients were retained and weighted proportionally to their cross-validated AUC
+                lift and variance reduction.
+              </p>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Sub-tab content */}
+      {autoSub === "features" && (
+        <div className="flex flex-col gap-3">
+          {inactiveFeatures.length > 0 && (
+            <div className="rounded-xl border border-border/70 bg-white/[0.02] px-4 py-3 text-xs leading-5 text-muted-foreground">
+              <span className="font-semibold text-foreground">Dropped by ML:</span>{" "}
+              {inactiveFeatures.map((f) => f.label).join(" · ")}
+            </div>
+          )}
+          {sortedFeatures.map((f, i) => (
+            <FeatureItem
+              key={f.feature}
+              rank={i + 1}
+              label={f.label}
+              category={FEATURE_META[f.feature]?.category ?? "Model Feature"}
+              description={FEATURE_META[f.feature]?.description ?? "Automatically selected predictive feature."}
+              weightPct={Math.round((Math.abs(f.weight) / totalWeight) * 100)}
+              barPct={Math.round((f.importance / maxImp) * 100)}
+            />
+          ))}
+          {sortedFeatures.length === 0 && (
+            <div className="rounded-2xl border border-border bg-card p-5 text-sm text-muted-foreground">
+              No feature decisions yet — run Auto-ML optimization.
+            </div>
+          )}
+        </div>
+      )}
+      {autoSub === "stacking" && <StackingWeightsPanel modelState={modelState} />}
+      {autoSub === "params" && <OptimizationParamsPanel modelState={modelState} />}
+      {autoSub === "cv" && <CrossValidationPanel modelState={modelState} />}
     </div>
   );
 }
@@ -392,7 +587,7 @@ function PfiPanel({ modelState }: { modelState: ModelStateDoc }) {
 
 function EnsemblePanel({ modelState }: { modelState: ModelStateDoc }) {
   const candidates = modelState.candidates ?? [];
-  const steps = ["6 Features", "Logistic + Elo", "Blended Ensemble", "Isotonic Calibration", "Monte Carlo", "Win Probability"];
+  const steps = ["8 Features", "5 Candidate Models", "Stacked Ensemble", "Isotonic Calibration", "Monte Carlo", "Win Probability"];
   return (
     <div className="flex flex-col gap-4">
       {/* Architecture flow */}

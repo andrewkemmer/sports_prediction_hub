@@ -186,24 +186,55 @@ async function fetchSeason(season: string, throughDate: string): Promise<RawGame
 // Pitcher stats (season ERA / K/9) — display + matchup context
 // ---------------------------------------------------------------------------
 
-async function fetchPitcherStats(ids: number[], season: string): Promise<Map<number, { era?: number; k9?: number }>> {
-  const out = new Map<number, { era?: number; k9?: number }>();
+interface PitcherSeasonStats {
+  era?: number;
+  k9?: number;
+  fip?: number;
+}
+
+function statNumber(value: unknown): number | undefined {
+  if (typeof value === "string") {
+    const n = parseFloat(value);
+    return Number.isFinite(n) ? n : undefined;
+  }
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+/** "187.2" → 187.666… (baseball innings convention: .1 = ⅓, .2 = ⅔). */
+function inningsPitchedValue(ip: unknown): number {
+  if (typeof ip === "number") return ip;
+  if (typeof ip === "string") {
+    const [whole, frac] = ip.split(".");
+    return (Number(whole) || 0) + (frac === "1" ? 1 / 3 : frac === "2" ? 2 / 3 : 0);
+  }
+  return 0;
+}
+
+/** FIP constant keeps values ERA-like; it cancels out in the feature delta. */
+const FIP_CONSTANT = 3.1;
+
+async function fetchPitcherStats(ids: number[], season: string): Promise<Map<number, PitcherSeasonStats>> {
+  const out = new Map<number, PitcherSeasonStats>();
   const unique = [...new Set(ids)].filter((id) => id > 0);
-  await mapLimit(unique, 6, async (id) => {
+  await mapLimit(unique, 8, async (id) => {
     try {
       const data = await fetchJson(
         `${MLB_BASE}/api/v1/people/${id}/stats?stats=season&group=pitching&season=${season}`,
       );
       const stat = data?.stats?.[0]?.splits?.[0]?.stat;
       if (stat) {
-        const era = typeof stat.era === "string" ? parseFloat(stat.era) : stat.era;
-        const k9 =
-          typeof stat.strikeoutsPer9Inn === "string"
-            ? parseFloat(stat.strikeoutsPer9Inn)
-            : stat.strikeoutsPer9Inn;
+        const era = statNumber(stat.era);
+        const k9 = statNumber(stat.strikeoutsPer9Inn);
+        const hr = statNumber(stat.homeRuns) ?? 0;
+        const bb = statNumber(stat.baseOnBalls) ?? 0;
+        const hbp = statNumber(stat.hitByPitch) ?? 0;
+        const so = statNumber(stat.strikeOuts) ?? 0;
+        const ip = inningsPitchedValue(stat.inningsPitched);
+        const fip = ip > 0 ? (13 * hr + 3 * (bb + hbp) - 2 * so) / ip + FIP_CONSTANT : undefined;
         out.set(id, {
-          era: Number.isFinite(era) ? era : undefined,
-          k9: Number.isFinite(k9) ? k9 : undefined,
+          era,
+          k9,
+          fip: fip === undefined ? undefined : Math.round(fip * 100) / 100,
         });
       }
     } catch {
@@ -211,6 +242,18 @@ async function fetchPitcherStats(ids: number[], season: string): Promise<Map<num
     }
   });
   return out;
+}
+
+/** Attach ERA/K9/FIP to each game's probable pitchers in place (new array). */
+function attachPitcherStats(
+  games: RawGame[],
+  stats: Map<number, PitcherSeasonStats>,
+): RawGame[] {
+  return games.map((g) => ({
+    ...g,
+    awayPitcher: g.awayPitcher ? { ...g.awayPitcher, ...(stats.get(g.awayPitcher.id) ?? {}) } : undefined,
+    homePitcher: g.homePitcher ? { ...g.homePitcher, ...(stats.get(g.homePitcher.id) ?? {}) } : undefined,
+  }));
 }
 
 // ---------------------------------------------------------------------------
@@ -326,7 +369,7 @@ function reconstructTeamState(rankings: PowerRanking[]): TeamState {
 function buildGameDoc(
   game: RawGame,
   pred: { homeWinProb: number; awayWinProb: number; pickTeam: "home" | "away"; pickProb: number; shap: GameDoc["shap"]; edge: number; fairHomeOdds: number; fairAwayOdds: number },
-  pitcherStats: Map<number, { era?: number; k9?: number }>,
+  pitcherStats: Map<number, PitcherSeasonStats>,
   injuries?: { home: number; away: number },
 ): GameDoc {
   const awayPitcher: PitcherInfo | undefined = game.awayPitcher
@@ -397,6 +440,20 @@ export const refreshModel = action({
       );
     }
 
+    // 1b. Fetch the upcoming window now so every starting pitcher (completed +
+    //     upcoming) can be hydrated in a single consolidated pass.
+    const windowEnd = addDays(today, UPCOMING_WINDOW_DAYS);
+    const upcomingRaw = await fetchScheduleRange(today, windowEnd);
+
+    // 1c. Season pitching stats (ERA / K9 / FIP) for every starter in scope.
+    const pitcherIdSet = new Set<number>();
+    for (const g of [...completed, ...upcomingRaw]) {
+      if (g.awayPitcher) pitcherIdSet.add(g.awayPitcher.id);
+      if (g.homePitcher) pitcherIdSet.add(g.homePitcher.id);
+    }
+    const pitcherStats = await fetchPitcherStats([...pitcherIdSet], season);
+    const completedEnriched = attachPitcherStats(completed, pitcherStats);
+
     // 2. Pull as-of-time injured-list snapshots for every team that has played,
     //    then train, select features/model, calibrate, and decide on Monte Carlo.
     const teamIds = [...new Set(completed.flatMap((g) => [g.home.id, g.away.id]))];
@@ -406,7 +463,7 @@ export const refreshModel = action({
       `${season}-${SEASON_START_MD}`,
       today,
     );
-    const run = runModel(completed, { season, asOfDate: today }, injurySnapshots);
+    const run = runModel(completedEnriched, { season, asOfDate: today }, injurySnapshots);
     const { result, model, rows, teamState } = run;
 
     // 3. As-of-time predictions for every completed game (historical results).
@@ -414,7 +471,7 @@ export const refreshModel = action({
       buildGameDoc(
         row.game,
         applyModel(model, row.features, row.homeElo, row.awayElo),
-        new Map(),
+        pitcherStats,
       ),
     );
 
@@ -429,15 +486,8 @@ export const refreshModel = action({
     const topDecileWinRate = highConf.length > 0 ? highConf.filter((d) => d.isCorrect).length / highConf.length : 0;
 
     // 4. Upcoming games (today through +3 days) with starter stat context.
-    const windowEnd = addDays(today, UPCOMING_WINDOW_DAYS);
-    const upcomingRaw = await fetchScheduleRange(today, windowEnd);
-    const pitcherIds: number[] = [];
-    for (const g of upcomingRaw) {
-      if (g.awayPitcher) pitcherIds.push(g.awayPitcher.id);
-      if (g.homePitcher) pitcherIds.push(g.homePitcher.id);
-    }
-    const pitcherStats = await fetchPitcherStats(pitcherIds, season);
-    const upcomingDocs: GameDoc[] = upcomingRaw
+    const upcomingEnriched = attachPitcherStats(upcomingRaw, pitcherStats);
+    const upcomingDocs: GameDoc[] = upcomingEnriched
       .filter((g) => g.winner !== "home" && g.winner !== "away")
       .map((g) =>
         buildGameDoc(g, predictionFor(g, model, teamState), pitcherStats, {
@@ -484,6 +534,9 @@ export const refreshModel = action({
         rollingBrier: result.rollingBrier,
         brierBaseline: result.brierBaseline,
         modelVersions: result.modelVersions,
+        stackingWeights: result.stackingWeights,
+        crossValidation: result.crossValidation,
+        optimizationParams: result.optimizationParams,
         spearmanRho,
         topDecileWinRate,
         todaysRecord,
@@ -535,8 +588,9 @@ export const predictDate = action({
       if (g.homePitcher) pitcherIds.push(g.homePitcher.id);
     }
     const pitcherStats = await fetchPitcherStats(pitcherIds, state.season as string);
+    const enriched = attachPitcherStats(raw, pitcherStats);
 
-    const docs = raw.map((g) =>
+    const docs = enriched.map((g) =>
       buildGameDoc(g, predictionFor(g, model, teamState), pitcherStats, {
         home: teamState.injuries[g.home.id] ?? 0,
         away: teamState.injuries[g.away.id] ?? 0,

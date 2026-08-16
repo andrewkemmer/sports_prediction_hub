@@ -30,6 +30,7 @@ const pitcherInfo = v.object({
   name: v.string(),
   era: v.optional(v.number()),
   k9: v.optional(v.number()),
+  fip: v.optional(v.number()),
 });
 
 const shapContribution = v.object({
