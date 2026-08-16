@@ -172,12 +172,20 @@ export function CalibrationTab({ modelState }: { modelState: ModelStateDoc }) {
   const visibleGames = filteredGames;
   const listLoading = gamesPage === undefined && rows.length === 0;
 
+  const resetPagination = () => {
+    setRows([]);
+    setPageCursor(undefined);
+    setNextCursor(null);
+  };
+
   const onStartChange = (v: string) => {
     setStartDate(v);
+    resetPagination();
     if (v && endDate && v > endDate) setEndDate(v);
   };
   const onEndChange = (v: string) => {
     setEndDate(v);
+    resetPagination();
     if (v && startDate && v < startDate) setStartDate(v);
   };
 

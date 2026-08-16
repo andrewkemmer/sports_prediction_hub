@@ -1,5 +1,5 @@
 import { v } from "convex/values";
-import { internalMutation, internalQuery, query, QueryCtx } from "./_generated/server";
+import { internalMutation, internalQuery, query } from "./_generated/server";
 import { calibrationCurvePoints, computeAuc, computeBrier, evaluate } from "./ml/model";
 import type { CalibrationBin, ConfidencePoint, CurvePoint } from "./ml/types";
 
@@ -40,42 +40,36 @@ interface CalibrationRow {
   actualMargin?: number;
 }
 
-async function loadCalibrationRows(
-  ctx: QueryCtx,
-  startDate: string,
-  endDate: string,
-): Promise<CalibrationRow[]> {
-  const rows: CalibrationRow[] = [];
-  let cursor: string | null = null;
-  do {
-    const page = await ctx.db
-      .query("games")
-      .withIndex("by_date", (q) => q.gte("date", startDate).lte("date", endDate))
-      .paginate({ numItems: 1000, cursor });
-    for (const g of page.page) {
-      if (g.winner !== "home" && g.winner !== "away") continue;
-      rows.push({
-        gamePk: g.gamePk,
-        date: g.date,
-        away: { abbrev: g.away.abbrev, name: g.away.name, score: g.away.score },
-        home: { abbrev: g.home.abbrev, name: g.home.name, score: g.home.score },
-        winner: g.winner,
-        pickTeam: g.pickTeam,
-        pickProb: g.pickProb,
-        isCorrect: g.isCorrect,
-        isUpset: g.isUpset,
-        predictedTotal: g.runProjection?.total,
-        homeRunLineProb: g.runProjection?.homeRunLineProb,
-        actualTotal: (g.away.score ?? 0) + (g.home.score ?? 0),
-        actualMargin: (g.home.score ?? 0) - (g.away.score ?? 0),
-      });
-    }
-    cursor = page.continueCursor;
-  } while (cursor !== null);
+// Minimal structural view of a stored game doc used for calibration.
+interface CalibrationGame {
+  gamePk: number;
+  date: string;
+  away: { abbrev: string; name: string; score?: number };
+  home: { abbrev: string; name: string; score?: number };
+  winner?: string;
+  pickTeam: string;
+  pickProb: number;
+  isCorrect?: boolean;
+  isUpset?: boolean;
+  runProjection?: { total?: number; homeRunLineProb?: number };
+}
 
-  return rows.sort((a, b) =>
-    a.date < b.date ? 1 : a.date > b.date ? -1 : a.gamePk < b.gamePk ? 1 : -1,
-  );
+function toCalibrationRow(g: CalibrationGame): CalibrationRow {
+  return {
+    gamePk: g.gamePk,
+    date: g.date,
+    away: { abbrev: g.away.abbrev, name: g.away.name, score: g.away.score },
+    home: { abbrev: g.home.abbrev, name: g.home.name, score: g.home.score },
+    winner: g.winner,
+    pickTeam: g.pickTeam,
+    pickProb: g.pickProb,
+    isCorrect: g.isCorrect,
+    isUpset: g.isUpset,
+    predictedTotal: g.runProjection?.total,
+    homeRunLineProb: g.runProjection?.homeRunLineProb,
+    actualTotal: (g.away.score ?? 0) + (g.home.score ?? 0),
+    actualMargin: (g.home.score ?? 0) - (g.away.score ?? 0),
+  };
 }
 
 // Calibration metrics computed server-side over the full range so the client
@@ -83,9 +77,51 @@ async function loadCalibrationRows(
 export const getCalibrationResults = query({
   args: { startDate: v.string(), endDate: v.string() },
   handler: async (ctx, args) => {
-    const games = await loadCalibrationRows(ctx, args.startDate, args.endDate);
-    const total = games.length;
-    const correct = games.filter((g) => g.isCorrect).length;
+    // Accumulate scalar metrics in a single pass over the date range instead
+    // of materializing a full row for every game (keeps memory bounded).
+    const preds: number[] = [];
+    const labels: number[] = [];
+    let total = 0;
+    let correct = 0;
+    let tN = 0;
+    let tAbs = 0;
+    let tSq = 0;
+    let tBias = 0;
+    const rlPreds: number[] = [];
+    const rlLabels: number[] = [];
+
+    let cursor: string | null = null;
+    do {
+      const page = await ctx.db
+        .query("games")
+        .withIndex("by_date", (q) => q.gte("date", args.startDate).lte("date", args.endDate))
+        .paginate({ numItems: 1000, cursor });
+      for (const g of page.page) {
+        if (g.winner !== "home" && g.winner !== "away") continue;
+        total += 1;
+        if (g.isCorrect) correct += 1;
+        preds.push(g.pickProb);
+        labels.push(g.isCorrect ? 1 : 0);
+
+        const predictedTotal = g.runProjection?.total;
+        const actualTotal = (g.away.score ?? 0) + (g.home.score ?? 0);
+        if (typeof predictedTotal === "number") {
+          tN += 1;
+          const err = predictedTotal - actualTotal;
+          tAbs += Math.abs(err);
+          tSq += err * err;
+          tBias += err;
+        }
+
+        const homeRunLineProb = g.runProjection?.homeRunLineProb;
+        if (typeof homeRunLineProb === "number") {
+          const margin = (g.home.score ?? 0) - (g.away.score ?? 0);
+          rlPreds.push(homeRunLineProb);
+          rlLabels.push(margin >= 2 ? 1 : 0);
+        }
+      }
+      cursor = page.continueCursor;
+    } while (cursor !== null);
 
     // Moneyline (favorite framing) metrics.
     let metrics = {
@@ -98,8 +134,6 @@ export const getCalibrationResults = query({
       calibrationCurve: [] as CurvePoint[],
     };
     if (total > 0) {
-      const preds = games.map((g) => g.pickProb);
-      const labels = games.map((g) => (g.isCorrect ? 1 : 0));
       const evalResult = evaluate(preds, labels);
       const curve = calibrationCurvePoints(preds, labels, 8);
       metrics = {
@@ -113,42 +147,22 @@ export const getCalibrationResults = query({
       };
     }
 
-    // Totals (predicted vs actual combined runs) metrics.
-    let totalsMetrics = { n: 0, mae: 0, rmse: 0, bias: 0 };
-    {
-      const rows = games.filter((g) => typeof g.predictedTotal === "number");
-      totalsMetrics.n = rows.length;
-      if (rows.length > 0) {
-        let absSum = 0;
-        let sqSum = 0;
-        let biasSum = 0;
-        for (const g of rows) {
-          const err = (g.predictedTotal as number) - (g.actualTotal as number);
-          absSum += Math.abs(err);
-          sqSum += err * err;
-          biasSum += err;
-        }
-        totalsMetrics.mae = absSum / rows.length;
-        totalsMetrics.rmse = Math.sqrt(sqSum / rows.length);
-        totalsMetrics.bias = biasSum / rows.length;
-      }
-    }
+    const totalsMetrics = {
+      n: tN,
+      mae: tN > 0 ? tAbs / tN : 0,
+      rmse: tN > 0 ? Math.sqrt(tSq / tN) : 0,
+      bias: tN > 0 ? tBias / tN : 0,
+    };
 
-    // Run-line (±1.5) metrics: home covers when it wins by 2+.
-    let runLineMetrics = { n: 0, auc: 0, brier: 0, accuracy: 0 };
-    {
-      const rows = games.filter(
-        (g) => typeof g.homeRunLineProb === "number" && typeof g.actualMargin === "number",
-      );
-      runLineMetrics.n = rows.length;
-      if (rows.length > 0) {
-        const preds = rows.map((g) => g.homeRunLineProb as number);
-        const labels = rows.map((g) => ((g.actualMargin as number) >= 2 ? 1 : 0));
-        runLineMetrics.auc = computeAuc(preds, labels);
-        runLineMetrics.brier = computeBrier(preds, labels);
-        const hits = rows.filter((g, i) => (((g.homeRunLineProb as number) >= 0.5 ? 1 : 0) === labels[i])).length;
-        runLineMetrics.accuracy = hits / rows.length;
-      }
+    let runLineMetrics = { n: rlPreds.length, auc: 0, brier: 0, accuracy: 0 };
+    if (rlPreds.length > 0) {
+      runLineMetrics = {
+        n: rlPreds.length,
+        auc: computeAuc(rlPreds, rlLabels),
+        brier: computeBrier(rlPreds, rlLabels),
+        accuracy:
+          rlPreds.filter((p, i) => (p >= 0.5 ? 1 : 0) === rlLabels[i]).length / rlPreds.length,
+      };
     }
 
     return {
@@ -171,21 +185,20 @@ export const getCalibrationGames = query({
     limit: v.optional(v.number()),
   },
   handler: async (ctx, args) => {
-    const rows = await loadCalibrationRows(ctx, args.startDate, args.endDate);
+    // Paginate directly on the date index (newest first) so each call reads
+    // only a small page instead of the entire multi-season dataset.
     const limit = Math.max(1, Math.min(args.limit ?? 100, 300));
-    let start = 0;
-    if (args.cursor) {
-      const [cd, cpk] = args.cursor.split("|");
-      const pk = Number(cpk);
-      start = rows.findIndex((g) => g.date < cd || (g.date === cd && g.gamePk < pk));
-      if (start === -1) start = rows.length;
+    const page = await ctx.db
+      .query("games")
+      .withIndex("by_date", (q) => q.gte("date", args.startDate).lte("date", args.endDate))
+      .order("desc")
+      .paginate({ numItems: limit, cursor: args.cursor ?? null });
+    const games: CalibrationRow[] = [];
+    for (const g of page.page) {
+      if (g.winner !== "home" && g.winner !== "away") continue;
+      games.push(toCalibrationRow(g));
     }
-    const page = rows.slice(start, start + limit);
-    const cursor =
-      start + limit < rows.length
-        ? `${page[page.length - 1].date}|${page[page.length - 1].gamePk}`
-        : null;
-    return { games: page, cursor };
+    return { games, cursor: page.continueCursor };
   },
 });
 
