@@ -396,12 +396,18 @@ function buildRunProjection(
   runLineIso: { x: number; y: number }[],
   game: RawGame,
   marketTotal?: number,
+  marketRunLine?: number,
   trials = RUN_SIM_TRIALS,
 ): RunProjection {
-  const first = simulateRuns(runModel, game.home.id, game.away.id, 0, trials);
+  const runLine = marketRunLine ?? 1.5;
+  const first = simulateRuns(runModel, game.home.id, game.away.id, 0, trials, runLine);
   const line = marketTotal ?? first.total;
-  const sim = line === 0 ? first : simulateRuns(runModel, game.home.id, game.away.id, line, trials);
-  const homeRL = runLineIso.length > 0 ? applyIsotonic(runLineIso, sim.homeRunLineProb) : sim.homeRunLineProb;
+  const sim = line === 0 ? first : simulateRuns(runModel, game.home.id, game.away.id, line, trials, runLine);
+  // Isotonic calibration is fit on the ±1.5 run line; other lines use raw MC.
+  const homeRL =
+    runLineIso.length > 0 && runLine === 1.5
+      ? applyIsotonic(runLineIso, sim.homeRunLineProb)
+      : sim.homeRunLineProb;
   const home = Math.min(0.999, Math.max(0.001, homeRL));
   return {
     homeScore: Math.round(sim.homeScore * 100) / 100,
@@ -644,7 +650,7 @@ export const refreshModel = action({
         applyModel(model, row.features, row.homeElo, row.awayElo),
         pitcherStats,
         undefined,
-        buildRunProjection(runModelState, runLineIso, row.game, undefined, RUN_CALIB_TRIALS),
+        buildRunProjection(runModelState, runLineIso, row.game, undefined, undefined, RUN_CALIB_TRIALS),
       ),
     );
 
@@ -670,7 +676,7 @@ export const refreshModel = action({
           predictionFor(g, model, teamState),
           pitcherStats,
           { home: teamState.injuries[g.home.id] ?? 0, away: teamState.injuries[g.away.id] ?? 0 },
-          buildRunProjection(runModelState, runLineIso, g, odds?.total, RUN_SIM_TRIALS),
+          buildRunProjection(runModelState, runLineIso, g, odds?.total, odds?.runLine, RUN_SIM_TRIALS),
           odds,
         );
       });
@@ -784,7 +790,7 @@ export const predictDate = action({
         predictionFor(g, model, teamState),
         pitcherStats,
         { home: teamState.injuries[g.home.id] ?? 0, away: teamState.injuries[g.away.id] ?? 0 },
-        runModelState ? buildRunProjection(runModelState, runLineIso, g, odds?.total, RUN_SIM_TRIALS) : undefined,
+        runModelState ? buildRunProjection(runModelState, runLineIso, g, odds?.total, odds?.runLine, RUN_SIM_TRIALS) : undefined,
         odds,
       );
     });

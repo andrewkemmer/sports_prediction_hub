@@ -24,8 +24,8 @@ export interface RunSimulation {
   total: number; // mean combined runs
   overProb: number; // P(total > line)
   underProb: number; // P(total < line)
-  homeRunLineProb: number; // P(home wins by 2+ → covers -1.5)
-  awayRunLineProb: number; // P(away loses by ≤1 or wins → covers +1.5)
+  homeRunLineProb: number; // P(home wins by ≥ ceil(runLine) → covers −runLine)
+  awayRunLineProb: number; // P(away covers +runLine)
 }
 
 function clamp(x: number, lo: number, hi: number): number {
@@ -104,7 +104,8 @@ export function fitRunModel(games: RawGame[]): RunModel {
 
 /**
  * Monte Carlo run simulation for a matchup. `line` is the total over/under
- * reference (market total when available, otherwise the model mean total).
+ * reference (market total when available, otherwise the model mean total) and
+ * `runLine` is the spread magnitude (1.5 = standard run line, 2.5 = alternate).
  */
 export function simulateRuns(
   model: RunModel,
@@ -112,6 +113,7 @@ export function simulateRuns(
   awayId: number,
   line: number,
   trials = 10000,
+  runLine = 1.5,
 ): RunSimulation {
   const offense = model.teamOffense;
   const defense = model.teamDefense;
@@ -119,6 +121,7 @@ export function simulateRuns(
   const parkMul = park[homeId] ?? 1;
   const lambdaHome = model.leagueRuns * (offense[homeId] ?? 1) * (defense[awayId] ?? 1) * parkMul;
   const lambdaAway = model.leagueRuns * (offense[awayId] ?? 1) * (defense[homeId] ?? 1) * parkMul;
+  const coverThreshold = Math.ceil(runLine); // 1.5 → 2, 2.5 → 3
 
   const rand = makeRand((homeId * 1000003 + awayId * 7919) >>> 0);
   let homeSum = 0;
@@ -136,8 +139,8 @@ export function simulateRuns(
     if (total > line) over += 1;
     else if (total < line) under += 1;
     const margin = hs - as;
-    if (margin >= 2) homeCover += 1;
-    if (margin <= 1) awayCover += 1;
+    if (margin >= coverThreshold) homeCover += 1;
+    else awayCover += 1;
   }
 
   return {

@@ -355,16 +355,32 @@ export function GameCard({ game }: { game: GameDoc }) {
                 {game.runProjection.awayScore.toFixed(1)}
               </span>
             </div>
-            <div className="mt-1 flex items-center justify-between text-[11px]">
+            <div className="mt-1.5 flex items-center justify-between gap-2 text-[11px]">
               <span className="text-muted-foreground">
-                Total {game.marketOdds?.total !== undefined ? game.marketOdds.total : game.runProjection.total.toFixed(1)}
+                Total{" "}
+                {game.marketOdds?.total !== undefined ? game.marketOdds.total : game.runProjection.total.toFixed(1)}
+                {game.marketOdds?.overPrice !== undefined && (
+                  <span className="text-muted-foreground/80">
+                    {" "}
+                    (O {formatAmerican(game.marketOdds.overPrice)} / U {formatAmerican(game.marketOdds.underPrice ?? 0)})
+                  </span>
+                )}
               </span>
               <span className="tabular-nums text-foreground">
                 O {formatPct(game.runProjection.overProb, 0)} · U {formatPct(game.runProjection.underProb, 0)}
               </span>
             </div>
-            <div className="mt-1 flex items-center justify-between text-[11px]">
-              <span className="text-muted-foreground">Run line ±1.5</span>
+            <div className="mt-1.5 flex items-center justify-between gap-2 text-[11px]">
+              <span className="text-muted-foreground">
+                Run line {game.marketOdds?.runLine !== undefined ? `±${game.marketOdds.runLine}` : "±1.5"}
+                {game.marketOdds?.homeRunLinePrice !== undefined && (
+                  <span className="text-muted-foreground/80">
+                    {" "}
+                    ({game.home.abbrev} {formatAmerican(game.marketOdds.homeRunLinePrice)} / {game.away.abbrev}{" "}
+                    {formatAmerican(game.marketOdds.awayRunLinePrice ?? 0)})
+                  </span>
+                )}
+              </span>
               <span className="tabular-nums text-foreground">
                 {game.home.abbrev} {formatPct(game.runProjection.homeRunLineProb, 0)} · {game.away.abbrev}{" "}
                 {formatPct(game.runProjection.awayRunLineProb, 0)}
