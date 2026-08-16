@@ -113,6 +113,19 @@ const schema = defineSchema(
       actualMargin: v.optional(v.number()),
     }).index("by_date", ["date"]),
 
+    // Resume state for the one-time calibration-history backfill. The backfill
+    // runs as a self-scheduling chain of small steps (one page per step); this
+    // doc persists the last pagination cursor so a killed step resumes from
+    // where it stopped instead of re-scanning the whole table.
+    calibrationBackfill: defineTable({
+      key: v.string(),
+      cursor: v.union(v.string(), v.null()),
+      scanned: v.number(),
+      done: v.boolean(),
+      updatedAt: v.number(),
+      error: v.optional(v.string()),
+    }).index("by_key", ["key"]),
+
     // Live progress for the long-running model refresh action. The client
     // subscribes to this so the refresh button can show a real progress bar.
     refreshProgress: defineTable({

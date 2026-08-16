@@ -313,6 +313,43 @@ export const replaceModelState = internalMutation({
   },
 });
 
+// Resume state for the one-time calibration backfill (see backfill.ts). The
+// backfill chain persists its pagination cursor here between steps so a
+// killed step resumes from where it stopped.
+export const getCalibrationBackfill = internalQuery({
+  args: {},
+  handler: async (ctx) =>
+    ctx.db
+      .query("calibrationBackfill")
+      .withIndex("by_key", (q) => q.eq("key", "current"))
+      .first(),
+});
+
+export const saveCalibrationBackfill = internalMutation({
+  args: {
+    cursor: v.union(v.string(), v.null()),
+    scanned: v.number(),
+    done: v.boolean(),
+    error: v.optional(v.string()),
+  },
+  handler: async (ctx, args) => {
+    const existing = await ctx.db
+      .query("calibrationBackfill")
+      .withIndex("by_key", (q) => q.eq("key", "current"))
+      .first();
+    const doc = {
+      key: "current",
+      cursor: args.cursor,
+      scanned: args.scanned,
+      done: args.done,
+      updatedAt: Date.now(),
+      error: args.error,
+    };
+    if (existing) await ctx.db.patch(existing._id, doc);
+    else await ctx.db.insert("calibrationBackfill", doc);
+  },
+});
+
 // Patch only the calibration summary onto the model state. Used by the
 // dedicated backfill action so it doesn't have to rewrite the whole (large)
 // model-state doc just to add the summary.

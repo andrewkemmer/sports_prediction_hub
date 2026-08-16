@@ -1422,10 +1422,16 @@ export const refreshModel = action({
         // timeout — the reason refreshes kept dying with the bar frozen at
         // "Backfilling calibration 94%". The scheduled action gets its own
         // execution budget and reports its own progress.
-        const needsBackfill =
-          !previousState.calibrationSummary ||
-          (previousState.calibrationSummary?.total ?? 0) === 0;
-        if (needsBackfill) {
+        // Schedule (or resume) the one-time calibration backfill unless its
+        // chain has completed OR is already actively running (a fresh,
+        // not-done state means the self-scheduling chain is alive and will
+        // finish on its own — scheduling again would start a second chain).
+        const backfillState: any = await ctx.runQuery(internal.mlb.getCalibrationBackfill, {});
+        const backfillChainAlive =
+          backfillState &&
+          !backfillState.done &&
+          Date.now() - backfillState.updatedAt < 3 * 60_000;
+        if (!backfillState?.done && !backfillChainAlive) {
           await ctx.scheduler.runAfter(0, internal.backfill.backfillCalibration, {});
         }
         return {

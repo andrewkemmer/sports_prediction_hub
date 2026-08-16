@@ -2,114 +2,14 @@
 
 import { internalAction } from "./_generated/server";
 import { internal } from "./_generated/api";
-import { calibrationCurvePoints, computeAuc, computeBrier, evaluate } from "./ml/model";
 
-// ---------------------------------------------------------------------------
-// Compact calibration row + summary computation (mirrors mlbActions.ts)
-// ---------------------------------------------------------------------------
+// Pages are kept small: the projection query reads full game docs (Convex
+// can't project fields), and big pages were slow enough to push the old
+// single-shot backfill past Convex's 10-minute Node action limit. 200 docs
+// per page keeps every step light and fast.
+const BACKFILL_PAGE = 200;
 
-interface CalibrationRow {
-  gamePk: number;
-  date: string;
-  away: { abbrev: string; name: string; score?: number };
-  home: { abbrev: string; name: string; score?: number };
-  winner?: "home" | "away";
-  pickTeam: "home" | "away";
-  pickProb: number;
-  homeWinProb: number;
-  isCorrect?: boolean;
-  isUpset?: boolean;
-  predictedTotal?: number;
-  homeRunLineProb?: number;
-  actualTotal: number;
-  actualMargin: number;
-}
-
-interface CalibrationSummary {
-  metrics: {
-    auc: number;
-    brier: number;
-    logLoss: number;
-    ece: number;
-    bins: unknown[];
-    confidenceDistribution: unknown[];
-    calibrationCurve: unknown[];
-  };
-  totalsMetrics: { n: number; mae: number; rmse: number; bias: number };
-  runLineMetrics: { n: number; auc: number; brier: number; accuracy: number };
-  total: number;
-  correct: number;
-  accuracy: number;
-}
-
-function buildCalibrationSummary(rows: CalibrationRow[]): CalibrationSummary {
-  const preds = rows.map((d) => d.pickProb);
-  const labels = rows.map((d) => (d.isCorrect ? 1 : 0));
-  const evalResult = evaluate(preds, labels);
-  const curve = calibrationCurvePoints(preds, labels, 8);
-  const metrics = {
-    auc: evalResult.auc,
-    brier: evalResult.brier,
-    logLoss: evalResult.logLoss,
-    ece: evalResult.ece,
-    bins: evalResult.bins,
-    confidenceDistribution: evalResult.confidenceDistribution,
-    calibrationCurve: curve.length > 0 ? curve : evalResult.calibrationCurve,
-  };
-
-  let tN = 0;
-  let tAbs = 0;
-  let tSq = 0;
-  let tBias = 0;
-  const rlPreds: number[] = [];
-  const rlLabels: number[] = [];
-  for (const d of rows) {
-    if (typeof d.predictedTotal === "number") {
-      tN += 1;
-      const err = d.predictedTotal - d.actualTotal;
-      tAbs += Math.abs(err);
-      tSq += err * err;
-      tBias += err;
-    }
-    if (typeof d.homeRunLineProb === "number") {
-      rlPreds.push(d.homeRunLineProb);
-      rlLabels.push(d.actualMargin >= 2 ? 1 : 0);
-    }
-  }
-
-  const totalsMetrics = {
-    n: tN,
-    mae: tN > 0 ? tAbs / tN : 0,
-    rmse: tN > 0 ? Math.sqrt(tSq / tN) : 0,
-    bias: tN > 0 ? tBias / tN : 0,
-  };
-  let runLineMetrics = { n: rlPreds.length, auc: 0, brier: 0, accuracy: 0 };
-  if (rlPreds.length > 0) {
-    runLineMetrics = {
-      n: rlPreds.length,
-      auc: computeAuc(rlPreds, rlLabels),
-      brier: computeBrier(rlPreds, rlLabels),
-      accuracy:
-        rlPreds.filter((p, i) => (p >= 0.5 ? 1 : 0) === rlLabels[i]).length / rlPreds.length,
-    };
-  }
-
-  const total = rows.length;
-  const correct = rows.filter((d) => d.isCorrect).length;
-  return {
-    metrics,
-    totalsMetrics,
-    runLineMetrics,
-    total,
-    correct,
-    accuracy: total > 0 ? correct / total : 0,
-  };
-}
-
-// ---------------------------------------------------------------------------
-// Progress reporting (best-effort — must never kill the action)
-// ---------------------------------------------------------------------------
-
+/** Best-effort progress writer — must never kill the action. */
 async function report(
   ctx: any,
   stage: string,
@@ -129,112 +29,121 @@ async function report(
   }
 }
 
-// ---------------------------------------------------------------------------
-// Backfill action
-// ---------------------------------------------------------------------------
+function etDateString(d: Date): string {
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/New_York",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(d);
+}
 
 /**
- * Builds the compact calibration projection for the FULL stored history and
- * saves the precomputed summary. This used to run inline inside refreshModel,
- * but scanning the whole games table on top of the refresh's API work pushed
- * the action past Convex's 10-minute Node action limit (refreshes died with
- * the bar frozen at "Backfilling calibration 94%"). As a scheduled action it
- * gets its own execution budget, and it only ever runs until the summary
- * exists — after that refreshes skip it entirely.
+ * Builds the compact calibration projection for the FULL stored history.
+ *
+ * It runs as a self-scheduling chain of small steps: each invocation reads
+ * one 200-game page, writes those dates' calibration rows immediately, saves
+ * its pagination cursor, then schedules the next step. The original single
+ * action scanned the whole table in one shot and repeatedly died at Convex's
+ * 10-minute action limit (the bar froze at "Backfilling calibration 94%" with
+ * `done` never written). With per-page work plus a persisted resume cursor,
+ * any killed step is simply resumed by the next refresh — the chain always
+ * converges, and the table is filled idempotently (dates are delete+rewrite,
+ * so partial progress is safe).
+ *
+ * The full-range calibration metrics are computed on read from the compact
+ * `calibration` table, so this action never needs to precompute a summary.
+ *
+ * No in-chain dedupe: each step writes the state doc, so a freshness-based
+ * guard would make every step see its own previous step's write and skip
+ * itself (that bug killed the chain after one step). Duplicate-chain
+ * protection lives in refreshModel, which only schedules a new step when no
+ * chain is currently active.
  */
 export const backfillCalibration = internalAction({
   args: {},
   handler: async (ctx) => {
     try {
-      const previous: any = await ctx.runQuery(internal.mlb.getLatestModelState, {});
-      if (previous?.calibrationSummary && (previous.calibrationSummary?.total ?? 0) > 0) {
-        return { backfilled: 0, skipped: true };
-      }
-      const today = new Intl.DateTimeFormat("en-CA", {
-        timeZone: "America/New_York",
-        year: "numeric",
-        month: "2-digit",
-        day: "2-digit",
-      }).format(new Date());
-      await report(ctx, "Backfilling calibration", 94, "Building calibration history from stored games…");
+      const state: any = await ctx.runQuery(internal.mlb.getCalibrationBackfill, {});
+      if (state?.done) return { skipped: true };
 
-      // Compact paginated read of the games table — only the calibration
-      // fields are returned (~1/20th the size of a full game doc).
-      const backfillByDate = new Map<string, CalibrationRow[]>();
-      let cursor: string | null = null;
-      let scanned = 0;
-      do {
-        const page: any = await ctx.runQuery(
-          internal.mlb.getCalibrationProjection,
-          { startDate: "2022-03-15", endDate: today, cursor, limit: 500 },
-        );
-        for (const r of page.games) {
-          if (r.winner !== "home" && r.winner !== "away") continue;
-          if (typeof r.pickProb !== "number") continue;
-          const list = backfillByDate.get(r.date) ?? [];
-          list.push(r);
-          backfillByDate.set(r.date, list);
-        }
-        cursor = page.cursor;
-        scanned += page.games.length;
-        await report(
-          ctx,
-          "Backfilling calibration",
-          94,
-          `Building calibration history — ${scanned.toLocaleString()} games scanned…`,
-        );
-      } while (cursor);
+      const today = etDateString(new Date());
+      const cursor = state?.cursor ?? null;
+      const scannedBase = state?.scanned ?? 0;
 
-      // Batch ~40 dates per mutation (~18 mutations for ~700 dates).
-      const calibrationDates = [...backfillByDate.keys()];
-      const dateGroups: { date: string; rows: CalibrationRow[] }[][] = [];
-      for (let i = 0; i < calibrationDates.length; i += 40) {
-        const group: { date: string; rows: CalibrationRow[] }[] = [];
-        for (const date of calibrationDates.slice(i, i + 40)) {
-          group.push({ date, rows: backfillByDate.get(date)! });
-        }
-        dateGroups.push(group);
+      // 1. One page of the games table (compact projection).
+      const page: any = await ctx.runQuery(internal.mlb.getCalibrationProjection, {
+        startDate: "2022-03-15",
+        endDate: today,
+        cursor,
+        limit: BACKFILL_PAGE,
+      });
+
+      // 2. Write this page's rows immediately (idempotent per date).
+      const byDate = new Map<string, any[]>();
+      for (const r of page.games) {
+        if (r.winner !== "home" && r.winner !== "away") continue;
+        if (typeof r.pickProb !== "number") continue;
+        const list = byDate.get(r.date) ?? [];
+        list.push(r);
+        byDate.set(r.date, list);
       }
+      const dates = [...byDate.keys()];
+      const groups: { date: string; rows: any[] }[][] = [];
+      for (let i = 0; i < dates.length; i += 40) {
+        groups.push(dates.slice(i, i + 40).map((date) => ({ date, rows: byDate.get(date)! })));
+      }
+      for (const group of groups) {
+        await ctx.runMutation(internal.mlb.bulkReplaceCalibration, { groups: group });
+      }
+
+      const scanned = scannedBase + page.games.length;
+
+      // 3. Persist the cursor so the next step resumes here.
+      await ctx.runMutation(internal.mlb.saveCalibrationBackfill, {
+        cursor: page.cursor,
+        scanned,
+        done: false,
+        error: undefined,
+      });
+
+      // 4. Progress — the count advances every step so the banner stays live.
       await report(
         ctx,
         "Backfilling calibration",
-        95,
-        `Writing calibration rows for ${calibrationDates.length.toLocaleString()} dates…`,
+        94,
+        `Building calibration history — ${scanned.toLocaleString()} games scanned…`,
       );
-      let written = 0;
-      const workers = Array.from({ length: Math.min(6, dateGroups.length) }, async () => {
-        while (dateGroups.length > 0) {
-          const group = dateGroups.shift()!;
-          await ctx.runMutation(internal.mlb.bulkReplaceCalibration, { groups: group });
-          written += group.length;
-          await report(
-            ctx,
-            "Backfilling calibration",
-            calibrationDates.length > 0
-              ? 95 + Math.floor((written / calibrationDates.length) * 4)
-              : 95,
-            `Writing calibration rows — ${written.toLocaleString()}/${calibrationDates.length.toLocaleString()} dates…`,
-          );
-        }
-      });
-      await Promise.all(workers);
 
-      const rows = [...backfillByDate.values()].flat();
-      const summary = rows.length > 0 ? buildCalibrationSummary(rows) : undefined;
-      if (summary) {
-        await ctx.runMutation(internal.mlb.setCalibrationSummary, { summary });
+      // 5. More pages → schedule the next step and return; else finish.
+      //    Terminate on cursor null OR an EMPTY page: Convex pagination
+      //    returns an empty page with a non-null cursor at the end of a range
+      //    query, so checking only `cursor` loops forever (that is what kept
+      //    the original backfill spinning on "11,586 games scanned…").
+      const finished = !page.cursor || page.games.length === 0;
+      if (!finished) {
+        await ctx.scheduler.runAfter(0, internal.backfill.backfillCalibration, {});
+        return { continued: true, scanned };
       }
+      await ctx.runMutation(internal.mlb.saveCalibrationBackfill, {
+        cursor: null,
+        scanned,
+        done: true,
+        error: undefined,
+      });
       await report(
         ctx,
         "Complete",
         100,
-        `Calibration history ready — ${rows.length.toLocaleString()} games`,
+        `Calibration history ready — ${scanned.toLocaleString()} games scanned`,
         { done: true },
       );
-      return { backfilled: rows.length };
+      return { backfilled: scanned };
     } catch (e) {
       const message = e instanceof Error ? e.message : "Unknown error";
       await report(ctx, "Backfill failed", 100, message, { done: true, error: message }).catch(() => {});
+      // The resume cursor was already persisted before the failing step, so a
+      // later refresh resumes from where the chain stopped.
       throw e;
     }
   },
