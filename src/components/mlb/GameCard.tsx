@@ -7,7 +7,7 @@ import {
   DialogTrigger,
 } from "@/components/ui/dialog";
 import { teamMeta } from "@/convex/ml/teams";
-import type { GameDoc, ShapContribution, TeamInfo } from "@/convex/ml/types";
+import type { GameDoc, LineupData, ShapContribution, TeamInfo } from "@/convex/ml/types";
 import {
   formatAmerican,
   formatPct,
@@ -29,6 +29,69 @@ import {
   Zap,
 } from "lucide-react";
 import { useState } from "react";
+
+function lineupOpsText(lu: LineupData | undefined, side: "home" | "away"): string | null {
+  const s = lu?.[side];
+  const ops = s?.battingOrder.filter((p) => typeof p.ops === "number");
+  if (!ops || ops.length === 0) return null;
+  const weighted = ops.reduce((acc, p, i) => acc + (p.ops ?? 0) * (i < 4 ? 2 : 1), 0);
+  const w = ops.reduce((acc, _, i) => acc + (i < 4 ? 2 : 1), 0);
+  return (weighted / w).toFixed(3);
+}
+
+function LineupPanel({ game }: { game: GameDoc }) {
+  const lu = game.lineups;
+  if (!lu) return null;
+  const hasData = (lu.home?.battingOrder.length ?? 0) > 0 || (lu.away?.battingOrder.length ?? 0) > 0;
+  if (!hasData) return null;
+  return (
+    <div className="border-t border-border/70 px-4 py-3">
+      <div className="mb-2 flex items-center gap-1.5 text-xs font-medium text-muted-foreground">
+        <Trophy className="size-3.5" />
+        Starting lineups
+        {game.lineupStats && (
+          <span className="ml-auto text-[10px] tabular-nums text-muted-foreground/70">
+            {game.away.abbrev} OPS {lineupOpsText(lu, "away") ?? "—"} · {game.home.abbrev} OPS{" "}
+            {lineupOpsText(lu, "home") ?? "—"}
+          </span>
+        )}
+      </div>
+      <div className="grid grid-cols-2 gap-2">
+        {(["home", "away"] as const).map((side) => {
+          const data = lu[side];
+          const label = side === "home" ? game.home.abbrev : game.away.abbrev;
+          const color = teamColor(side === "home" ? game.home.id : game.away.id);
+          return (
+            <div key={side} className="rounded-lg border border-border/60 bg-white/[0.02] p-2.5">
+              <div className="mb-1.5 flex items-center gap-1.5 text-[10px] font-semibold uppercase tracking-wider" style={{ color }}>
+                {label} {side === "home" ? "(Home)" : "(Away)"}
+              </div>
+              {data?.battingOrder.length ? (
+                <ol className="space-y-0.5">
+                  {data.battingOrder.map((p, i) => (
+                    <li key={p.id} className="flex items-center gap-1.5 text-[11px]">
+                      <span className="w-3 shrink-0 text-right tabular-nums text-muted-foreground/60">{i + 1}</span>
+                      <span className="truncate text-foreground/90">{p.name}</span>
+                      {p.pos && <span className="ml-auto shrink-0 text-[9px] uppercase text-muted-foreground/50">{p.pos}</span>}
+                    </li>
+                  ))}
+                </ol>
+              ) : (
+                <div className="text-[10px] text-muted-foreground/60">Lineup not posted yet</div>
+              )}
+              {data && data.bench.length > 0 && (
+                <div className="mt-2 border-t border-border/50 pt-1.5 text-[10px] text-muted-foreground/60">
+                  Bench: {data.bench.slice(0, 5).map((p) => p.name).join(", ")}
+                  {data.bench.length > 5 ? ` +${data.bench.length - 5} more` : ""}
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
 
 function Pill({ className, children }: { className?: string; children: React.ReactNode }) {
   return (
@@ -426,6 +489,9 @@ export function GameCard({ game }: { game: GameDoc }) {
           Edge: {formatSigned(game.edge ?? 0, 2)}
         </span>
       </div>
+
+      {/* Actual starting lineups */}
+      <LineupPanel game={game} />
 
       {/* SHAP features */}
       {game.shap && game.shap.length > 0 && (

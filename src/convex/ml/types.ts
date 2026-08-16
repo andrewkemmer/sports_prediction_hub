@@ -28,6 +28,26 @@ export interface ShapContribution {
   contribution: number;
 }
 
+/** One player in a lineup: batting order slot, position, name. */
+export interface LineupPlayer {
+  id: number;
+  name: string;
+  pos?: string;
+  ops?: number; // season OPS (populated when the player's hitting stats were fetched)
+}
+
+/** Actual starting 9 + available bench for a game (from the boxscore). */
+export interface LineupData {
+  home?: { battingOrder: LineupPlayer[]; bench: LineupPlayer[] };
+  away?: { battingOrder: LineupPlayer[]; bench: LineupPlayer[] };
+}
+
+/** Aggregated lineup-strength inputs used as model features. */
+export interface LineupStats {
+  home: { known: boolean; ops: number }; // weighted mean OPS of the starting 9
+  away: { known: boolean; ops: number };
+}
+
 /** A parsed schedule game straight from the MLB Stats API. */
 export interface RawGame {
   gamePk: number;
@@ -45,6 +65,8 @@ export interface RawGame {
   winner?: "home" | "away";
   season?: string; // season year (e.g. "2024")
   weather?: GameWeather;
+  lineups?: LineupData; // actual starting 9 + bench when available
+  lineupStats?: LineupStats; // computed lineup-strength features
 }
 
 /** Game-time weather conditions (MLB Stats API `hydrate=weather`). */
@@ -94,6 +116,8 @@ export interface FeatureValues {
   parkFactor: number; // home ballpark run factor (>1 hitter-friendly)
   tempDev: number; // game temperature deviation from 72°F
   windMph: number; // game wind speed
+  lineupKnown: number; // 1 when actual lineup data is available for this game
+  lineupOpsDiff: number; // home starting-9 weighted OPS - away (positive favors home)
 }
 
 export const FEATURE_KEYS = [
@@ -111,6 +135,8 @@ export const FEATURE_KEYS = [
   "parkFactor",
   "tempDev",
   "windMph",
+  "lineupKnown",
+  "lineupOpsDiff",
 ] as const;
 
 export type FeatureKey = (typeof FEATURE_KEYS)[number];
@@ -130,6 +156,8 @@ export const FEATURE_LABELS: Record<FeatureKey, string> = {
   parkFactor: "Ballpark factor",
   tempDev: "Weather temperature",
   windMph: "Weather wind",
+  lineupKnown: "Lineup data available",
+  lineupOpsDiff: "Starting-9 OPS edge",
 };
 
 /** A training row: features computed strictly as-of the game time. */
@@ -291,6 +319,8 @@ export interface GameDoc {
   awayInjuries?: number;
   season?: string;
   weather?: GameWeather;
+  lineups?: LineupData;
+  lineupStats?: LineupStats;
   runProjection?: RunProjection;
   marketOdds?: MarketOdds;
 }

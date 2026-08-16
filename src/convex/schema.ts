@@ -88,6 +88,8 @@ const schema = defineSchema(
       awayInjuries: v.optional(v.number()),
       season: v.optional(v.string()),
       weather: v.optional(v.any()),
+      lineups: v.optional(v.any()), // actual starting 9 + bench (boxscore)
+      lineupStats: v.optional(v.any()), // aggregated lineup-strength features
       runProjection: v.optional(v.any()),
       marketOdds: v.optional(v.any()),
     }).index("by_date", ["date"]),
@@ -165,6 +167,7 @@ const schema = defineSchema(
       runMarginCalibration: v.optional(v.any()),
       teamSeasonStats: v.optional(v.any()),
       injurySnapshots: v.optional(v.any()),
+      playerOps: v.optional(v.any()), // cached per-player season OPS (`id|season` → OPS)
       calibrationSummary: v.optional(v.any()),
       todaysRecord: v.any(),
     }).index("by_key", ["key"]),

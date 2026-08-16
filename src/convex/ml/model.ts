@@ -242,6 +242,19 @@ function buildFeatures(game: RawGame, state: MutableState): FeatureValues {
   const tempF = game.weather?.tempF;
   const wind = game.weather?.windMph;
 
+  // Actual starting-9 / bench data. When lineups are missing (older historical
+  // games) the feature defaults to 0 with lineupKnown = 0, so the model learns
+  // to treat "unknown lineup" distinctly from "known, strong/weak lineup".
+  const lineupHome = game.lineupStats?.home;
+  const lineupAway = game.lineupStats?.away;
+  const homeLineupKnown = lineupHome?.known === true ? 1 : 0;
+  const awayLineupKnown = lineupAway?.known === true ? 1 : 0;
+  const lineupKnown = homeLineupKnown === 1 && awayLineupKnown === 1 ? 1 : 0;
+  const lineupOpsDiff =
+    typeof lineupHome?.ops === "number" && typeof lineupAway?.ops === "number"
+      ? lineupHome.ops - lineupAway.ops
+      : 0;
+
   return {
     eloDiff: (homeElo - awayElo) / 100,
     winPctDiff: homeWp - awayWp,
@@ -257,6 +270,8 @@ function buildFeatures(game: RawGame, state: MutableState): FeatureValues {
     parkFactor: PARK_FACTORS[game.home.id] ?? 1,
     tempDev: typeof tempF === "number" ? tempF - 72 : 0,
     windMph: typeof wind === "number" ? wind : 0,
+    lineupKnown,
+    lineupOpsDiff,
   };
 }
 

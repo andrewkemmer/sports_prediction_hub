@@ -23,6 +23,8 @@ import {
   GameDoc,
   GameWeather,
   InjurySnapshot,
+  LineupData,
+  LineupPlayer,
   MarketOdds,
   PitcherInfo,
   PowerRanking,
@@ -601,6 +603,157 @@ async function fetchInjurySnapshots(
 }
 
 // ---------------------------------------------------------------------------
+// Lineups (actual starting 9 + bench, from the per-game boxscore)
+// ---------------------------------------------------------------------------
+
+/**
+ * Fetch a game's actual lineup from the lightweight boxscore endpoint.
+ * Returns undefined when the boxscore has no lineup data yet (lineups are
+ * posted ~2-3 hours before first pitch, and the endpoint 404s until then).
+ */
+async function fetchGameLineup(gamePk: number): Promise<LineupData | undefined> {
+  try {
+    // No retry loop here: a 404/empty boxscore is the *expected* state for
+    // games whose lineups are not posted yet, and retrying would add seconds
+    // per scheduled game.
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 15000);
+    const res = await fetch(`${MLB_BASE}/api/v1/game/${gamePk}/boxscore`, {
+      signal: controller.signal,
+      headers: { "User-Agent": "FreebuffMLB/1.0" },
+    });
+    clearTimeout(timer);
+    if (!res.ok) return undefined;
+    const data = await res.json();
+    const teams = data?.teams;
+    if (!teams?.home || !teams?.away) return undefined;
+    const parseSide = (side: any) => {
+      const battingOrder: LineupPlayer[] = [];
+      const bench: LineupPlayer[] = [];
+      const orderIdToSlot = new Map<number, number>();
+      const orderIds = new Set<number>((side.battingOrder ?? []) as number[]);
+      const players = (side.players ?? {}) as Record<string, any>;
+      for (const key of Object.keys(players)) {
+        const p = players[key];
+        const id = p?.person?.id;
+        if (typeof id !== "number") continue;
+        const pos = p?.position?.abbreviation;
+        if (orderIds.has(id)) {
+          const slot = typeof p?.battingOrder === "string" ? parseInt(p.battingOrder, 10) : 0;
+          if (slot > 0) orderIdToSlot.set(id, slot);
+          battingOrder.push({ id, name: p.person.fullName ?? "", pos });
+        } else if (pos !== "P") {
+          bench.push({ id, name: p.person.fullName ?? "", pos });
+        }
+      }
+      battingOrder.sort((a, b) => (orderIdToSlot.get(a.id) ?? 99) - (orderIdToSlot.get(b.id) ?? 99));
+      return { battingOrder, bench };
+    };
+    return { home: parseSide(teams.home), away: parseSide(teams.away) };
+  } catch {
+    return undefined; // lineups not posted yet / no boxscore for scheduled games
+  }
+}
+
+/** Fetch lineups for many games with a bounded concurrency. */
+async function fetchLineupsForGames(
+  games: RawGame[],
+  concurrency = 16,
+  onProgress?: (done: number, total: number) => void,
+): Promise<Map<number, LineupData>> {
+  const out = new Map<number, LineupData>();
+  const seen = new Set<number>();
+  const targets = games.filter((g) => {
+    if (seen.has(g.gamePk)) return false;
+    seen.add(g.gamePk);
+    return true;
+  });
+  let done = 0;
+  await mapLimit(targets, concurrency, async (g) => {
+    const lu = await fetchGameLineup(g.gamePk);
+    if (lu && (lu.home?.battingOrder.length ?? 0) > 0 && (lu.away?.battingOrder.length ?? 0) > 0) {
+      out.set(g.gamePk, lu);
+    }
+    done += 1;
+    if (onProgress && done % 10 === 0) onProgress(done, targets.length);
+  });
+  if (onProgress) onProgress(targets.length, targets.length);
+  return out;
+}
+
+/** Season hitting OPS for a set of players, reusing the cached map. */
+async function fetchPlayerSeasonOps(
+  ids: number[],
+  season: string,
+  cached: Record<string, number> = {},
+): Promise<Map<number, number>> {
+  const out = new Map<number, number>();
+  const unique = [...new Set(ids)].filter((id) => id > 0 && typeof cached[`${id}|${season}`] !== "number");
+  await mapLimit(unique, 24, async (id) => {
+    try {
+      const data = await fetchJson(
+        `${MLB_BASE}/api/v1/people/${id}/stats?stats=season&group=hitting&season=${season}`,
+      );
+      const stat = data?.stats?.[0]?.splits?.[0]?.stat;
+      const ops = statNumber(stat?.ops);
+      if (ops !== undefined) out.set(id, ops);
+    } catch {
+      // individual player stat failures are non-fatal
+    }
+  });
+  return out;
+}
+
+/** Weighted mean OPS of a lineup — slots 1-4 (most PAs) count double. */
+function lineupOps(lineup: LineupPlayer[] | undefined): number {
+  if (!lineup || lineup.length === 0) return 0;
+  let sum = 0;
+  let w = 0;
+  for (let i = 0; i < lineup.length; i++) {
+    const ops = lineup[i].ops;
+    if (typeof ops !== "number") continue;
+    const weight = i < 4 ? 2 : 1;
+    sum += ops * weight;
+    w += weight;
+  }
+  return w > 0 ? sum / w : 0;
+}
+
+/**
+ * Attach lineup data + computed lineup-strength features to games that have a
+ * fetched boxscore lineup. `playerOps` is a game-season map of player OPS.
+ */
+function attachLineups(
+  games: RawGame[],
+  lineups: Map<number, LineupData>,
+  playerOps: Map<number, number>,
+): RawGame[] {
+  return games.map((g) => {
+    const lu = lineups.get(g.gamePk);
+    if (!lu) return g;
+    const withOps = (side?: { battingOrder: LineupPlayer[]; bench: LineupPlayer[] }) => {
+      if (!side) return side;
+      return {
+        battingOrder: side.battingOrder.map((p) => ({ ...p, ops: playerOps.get(p.id) })),
+        bench: side.bench.map((p) => ({ ...p, ops: playerOps.get(p.id) })),
+      };
+    };
+    const home = withOps(lu.home);
+    const away = withOps(lu.away);
+    const homeOps = lineupOps(home?.battingOrder);
+    const awayOps = lineupOps(away?.battingOrder);
+    return {
+      ...g,
+      lineups: { home, away },
+      lineupStats: {
+        home: { known: homeOps > 0, ops: homeOps },
+        away: { known: awayOps > 0, ops: awayOps },
+      },
+    };
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Model state reconstruction (for on-demand date predictions)
 // ---------------------------------------------------------------------------
 
@@ -678,6 +831,8 @@ function buildGameDoc(
     awayInjuries: injuries?.away,
     season: game.season,
     weather: game.weather,
+    lineups: game.lineups,
+    lineupStats: game.lineupStats,
     runProjection,
     marketOdds,
   };
@@ -719,6 +874,8 @@ function gameDocToRaw(doc: any): RawGame {
     winner: doc.winner,
     season: doc.season,
     weather: doc.weather,
+    lineups: doc.lineups,
+    lineupStats: doc.lineupStats,
   };
 }
 
@@ -744,14 +901,18 @@ function mergeRawWithStored(fresh: RawGame, stored: RawGame): RawGame {
   };
 }
 
-/** Load every stored game in bounded pages (fast, no external API). */
-async function loadStoredGames(ctx: any): Promise<RawGame[]> {
+/**
+ * Load stored games for a date range in bounded pages (fast, no external
+ * API). Page size is 300 so full game docs never blow Convex's per-query
+ * response limit; loading only 2024→today skips irrelevant older history.
+ */
+async function loadStoredGames(ctx: any, startDate: string, endDate: string): Promise<RawGame[]> {
   const all: RawGame[] = [];
   let cursor: string | null = null;
   do {
     const page: { games: any[]; cursor: string | null } = await ctx.runQuery(
-      internal.mlb.getGamesPage,
-      { cursor, limit: 1000 },
+      internal.mlb.getGamesByDateRange,
+      { startDate, endDate, cursor, limit: 300 },
     );
     for (const g of page.games) all.push(gameDocToRaw(g));
     cursor = page.cursor;
@@ -760,9 +921,9 @@ async function loadStoredGames(ctx: any): Promise<RawGame[]> {
 }
 
 /** Precomputed full-range calibration metrics stored on the model state. */
-function buildCalibrationSummary(completedDocs: GameDoc[]): CalibrationSummary {
-  const preds = completedDocs.map((d) => d.pickProb);
-  const labels = completedDocs.map((d) => (d.isCorrect ? 1 : 0));
+function buildCalibrationSummary(rows: CalibrationRow[]): CalibrationSummary {
+  const preds = rows.map((d) => d.pickProb);
+  const labels = rows.map((d) => (d.isCorrect ? 1 : 0));
   const evalResult = evaluate(preds, labels);
   const curve = calibrationCurvePoints(preds, labels, 8);
   const metrics = {
@@ -781,21 +942,17 @@ function buildCalibrationSummary(completedDocs: GameDoc[]): CalibrationSummary {
   let tBias = 0;
   const rlPreds: number[] = [];
   const rlLabels: number[] = [];
-  for (const d of completedDocs) {
-    const predictedTotal = d.runProjection?.total;
-    if (typeof predictedTotal === "number") {
-      const actual = (d.away.score ?? 0) + (d.home.score ?? 0);
+  for (const d of rows) {
+    if (typeof d.predictedTotal === "number") {
       tN += 1;
-      const err = predictedTotal - actual;
+      const err = d.predictedTotal - d.actualTotal;
       tAbs += Math.abs(err);
       tSq += err * err;
       tBias += err;
     }
-    const homeRunLineProb = d.runProjection?.homeRunLineProb;
-    if (typeof homeRunLineProb === "number") {
-      const margin = (d.home.score ?? 0) - (d.away.score ?? 0);
-      rlPreds.push(homeRunLineProb);
-      rlLabels.push(margin >= 2 ? 1 : 0);
+    if (typeof d.homeRunLineProb === "number") {
+      rlPreds.push(d.homeRunLineProb);
+      rlLabels.push(d.actualMargin >= 2 ? 1 : 0);
     }
   }
 
@@ -816,8 +973,8 @@ function buildCalibrationSummary(completedDocs: GameDoc[]): CalibrationSummary {
     };
   }
 
-  const total = completedDocs.length;
-  const correct = completedDocs.filter((d) => d.isCorrect).length;
+  const total = rows.length;
+  const correct = rows.filter((d) => d.isCorrect).length;
   return {
     metrics,
     totalsMetrics,
@@ -828,23 +985,62 @@ function buildCalibrationSummary(completedDocs: GameDoc[]): CalibrationSummary {
   };
 }
 
-/** Lightweight projection (1/10th of a game doc) for calibration queries. */
-function calibrationRowFromDoc(d: GameDoc) {
-  return {
-    gamePk: d.gamePk,
-    date: d.date,
-    away: { abbrev: d.away.abbrev, name: d.away.name, score: d.away.score },
-    home: { abbrev: d.home.abbrev, name: d.home.name, score: d.home.score },
-    winner: d.winner,
-    pickTeam: d.pickTeam,
-    pickProb: d.pickProb,
-    isCorrect: d.isCorrect,
-    isUpset: d.isUpset,
-    predictedTotal: d.runProjection?.total,
-    homeRunLineProb: d.runProjection?.homeRunLineProb,
-    actualTotal: (d.away.score ?? 0) + (d.home.score ?? 0),
-    actualMargin: (d.home.score ?? 0) - (d.away.score ?? 0),
-  };
+/** Compact calibration row (≈1/10th of a game doc) for calibration queries. */
+interface CalibrationRow {
+  gamePk: number;
+  date: string;
+  away: { abbrev: string; name: string; score?: number };
+  home: { abbrev: string; name: string; score?: number };
+  winner?: "home" | "away";
+  pickTeam: "home" | "away";
+  pickProb: number;
+  homeWinProb: number;
+  isCorrect?: boolean;
+  isUpset?: boolean;
+  predictedTotal?: number;
+  homeRunLineProb?: number;
+  actualTotal: number;
+  actualMargin: number;
+}
+
+/** Build compact calibration rows from the training rows (no full GameDocs). */
+function buildCalibrationRows(
+  rows: FeatureRow[],
+  model: TrainedModel,
+  runModelState: RunModel,
+  runLineIso: { x: number; y: number }[],
+  runMarginCal: RunMarginCalibration,
+): CalibrationRow[] {
+  return rows.map((row: FeatureRow) => {
+    const pred = applyModel(model, row.features, row.homeElo, row.awayElo);
+    const g = row.game;
+    const proj = buildRunProjection(
+      runModelState,
+      runLineIso,
+      g,
+      undefined,
+      undefined,
+      RUN_CALIB_TRIALS,
+      pred.homeWinProb,
+      runMarginCal,
+    );
+    return {
+      gamePk: g.gamePk,
+      date: g.date,
+      away: { abbrev: g.away.abbrev, name: g.away.name, score: g.away.score },
+      home: { abbrev: g.home.abbrev, name: g.home.name, score: g.home.score },
+      winner: g.winner,
+      pickTeam: pred.pickTeam,
+      pickProb: pred.pickProb,
+      homeWinProb: pred.homeWinProb,
+      isCorrect: pred.pickTeam === g.winner,
+      isUpset: pred.pickTeam !== g.winner,
+      predictedTotal: proj.total,
+      homeRunLineProb: proj.homeRunLineProb,
+      actualTotal: (g.away.score ?? 0) + (g.home.score ?? 0),
+      actualMargin: (g.home.score ?? 0) - (g.away.score ?? 0),
+    };
+  });
 }
 
 export const refreshModel = action({
@@ -874,7 +1070,9 @@ export const refreshModel = action({
 
       // 1. Reuse previously stored games so complete seasons are not re-fetched
       //    from the external API on every refresh (this was the ~5-minute cost).
-      const storedGames = await loadStoredGames(ctx);
+      //    Only 2024 → today is loaded: older seasons add little to the fit and
+      //    trimming them keeps the read well inside Convex's per-action budget.
+      const storedGames = await loadStoredGames(ctx, `${Number(season) - 2}-03-15`, today);
       const storedCompleted = storedGames.filter(
         (g) => g.winner === "home" || g.winner === "away",
       );
@@ -895,9 +1093,10 @@ export const refreshModel = action({
       const stageTicker = (stageLabel: string, total: number, startPct: number, endPct: number) =>
         (completed: number) => {
           const c = Math.min(completed, total);
+          const frac = total > 0 ? c / total : 1;
           void ctx.runMutation(internal.mlb.setRefreshProgress, {
             stage: `${stageLabel} ${c}/${total}`,
-            pct: startPct + Math.floor((c / total) * (endPct - startPct)),
+            pct: startPct + Math.floor(frac * (endPct - startPct)),
             message: `Loading ${stageLabel.toLowerCase()} (${c}/${total})…`,
           });
         };
@@ -1008,16 +1207,37 @@ export const refreshModel = action({
         `Loaded ${freshTeamStats.size} team-season stat blocks.`,
       );
       const enriched = attachTeamSeasonStats(attachPitcherStats(allRaw, pitcherStats), teamSeasonStats);
-      const completedEnriched = enriched.filter(
-        (g) => g.winner === "home" || g.winner === "away",
-      );
 
-      // 6. Pull as-of-time injured-list snapshots for every team that has played,
+      // 6. Actual starting lineups (last 2 days + upcoming window): fetch the
+      //    boxscore for each game, attach the starting 9 + bench, and pull each
+      //    batter's season OPS so the model gets a real lineup-strength feature.
+      await report("Fetching lineups", 46, "Loading actual starting lineups…");
+      const lineupGames = enriched.filter(
+        (g) => g.date >= addDays(today, -2) && g.date <= addDays(today, UPCOMING_WINDOW_DAYS),
+      );
+      const lineupTicker = stageTicker("Lineups", lineupGames.length, 46, 52);
+      const lineups = await fetchLineupsForGames(lineupGames, 16, lineupTicker);
+      const batterIds: number[] = [];
+      for (const lu of lineups.values()) {
+        for (const side of [lu.home, lu.away]) {
+          if (!side) continue;
+          for (const p of [...side.battingOrder, ...side.bench]) batterIds.push(p.id);
+        }
+      }
+      const previousPlayerOps = (previousState?.playerOps ?? {}) as Record<string, number>;
+      const playerOps = await fetchPlayerSeasonOps(batterIds, season, previousPlayerOps);
+      const playerOpsCache: Record<string, number> = {
+        ...previousPlayerOps,
+        ...Object.fromEntries([...playerOps].map(([id, ops]) => [`${id}|${season}`, ops])),
+      };
+      const enrichedWithLineups = attachLineups(enriched, lineups, playerOps);
+
+      // 7. Pull as-of-time injured-list snapshots for every team that has played,
       //    then train, select features/model, calibrate, and decide on Monte Carlo.
       //    On a cold start we skip this: the injury feature benefits from a multi-
       //    month history, and saving the bulk fetch here is what was leaving the
       //    action hanging past 5 minutes before the user reconnected.
-      await report("Fetching injury data", 50, hasFullHistory ? "Loading injured-list snapshots…" : "Skipping injury history on first run");
+      await report("Fetching injury data", 54, hasFullHistory ? "Loading injured-list snapshots…" : "Skipping injury history on first run");
       const teamIds = [...new Set(completed.flatMap((g) => [g.home.id, g.away.id]))];
       const previousInjurySnapshots =
         previousState?.season === season
@@ -1033,6 +1253,10 @@ export const refreshModel = action({
           )
         : new Map<number, InjurySnapshot[]>();
 
+      const completedEnriched = enrichedWithLineups.filter(
+        (g) => g.winner === "home" || g.winner === "away",
+      );
+
       await report("Training model", 64, "Fitting models & selecting features…");
       const run = runModel(completedEnriched, { season, asOfDate: today }, injurySnapshots);
       const { result, model, rows, teamState } = run;
@@ -1046,36 +1270,35 @@ export const refreshModel = action({
 
       await report("Scoring games", 80, "Generating predictions & run simulations…");
       // 7. As-of-time predictions for every completed game (historical results),
-      //    plus run-scoring projections for the totals / run-line views.
-      const completedDocs: GameDoc[] = rows.map((row: FeatureRow) => {
-        const pred = applyModel(model, row.features, row.homeElo, row.awayElo);
-        return buildGameDoc(
-          row.game,
-          pred,
-          pitcherStats,
-          undefined,
-          buildRunProjection(runModelState, runLineIso, row.game, undefined, undefined, RUN_CALIB_TRIALS, pred.homeWinProb, runMarginCal),
-        );
-      });
+      //    plus run-scoring projections for the totals / run-line views. Only
+      //    compact calibration rows are built here — the full GameDoc (with
+      //    SHAP + market odds) is only materialized for the fresh window below,
+      //    which keeps the refresh from constructing ~7k heavyweight docs.
+      const calibrationRows = buildCalibrationRows(
+        rows,
+        model,
+        runModelState,
+        runLineIso,
+        runMarginCal,
+      );
 
-      // Descriptive reliability / calibration views over the full 2022–2026 dataset.
+      // Descriptive reliability / calibration views over the full dataset.
       // Favorite framing: one side per game (predicted probability > 50%) vs. outcome.
-      const fullPreds = completedDocs.map((d) => d.pickProb);
-      const fullLabels = completedDocs.map((d) => (d.isCorrect ? 1 : 0));
+      const fullPreds = calibrationRows.map((d) => d.pickProb);
+      const fullLabels = calibrationRows.map((d) => (d.isCorrect ? 1 : 0));
       const fullCurve = calibrationCurvePoints(fullPreds, fullLabels, 12);
       const fullEval = evaluate(fullPreds, fullLabels);
       const spearmanRho = spearmanRank(fullPreds, fullLabels);
-      const highConf = completedDocs.filter((d) => d.pickProb >= 0.65);
+      const highConf = calibrationRows.filter((d) => d.pickProb >= 0.65);
       const topDecileWinRate = highConf.length > 0 ? highConf.filter((d) => d.isCorrect).length / highConf.length : 0;
-      const calibrationSummary = buildCalibrationSummary(completedDocs);
-      const calibrationRows = completedDocs.map(calibrationRowFromDoc);
+      const calibrationSummary = buildCalibrationSummary(calibrationRows);
 
       // 8. Build fresh docs only for the recent/upcoming window so we never
       //    rewrite thousands of unchanged historical dates on refresh.
       const freshDates = new Set(freshRaw.map((g) => g.date));
       const rowsByPk = new Map(rows.map((r) => [r.game.gamePk, r]));
       const freshDocs: GameDoc[] = [];
-      for (const g of enriched) {
+      for (const g of enrichedWithLineups) {
         if (!freshDates.has(g.date)) continue;
         if (g.winner === "home" || g.winner === "away") {
           const row = rowsByPk.get(g.gamePk);
@@ -1107,7 +1330,7 @@ export const refreshModel = action({
       }
 
       // 9. Today's record.
-      const todaysRecord = buildTodaysRecord(completedDocs, today);
+      const todaysRecord = buildTodaysRecord(calibrationRows as unknown as GameDoc[], today);
 
       await report("Saving model state", 92, "Persisting trained model…");
       // 10. Store the model state (singleton).
@@ -1153,6 +1376,7 @@ export const refreshModel = action({
           runMarginCalibration: runMarginCal,
           teamSeasonStats,
           injurySnapshots: Object.fromEntries(injurySnapshots),
+          playerOps: playerOpsCache,
           calibrationSummary,
           spearmanRho,
           topDecileWinRate,
@@ -1179,7 +1403,7 @@ export const refreshModel = action({
       const calibrationDates = needsCalibrationBackfill
         ? new Set(calibrationRows.map((r) => r.date))
         : freshDates;
-      const calibrationByDate = new Map<string, ReturnType<typeof calibrationRowFromDoc>[]>();
+      const calibrationByDate = new Map<string, CalibrationRow[]>();
       for (const row of calibrationRows) {
         if (!calibrationDates.has(row.date)) continue;
         const list = calibrationByDate.get(row.date) ?? [];
@@ -1257,9 +1481,23 @@ export const predictDate = action({
     };
     const enriched = attachTeamSeasonStats(attachPitcherStats(raw, pitcherStats), teamSeasonStats);
 
+    // Actual starting lineups for the selected date (boxscore), with each
+    // batter's season OPS pulled from the cached map + fresh fetches.
+    const lineups = await fetchLineupsForGames(enriched, 16);
+    const batterIds: number[] = [];
+    for (const lu of lineups.values()) {
+      for (const side of [lu.home, lu.away]) {
+        if (!side) continue;
+        for (const p of [...side.battingOrder, ...side.bench]) batterIds.push(p.id);
+      }
+    }
+    const previousPlayerOps = (state.playerOps ?? {}) as Record<string, number>;
+    const playerOps = await fetchPlayerSeasonOps(batterIds, season, previousPlayerOps);
+    const enrichedWithLineups = attachLineups(enriched, lineups, playerOps);
+
     const marketOdds = await fetchMarketOdds();
 
-    const docs = enriched.map((g) => {
+    const docs = enrichedWithLineups.map((g) => {
       const odds = marketOddsForGame(marketOdds, g);
       const pred = predictionFor(g, model, teamState);
       return buildGameDoc(

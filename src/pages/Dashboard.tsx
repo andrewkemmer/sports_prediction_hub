@@ -63,16 +63,18 @@ export default function Dashboard() {
 
   // The refresh action reports its stage through the `refreshProgress` doc so
   // the UI can render a real progress bar instead of an indeterminate spinner.
-  // An in-flight refresh whose WebSocket dropped still has progress, so we keep
-  // showing the latest stage until either it marks itself `done` or the action
-  // is too old to trust.
-  const activeProgress =
-    refreshProgress &&
-    !refreshProgress.done &&
-    Date.now() - refreshProgress.updatedAt < 15 * 60_000;
+  // A progress doc that has not updated in 3 minutes while no refresh is in
+  // flight locally is treated as stale (the server action died without writing
+  // `done`), so a dead run never pins the UI at 4% forever.
+  const progressStale = refreshProgress && !refreshProgress.done && Date.now() - refreshProgress.updatedAt > 3 * 60_000;
+  const activeProgress = refreshing || (!!refreshProgress && !refreshProgress.done && !progressStale);
   const progressForUi: RefreshProgressDoc | null =
     refreshing && (!refreshProgress || refreshProgress.done) ? null : (refreshProgress ?? null);
-  const showProgress = refreshing || !!activeProgress;
+  const showProgress = activeProgress;
+  // While a refresh IS in flight locally, warn if the server hasn't checked in
+  // for a while so the user knows it may be stuck rather than silently waiting.
+  const progressStalled =
+    refreshing && !!refreshProgress && !refreshProgress.done && Date.now() - refreshProgress.updatedAt > 2 * 60_000;
   // Show a stale-but-failed progress banner so the user can see the prior
   // refresh's failure reason after a dropped WebSocket reconnect.
   const lastFailedProgress =
@@ -185,7 +187,7 @@ export default function Dashboard() {
 
       {/* Content */}
       <div className="mx-auto w-full max-w-7xl px-4 py-6 sm:px-6">
-        {showProgress && <RefreshProgressBar progress={progressForUi} />}
+        {showProgress && <RefreshProgressBar progress={progressForUi} stalled={progressStalled} />}
         {lastFailedProgress && lastFailedMessage && (
           <div className="mb-4 rounded-xl border border-rose-500/40 bg-rose-500/5 p-3 text-sm text-rose-700 dark:text-rose-300">
             <span className="font-semibold">Last refresh failed: </span>
@@ -224,7 +226,7 @@ export default function Dashboard() {
   );
 }
 
-function RefreshProgressBar({ progress }: { progress: RefreshProgressDoc | null }) {
+function RefreshProgressBar({ progress, stalled }: { progress: RefreshProgressDoc | null; stalled?: boolean }) {
   const pct = progress?.pct ?? 4;
   const stage = progress?.stage ?? "Starting refresh";
   const message = progress?.message ?? "Processing on the server…";
@@ -241,6 +243,12 @@ function RefreshProgressBar({ progress }: { progress: RefreshProgressDoc | null 
       </div>
       <Progress value={pct} className="mt-2.5" />
       <p className="mt-2 text-xs text-muted-foreground">{message}</p>
+      {stalled && (
+        <p className="mt-2 text-xs font-medium text-amber-400">
+          Still working — this is taking longer than usual. The server may be slow to reach the MLB API;
+          you can wait for it to finish or click Refresh again to restart.
+        </p>
+      )}
     </div>
   );
 }

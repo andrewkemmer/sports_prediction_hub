@@ -91,6 +91,8 @@ export interface ModelStateDoc {
   runLineCalibration?: { x: number; y: number }[];
   runMarginCalibration?: { slope: number; intercept: number };
   teamSeasonStats?: Record<string, { ops?: number; era?: number; fieldingPct?: number }>;
+  injurySnapshots?: Record<string, { date: string; count: number }[]>;
+  playerOps?: Record<string, number>;
   calibrationSummary?: CalibrationSummary;
   spearmanRho?: number;
   topDecileWinRate?: number;

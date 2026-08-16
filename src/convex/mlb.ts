@@ -23,14 +23,23 @@ export const getGamesByDate = query({
       .collect(),
 });
 
-// Load all stored games in bounded pages. The refresh action uses this to
-// reuse already-stored seasons instead of re-fetching them from the API.
-export const getGamesPage = internalQuery({
-  args: { cursor: v.union(v.string(), v.null()), limit: v.optional(v.number()) },
+// Load stored games for a date range in bounded pages. The refresh action uses
+// this to reuse already-stored seasons instead of re-fetching them from the
+// API. Pages are kept at 300 docs so full game documents (with SHAP + run
+// projections) never push a single query response over Convex's limit.
+export const getGamesByDateRange = internalQuery({
+  args: {
+    startDate: v.string(),
+    endDate: v.string(),
+    cursor: v.union(v.string(), v.null()),
+    limit: v.optional(v.number()),
+  },
   handler: async (ctx, args) => {
     const page = await ctx.db
       .query("games")
-      .paginate({ numItems: Math.min(args.limit ?? 1000, 2000), cursor: args.cursor ?? null });
+      .withIndex("by_date", (q) => q.gte("date", args.startDate).lte("date", args.endDate))
+      .order("asc")
+      .paginate({ numItems: Math.min(args.limit ?? 300, 500), cursor: args.cursor ?? null });
     return { games: page.page, cursor: page.continueCursor };
   },
 });
