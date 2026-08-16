@@ -40,6 +40,39 @@ export interface RawGame {
   venue?: string;
   innings?: number;
   winner?: "home" | "away";
+  season?: string; // season year (e.g. "2024")
+  weather?: GameWeather;
+}
+
+/** Game-time weather conditions (MLB Stats API `hydrate=weather`). */
+export interface GameWeather {
+  condition?: string;
+  tempF?: number;
+  windMph?: number;
+}
+
+/** Predicted score / totals / run-line projection from the run model. */
+export interface RunProjection {
+  homeScore: number; // mean runs
+  awayScore: number; // mean runs
+  total: number; // mean combined runs
+  overProb: number; // P(total > line)
+  underProb: number; // P(total < line)
+  homeRunLineProb: number; // P(home wins by 2+, i.e. covers -1.5)
+  awayRunLineProb: number; // P(away loses by <=1 or wins, i.e. covers +1.5)
+}
+
+/** Market odds from a third-party odds provider (e.g. The Odds API). */
+export interface MarketOdds {
+  homeMoneyline?: number; // american odds
+  awayMoneyline?: number;
+  total?: number; // over/under line
+  overPrice?: number;
+  underPrice?: number;
+  runLine?: number; // e.g. 1.5
+  homeRunLinePrice?: number;
+  awayRunLinePrice?: number;
+  source?: string;
 }
 
 /** The feature values used by the model for a single game. */
@@ -235,6 +268,10 @@ export interface GameDoc {
   shap?: ShapContribution[];
   homeInjuries?: number;
   awayInjuries?: number;
+  season?: string;
+  weather?: GameWeather;
+  runProjection?: RunProjection;
+  marketOdds?: MarketOdds;
 }
 
 /** Ensemble stacking weight for one candidate model. */

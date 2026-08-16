@@ -344,10 +344,42 @@ export function GameCard({ game }: { game: GameDoc }) {
         </div>
       </div>
 
+      {/* Run model: predicted score, totals, run line */}
+      {game.runProjection && (
+        <div className="mt-2.5 px-4">
+          <div className="rounded-lg border border-border/60 bg-white/[0.02] px-3 py-2">
+            <div className="flex items-center justify-between text-[11px]">
+              <span className="text-muted-foreground">Predicted score</span>
+              <span className="font-semibold tabular-nums text-foreground">
+                {game.home.abbrev} {game.runProjection.homeScore.toFixed(1)} – {game.away.abbrev}{" "}
+                {game.runProjection.awayScore.toFixed(1)}
+              </span>
+            </div>
+            <div className="mt-1 flex items-center justify-between text-[11px]">
+              <span className="text-muted-foreground">
+                Total {game.marketOdds?.total !== undefined ? game.marketOdds.total : game.runProjection.total.toFixed(1)}
+              </span>
+              <span className="tabular-nums text-foreground">
+                O {formatPct(game.runProjection.overProb, 0)} · U {formatPct(game.runProjection.underProb, 0)}
+              </span>
+            </div>
+            <div className="mt-1 flex items-center justify-between text-[11px]">
+              <span className="text-muted-foreground">Run line ±1.5</span>
+              <span className="tabular-nums text-foreground">
+                {game.home.abbrev} {formatPct(game.runProjection.homeRunLineProb, 0)} · {game.away.abbrev}{" "}
+                {formatPct(game.runProjection.awayRunLineProb, 0)}
+              </span>
+            </div>
+          </div>
+        </div>
+      )}
+
       {game.venue && (
         <div className="mt-2.5 flex items-center gap-1.5 px-4 text-[11px] text-muted-foreground">
           <MapPin className="size-3.5" />
           {game.venue}
+          {game.weather?.tempF !== undefined && ` · ${game.weather.tempF}°F`}
+          {game.weather?.windMph !== undefined && ` · ${game.weather.windMph} mph wind`}
         </div>
       )}
 
@@ -362,8 +394,17 @@ export function GameCard({ game }: { game: GameDoc }) {
       {/* Odds / edge */}
       <div className="mt-2 flex items-center justify-between px-4 pb-3 text-[11px]">
         <span className="text-muted-foreground">
-          ML: {game.home.abbrev} {formatAmerican(game.fairHomeOdds ?? 0)} {game.away.abbrev}{" "}
-          {formatAmerican(game.fairAwayOdds ?? 0)}
+          {game.marketOdds?.homeMoneyline !== undefined ? (
+            <>
+              ML: {game.home.abbrev} {formatAmerican(game.marketOdds.homeMoneyline)} {game.away.abbrev}{" "}
+              {formatAmerican(game.marketOdds.awayMoneyline ?? 0)}
+            </>
+          ) : (
+            <>
+              Fair ML: {game.home.abbrev} {formatAmerican(game.fairHomeOdds ?? 0)} {game.away.abbrev}{" "}
+              {formatAmerican(game.fairAwayOdds ?? 0)}
+            </>
+          )}
         </span>
         <span className={cn("font-medium tabular-nums", (game.edge ?? 0) >= 0 ? "text-emerald-400" : "text-rose-400")}>
           Edge: {formatSigned(game.edge ?? 0, 2)}

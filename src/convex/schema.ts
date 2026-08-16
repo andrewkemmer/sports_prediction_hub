@@ -83,6 +83,10 @@ const schema = defineSchema(
       shap: v.optional(v.array(shapContribution)),
       homeInjuries: v.optional(v.number()),
       awayInjuries: v.optional(v.number()),
+      season: v.optional(v.string()),
+      weather: v.optional(v.any()),
+      runProjection: v.optional(v.any()),
+      marketOdds: v.optional(v.any()),
     }).index("by_date", ["date"]),
 
     // Singleton document (key = "current") describing the trained model.
@@ -121,6 +125,8 @@ const schema = defineSchema(
       modelVersions: v.optional(v.any()),
       spearmanRho: v.optional(v.number()),
       topDecileWinRate: v.optional(v.number()),
+      runModel: v.optional(v.any()),
+      runLineCalibration: v.optional(v.any()),
       todaysRecord: v.any(),
     }).index("by_key", ["key"]),
   },

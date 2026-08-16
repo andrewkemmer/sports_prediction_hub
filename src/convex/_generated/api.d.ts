@@ -12,6 +12,7 @@ import type * as auth from "../auth.js";
 import type * as auth_emailOtp from "../auth/emailOtp.js";
 import type * as http from "../http.js";
 import type * as ml_model from "../ml/model.js";
+import type * as ml_runs from "../ml/runs.js";
 import type * as ml_teams from "../ml/teams.js";
 import type * as ml_types from "../ml/types.js";
 import type * as mlb from "../mlb.js";
@@ -29,6 +30,7 @@ declare const fullApi: ApiFromModules<{
   "auth/emailOtp": typeof auth_emailOtp;
   http: typeof http;
   "ml/model": typeof ml_model;
+  "ml/runs": typeof ml_runs;
   "ml/teams": typeof ml_teams;
   "ml/types": typeof ml_types;
   mlb: typeof mlb;

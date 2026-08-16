@@ -35,6 +35,7 @@ import {
   TeamState,
   TrainedModel,
 } from "./types";
+import { fitRunModel, RunModel, simulateRuns } from "./runs";
 
 const ELO_INIT = 1500;
 const ELO_HFA_UPDATE = 30; // home advantage baked into Elo updates only
@@ -84,6 +85,8 @@ export interface ModelRunResult {
   stackingWeights: StackingWeight[];
   crossValidation: CrossValidationResult;
   optimizationParams: OptimizationParams;
+  runModel: RunModel;
+  runLineCalibration: { x: number; y: number }[];
 }
 
 export interface Prediction {
@@ -1195,6 +1198,24 @@ export function runModel(
     featureSelection: "Greedy backward elimination (L2 logistic)",
   };
 
+  // Run-scoring model: predicted scores, totals, and run lines. Fitted on all
+  // completed games (a season-talent model) and isotonic-calibrated on the
+  // first 85% so run-line probabilities minimize risk (Brier).
+  const runModel = fitRunModel(completedGames);
+  const rlRaw: number[] = [];
+  const rlOutcomes: number[] = [];
+  for (const r of rows.slice(0, calibEnd)) {
+    const sim = simulateRuns(runModel, r.game.home.id, r.game.away.id, 0, 2000);
+    const margin = (r.game.home.score ?? 0) - (r.game.away.score ?? 0);
+    rlRaw.push(sim.homeRunLineProb);
+    rlOutcomes.push(margin >= 2 ? 1 : 0);
+  }
+  const rlOrder = rlRaw.map((p, i) => ({ p, y: rlOutcomes[i] })).sort((a, b) => a.p - b.p);
+  const runLineCalibration =
+    rlOrder.length >= 40
+      ? isotonicRegression(rlOrder.map((o) => o.p), rlOrder.map((o) => o.y))
+      : [];
+
   const teamMeta = new Map<number, { name: string; abbrev: string }>();
   for (const g of completedGames) {
     if (!teamMeta.has(g.away.id)) teamMeta.set(g.away.id, { name: g.away.name, abbrev: g.away.abbrev });
@@ -1269,6 +1290,8 @@ export function runModel(
     stackingWeights: stacking.weights,
     crossValidation,
     optimizationParams,
+    runModel,
+    runLineCalibration,
   };
 
   return { result, model, teamState, rows, predict };

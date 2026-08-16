@@ -8,13 +8,16 @@ import type {
   FeatureDriftItem,
   FeatureImportance,
   GameDoc,
+  MarketOdds,
   ModelVersion,
   OptimizationParams,
   PowerRanking,
   RollingBrierPoint,
+  RunProjection,
   StackingWeight,
   TodaysRecord,
 } from "@/convex/ml/types";
+import type { RunModel } from "@/convex/ml/runs";
 
 export type {
   CalibrationBin,
@@ -25,13 +28,16 @@ export type {
   FeatureDriftItem,
   FeatureImportance,
   GameDoc,
+  MarketOdds,
   ModelVersion,
   OptimizationParams,
   PowerRanking,
   RollingBrierPoint,
+  RunProjection,
   StackingWeight,
   TodaysRecord,
 };
+export type { RunModel };
 
 export interface ModelStateDoc {
   key: string;
@@ -69,6 +75,8 @@ export interface ModelStateDoc {
   stackingWeights?: StackingWeight[];
   crossValidation?: CrossValidationResult;
   optimizationParams?: OptimizationParams;
+  runModel?: RunModel;
+  runLineCalibration?: { x: number; y: number }[];
   spearmanRho?: number;
   topDecileWinRate?: number;
   todaysRecord: TodaysRecord;

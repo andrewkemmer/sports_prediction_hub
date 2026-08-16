@@ -1,6 +1,7 @@
 import { v } from "convex/values";
 import { internalMutation, internalQuery, query } from "./_generated/server";
-import { calibrationCurvePoints, evaluate } from "./ml/model";
+import { calibrationCurvePoints, computeAuc, computeBrier, evaluate } from "./ml/model";
+import type { CalibrationBin, ConfidencePoint, CurvePoint } from "./ml/types";
 
 // Latest trained model (singleton key = "current").
 export const getModelState = query({
@@ -27,14 +28,12 @@ export const getGamesByDate = query({
 export const getCalibrationResults = query({
   args: { startDate: v.string(), endDate: v.string() },
   handler: async (ctx, args) => {
-    const all = await ctx.db.query("games").collect();
+    const all = await ctx.db
+      .query("games")
+      .withIndex("by_date", (q) => q.gte("date", args.startDate).lte("date", args.endDate))
+      .collect();
     const games = all
-      .filter(
-        (g) =>
-          (g.winner === "home" || g.winner === "away") &&
-          g.date >= args.startDate &&
-          g.date <= args.endDate,
-      )
+      .filter((g) => g.winner === "home" || g.winner === "away")
       .sort((a, b) => (a.date < b.date ? 1 : -1))
       .map((g) => ({
         gamePk: g.gamePk,
@@ -46,37 +45,31 @@ export const getCalibrationResults = query({
         pickProb: g.pickProb,
         isCorrect: g.isCorrect,
         isUpset: g.isUpset,
+        predictedTotal: g.runProjection?.total,
+        homeRunLineProb: g.runProjection?.homeRunLineProb,
+        actualTotal: (g.away.score ?? 0) + (g.home.score ?? 0),
+        actualMargin: (g.home.score ?? 0) - (g.away.score ?? 0),
       }));
 
     const total = games.length;
     const correct = games.filter((g) => g.isCorrect).length;
 
-    if (total === 0) {
-      return {
-        games,
-        metrics: {
-          auc: 0,
-          brier: 0,
-          logLoss: 0,
-          ece: 0,
-          bins: [],
-          confidenceDistribution: [],
-          calibrationCurve: [],
-        },
-        total: 0,
-        correct: 0,
-        accuracy: 0,
-      };
-    }
-
-    const preds = games.map((g) => g.pickProb);
-    const labels = games.map((g) => (g.isCorrect ? 1 : 0));
-    const evalResult = evaluate(preds, labels);
-    const curve = calibrationCurvePoints(preds, labels, 8);
-
-    return {
-      games,
-      metrics: {
+    // Moneyline (favorite framing) metrics.
+    let moneylineMetrics = {
+      auc: 0,
+      brier: 0,
+      logLoss: 0,
+      ece: 0,
+      bins: [] as CalibrationBin[],
+      confidenceDistribution: [] as ConfidencePoint[],
+      calibrationCurve: [] as CurvePoint[],
+    };
+    if (total > 0) {
+      const preds = games.map((g) => g.pickProb);
+      const labels = games.map((g) => (g.isCorrect ? 1 : 0));
+      const evalResult = evaluate(preds, labels);
+      const curve = calibrationCurvePoints(preds, labels, 8);
+      moneylineMetrics = {
         auc: evalResult.auc,
         brier: evalResult.brier,
         logLoss: evalResult.logLoss,
@@ -84,10 +77,55 @@ export const getCalibrationResults = query({
         bins: evalResult.bins,
         confidenceDistribution: evalResult.confidenceDistribution,
         calibrationCurve: curve.length > 0 ? curve : evalResult.calibrationCurve,
-      },
+      };
+    }
+
+    // Totals (predicted vs actual combined runs) metrics.
+    let totalsMetrics = { n: 0, mae: 0, rmse: 0, bias: 0 };
+    {
+      const rows = games.filter((g) => typeof g.predictedTotal === "number");
+      totalsMetrics.n = rows.length;
+      if (rows.length > 0) {
+        let absSum = 0;
+        let sqSum = 0;
+        let biasSum = 0;
+        for (const g of rows) {
+          const err = (g.predictedTotal as number) - (g.actualTotal as number);
+          absSum += Math.abs(err);
+          sqSum += err * err;
+          biasSum += err;
+        }
+        totalsMetrics.mae = absSum / rows.length;
+        totalsMetrics.rmse = Math.sqrt(sqSum / rows.length);
+        totalsMetrics.bias = biasSum / rows.length;
+      }
+    }
+
+    // Run-line (±1.5) metrics: home covers when it wins by 2+.
+    let runLineMetrics = { n: 0, auc: 0, brier: 0, accuracy: 0 };
+    {
+      const rows = games.filter(
+        (g) => typeof g.homeRunLineProb === "number" && typeof g.actualMargin === "number",
+      );
+      runLineMetrics.n = rows.length;
+      if (rows.length > 0) {
+        const preds = rows.map((g) => g.homeRunLineProb as number);
+        const labels = rows.map((g) => ((g.actualMargin as number) >= 2 ? 1 : 0));
+        runLineMetrics.auc = computeAuc(preds, labels);
+        runLineMetrics.brier = computeBrier(preds, labels);
+        const hits = rows.filter((g, i) => (((g.homeRunLineProb as number) >= 0.5 ? 1 : 0) === labels[i])).length;
+        runLineMetrics.accuracy = hits / rows.length;
+      }
+    }
+
+    return {
+      games,
+      metrics: moneylineMetrics,
+      totalsMetrics,
+      runLineMetrics,
       total,
       correct,
-      accuracy: correct / total,
+      accuracy: total > 0 ? correct / total : 0,
     };
   },
 });

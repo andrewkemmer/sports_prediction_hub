@@ -4,6 +4,7 @@ import { v } from "convex/values";
 import { internal } from "./_generated/api";
 import { action } from "./_generated/server";
 import {
+  applyIsotonic,
   applyModel,
   buildFeaturesForGame,
   calibrationCurvePoints,
@@ -11,14 +12,18 @@ import {
   runModel,
   spearmanRank,
 } from "./ml/model";
+import { RunModel, simulateRuns } from "./ml/runs";
 import { teamMeta } from "./ml/teams";
 import {
   FeatureRow,
   GameDoc,
+  GameWeather,
   InjurySnapshot,
+  MarketOdds,
   PitcherInfo,
   PowerRanking,
   RawGame,
+  RunProjection,
   TeamState,
   TodaysRecord,
   TrainedModel,
@@ -27,6 +32,10 @@ import {
 const MLB_BASE = "https://statsapi.mlb.com";
 const SEASON_START_MD = "03-15";
 const UPCOMING_WINDOW_DAYS = 3;
+const TRAIN_SEASONS = ["2022", "2023", "2024", "2025"];
+const PAST_SEASON_END_MD = "11-01";
+const RUN_SIM_TRIALS = 10000;
+const RUN_CALIB_TRIALS = 2000;
 
 // ---------------------------------------------------------------------------
 // HTTP / date helpers
@@ -106,7 +115,7 @@ async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promis
 // ---------------------------------------------------------------------------
 
 function scheduleUrl(start: string, end: string): string {
-  return `${MLB_BASE}/api/v1/schedule?sportId=1&startDate=${start}&endDate=${end}&hydrate=probablePitcher,linescore`;
+  return `${MLB_BASE}/api/v1/schedule?sportId=1&startDate=${start}&endDate=${end}&hydrate=probablePitcher,linescore,weather`;
 }
 
 function parseGame(g: any): RawGame | null {
@@ -151,7 +160,20 @@ function parseGame(g: any): RawGame | null {
     venue: g.venue?.name,
     innings: innings > 9 ? innings : undefined,
     winner,
+    season: g.season,
+    weather: parseWeather(g.weather),
   };
+}
+
+function parseWeather(w: any): GameWeather | undefined {
+  if (!w) return undefined;
+  const temp = typeof w.temp === "string" ? parseFloat(w.temp) : w.temp;
+  const wind = typeof w.wind?.speed === "string" ? parseFloat(w.wind.speed) : w.wind?.speed;
+  const out: GameWeather = {};
+  if (typeof w.condition === "string") out.condition = w.condition;
+  if (Number.isFinite(temp)) out.tempF = temp;
+  if (Number.isFinite(wind)) out.windMph = wind;
+  return Object.keys(out).length > 0 ? out : undefined;
 }
 
 function parseSchedule(data: any): RawGame[] {
@@ -180,6 +202,18 @@ async function fetchSeason(season: string, throughDate: string): Promise<RawGame
     for (const g of games) seen.set(g.gamePk, g);
   });
   return [...seen.values()].sort((a, b) => (a.gameDate < b.gameDate ? -1 : 1));
+}
+
+/** Fetch the full training window: 2022–2025 full seasons + 2026 through today. */
+async function fetchAllSeasons(currentSeason: string, throughDate: string): Promise<RawGame[]> {
+  const seasons = [...TRAIN_SEASONS, currentSeason];
+  const all: RawGame[] = [];
+  for (const s of seasons) {
+    const end = s === currentSeason ? throughDate : `${s}-${PAST_SEASON_END_MD}`;
+    const games = await fetchSeason(s, end);
+    all.push(...games);
+  }
+  return all.sort((a, b) => (a.gameDate < b.gameDate ? -1 : 1));
 }
 
 // ---------------------------------------------------------------------------
@@ -213,13 +247,21 @@ function inningsPitchedValue(ip: unknown): number {
 /** FIP constant keeps values ERA-like; it cancels out in the feature delta. */
 const FIP_CONSTANT = 3.1;
 
-async function fetchPitcherStats(ids: number[], season: string): Promise<Map<number, PitcherSeasonStats>> {
-  const out = new Map<number, PitcherSeasonStats>();
-  const unique = [...new Set(ids)].filter((id) => id > 0);
-  await mapLimit(unique, 8, async (id) => {
+async function fetchPitcherStats(
+  pairs: { id: number; season: string }[],
+): Promise<Map<string, PitcherSeasonStats>> {
+  const out = new Map<string, PitcherSeasonStats>();
+  const seen = new Set<string>();
+  const unique = pairs.filter((p) => {
+    const key = `${p.id}|${p.season}`;
+    if (p.id <= 0 || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+  await mapLimit(unique, 8, async (p) => {
     try {
       const data = await fetchJson(
-        `${MLB_BASE}/api/v1/people/${id}/stats?stats=season&group=pitching&season=${season}`,
+        `${MLB_BASE}/api/v1/people/${p.id}/stats?stats=season&group=pitching&season=${p.season}`,
       );
       const stat = data?.stats?.[0]?.splits?.[0]?.stat;
       if (stat) {
@@ -231,7 +273,7 @@ async function fetchPitcherStats(ids: number[], season: string): Promise<Map<num
         const so = statNumber(stat.strikeOuts) ?? 0;
         const ip = inningsPitchedValue(stat.inningsPitched);
         const fip = ip > 0 ? (13 * hr + 3 * (bb + hbp) - 2 * so) / ip + FIP_CONSTANT : undefined;
-        out.set(id, {
+        out.set(`${p.id}|${p.season}`, {
           era,
           k9,
           fip: fip === undefined ? undefined : Math.round(fip * 100) / 100,
@@ -247,13 +289,129 @@ async function fetchPitcherStats(ids: number[], season: string): Promise<Map<num
 /** Attach ERA/K9/FIP to each game's probable pitchers in place (new array). */
 function attachPitcherStats(
   games: RawGame[],
-  stats: Map<number, PitcherSeasonStats>,
+  stats: Map<string, PitcherSeasonStats>,
 ): RawGame[] {
   return games.map((g) => ({
     ...g,
-    awayPitcher: g.awayPitcher ? { ...g.awayPitcher, ...(stats.get(g.awayPitcher.id) ?? {}) } : undefined,
-    homePitcher: g.homePitcher ? { ...g.homePitcher, ...(stats.get(g.homePitcher.id) ?? {}) } : undefined,
+    awayPitcher: g.awayPitcher
+      ? { ...g.awayPitcher, ...(stats.get(`${g.awayPitcher.id}|${g.season}`) ?? {}) }
+      : undefined,
+    homePitcher: g.homePitcher
+      ? { ...g.homePitcher, ...(stats.get(`${g.homePitcher.id}|${g.season}`) ?? {}) }
+      : undefined,
   }));
+}
+
+// ---------------------------------------------------------------------------
+// Market odds (The Odds API) — optional, reads THE_ODDS_API_KEY
+// ---------------------------------------------------------------------------
+
+const ODDS_API_KEY = process.env.THE_ODDS_API_KEY;
+const ODDS_BASE = "https://api.the-odds-api.com/v4/sports/baseball_mlb/odds";
+
+function oddsNum(v: unknown): number | undefined {
+  if (typeof v === "number" && Number.isFinite(v)) return v;
+  return undefined;
+}
+
+function pickBookmaker(bookmakers: any[]): any | undefined {
+  if (!Array.isArray(bookmakers) || bookmakers.length === 0) return undefined;
+  const preferred = ["pinnacle", "draftkings", "fanduel", "betmgm"];
+  for (const p of preferred) {
+    const b = bookmakers.find((x) => x?.key === p);
+    if (b) return b;
+  }
+  return bookmakers[0];
+}
+
+function oddsFromEvent(event: any): { date: string; home: string; away: string; odds: MarketOdds } | null {
+  const home = event?.home_team;
+  const away = event?.away_team;
+  if (typeof home !== "string" || typeof away !== "string") return null;
+  const book = pickBookmaker(event?.bookmakers);
+  const markets = book?.markets;
+  if (!Array.isArray(markets)) return null;
+  const odds: MarketOdds = {};
+  for (const m of markets) {
+    const key = m?.key;
+    const outcomes: any[] = m?.outcomes ?? [];
+    if (key === "h2h") {
+      for (const o of outcomes) {
+        if (o?.name === home) odds.homeMoneyline = oddsNum(o.price);
+        else if (o?.name === away) odds.awayMoneyline = oddsNum(o.price);
+      }
+    } else if (key === "totals") {
+      for (const o of outcomes) {
+        const pt = oddsNum(o?.point);
+        if (pt !== undefined) odds.total = pt;
+        if (o?.name === "Over") odds.overPrice = oddsNum(o.price);
+        if (o?.name === "Under") odds.underPrice = oddsNum(o.price);
+      }
+    } else if (key === "spreads") {
+      for (const o of outcomes) {
+        const pt = oddsNum(o?.point);
+        if (pt !== undefined) odds.runLine = Math.abs(pt);
+        if (o?.name === home) odds.homeRunLinePrice = oddsNum(o.price);
+        else if (o?.name === away) odds.awayRunLinePrice = oddsNum(o.price);
+      }
+    }
+  }
+  if (Object.keys(odds).length === 0) return null;
+  odds.source = "The Odds API";
+  const commence = event?.commence_time;
+  const date = commence ? etDateString(new Date(commence)) : "";
+  return { date, home, away, odds };
+}
+
+async function fetchMarketOdds(): Promise<Map<string, MarketOdds>> {
+  const out = new Map<string, MarketOdds>();
+  if (!ODDS_API_KEY) return out;
+  try {
+    const url = `${ODDS_BASE}/?apiKey=${encodeURIComponent(ODDS_API_KEY)}&regions=us&markets=h2h,totals,spreads&oddsFormat=american`;
+    const data = await fetchJson(url);
+    for (const event of data ?? []) {
+      const parsed = oddsFromEvent(event);
+      if (!parsed || !parsed.date) continue;
+      out.set(`${parsed.date}|${parsed.home}|${parsed.away}`, parsed.odds);
+    }
+  } catch {
+    // market odds are best-effort; never fail a model refresh because of them
+  }
+  return out;
+}
+
+function marketOddsForGame(odds: Map<string, MarketOdds>, game: RawGame): MarketOdds | undefined {
+  if (odds.size === 0) return undefined;
+  const homeFull = teamMeta(game.home.id).fullName;
+  const awayFull = teamMeta(game.away.id).fullName;
+  return odds.get(`${game.date}|${homeFull}|${awayFull}`) ?? odds.get(`${game.date}|${awayFull}|${homeFull}`);
+}
+
+// ---------------------------------------------------------------------------
+// Run projections (predicted scores, totals, run lines)
+// ---------------------------------------------------------------------------
+
+function buildRunProjection(
+  runModel: RunModel,
+  runLineIso: { x: number; y: number }[],
+  game: RawGame,
+  marketTotal?: number,
+  trials = RUN_SIM_TRIALS,
+): RunProjection {
+  const first = simulateRuns(runModel, game.home.id, game.away.id, 0, trials);
+  const line = marketTotal ?? first.total;
+  const sim = line === 0 ? first : simulateRuns(runModel, game.home.id, game.away.id, line, trials);
+  const homeRL = runLineIso.length > 0 ? applyIsotonic(runLineIso, sim.homeRunLineProb) : sim.homeRunLineProb;
+  const home = Math.min(0.999, Math.max(0.001, homeRL));
+  return {
+    homeScore: Math.round(sim.homeScore * 100) / 100,
+    awayScore: Math.round(sim.awayScore * 100) / 100,
+    total: Math.round(sim.total * 100) / 100,
+    overProb: sim.overProb,
+    underProb: sim.underProb,
+    homeRunLineProb: home,
+    awayRunLineProb: 1 - home,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -369,14 +527,16 @@ function reconstructTeamState(rankings: PowerRanking[]): TeamState {
 function buildGameDoc(
   game: RawGame,
   pred: { homeWinProb: number; awayWinProb: number; pickTeam: "home" | "away"; pickProb: number; shap: GameDoc["shap"]; edge: number; fairHomeOdds: number; fairAwayOdds: number },
-  pitcherStats: Map<number, PitcherSeasonStats>,
+  pitcherStats: Map<string, PitcherSeasonStats>,
   injuries?: { home: number; away: number },
+  runProjection?: RunProjection,
+  marketOdds?: MarketOdds,
 ): GameDoc {
   const awayPitcher: PitcherInfo | undefined = game.awayPitcher
-    ? { ...game.awayPitcher, ...(pitcherStats.get(game.awayPitcher.id) ?? {}) }
+    ? { ...game.awayPitcher, ...(pitcherStats.get(`${game.awayPitcher.id}|${game.season}`) ?? {}) }
     : undefined;
   const homePitcher: PitcherInfo | undefined = game.homePitcher
-    ? { ...game.homePitcher, ...(pitcherStats.get(game.homePitcher.id) ?? {}) }
+    ? { ...game.homePitcher, ...(pitcherStats.get(`${game.homePitcher.id}|${game.season}`) ?? {}) }
     : undefined;
 
   const doc: GameDoc = {
@@ -403,6 +563,10 @@ function buildGameDoc(
     shap: pred.shap,
     homeInjuries: injuries?.home,
     awayInjuries: injuries?.away,
+    season: game.season,
+    weather: game.weather,
+    runProjection,
+    marketOdds,
   };
   if (game.winner === "home" || game.winner === "away") {
     doc.isCorrect = pred.pickTeam === game.winner;
@@ -431,27 +595,28 @@ export const refreshModel = action({
     const season = String(now.getFullYear());
     const today = etDateString(now);
 
-    // 1. Fetch every regular-season game through today (single consolidated source).
-    const allGames = await fetchSeason(season, today);
+    // 1. Fetch 2022–2025 full seasons + 2026 through today (regular season only).
+    const allGames = await fetchAllSeasons(season, today);
     const completed = allGames.filter((g) => g.winner === "home" || g.winner === "away");
     if (completed.length < 40) {
       throw new Error(
-        `Only ${completed.length} completed ${season} regular-season games found in MLB Stats API. Cannot train yet.`,
+        `Only ${completed.length} completed regular-season games found in MLB Stats API. Cannot train yet.`,
       );
     }
 
-    // 1b. Fetch the upcoming window now so every starting pitcher (completed +
-    //     upcoming) can be hydrated in a single consolidated pass.
+    // 1b. Fetch the upcoming window (current season) for on-demand predictions.
     const windowEnd = addDays(today, UPCOMING_WINDOW_DAYS);
     const upcomingRaw = await fetchScheduleRange(today, windowEnd);
 
-    // 1c. Season pitching stats (ERA / K9 / FIP) for every starter in scope.
-    const pitcherIdSet = new Set<number>();
+    // 1c. Season pitching stats (ERA / K9 / FIP) for every starter in scope,
+    //     keyed by (pitcher, season) so past seasons use that season's stats.
+    const pitcherPairs: { id: number; season: string }[] = [];
     for (const g of [...completed, ...upcomingRaw]) {
-      if (g.awayPitcher) pitcherIdSet.add(g.awayPitcher.id);
-      if (g.homePitcher) pitcherIdSet.add(g.homePitcher.id);
+      const s = g.season ?? season;
+      if (g.awayPitcher) pitcherPairs.push({ id: g.awayPitcher.id, season: s });
+      if (g.homePitcher) pitcherPairs.push({ id: g.homePitcher.id, season: s });
     }
-    const pitcherStats = await fetchPitcherStats([...pitcherIdSet], season);
+    const pitcherStats = await fetchPitcherStats(pitcherPairs);
     const completedEnriched = attachPitcherStats(completed, pitcherStats);
 
     // 2. Pull as-of-time injured-list snapshots for every team that has played,
@@ -465,17 +630,25 @@ export const refreshModel = action({
     );
     const run = runModel(completedEnriched, { season, asOfDate: today }, injurySnapshots);
     const { result, model, rows, teamState } = run;
+    const runModelState = result.runModel;
+    const runLineIso = result.runLineCalibration ?? [];
 
-    // 3. As-of-time predictions for every completed game (historical results).
+    // Market odds (best-effort; empty map when THE_ODDS_API_KEY is unset).
+    const marketOdds = await fetchMarketOdds();
+
+    // 3. As-of-time predictions for every completed game (historical results),
+    //    plus run-scoring projections for the totals / run-line views.
     const completedDocs: GameDoc[] = rows.map((row: FeatureRow) =>
       buildGameDoc(
         row.game,
         applyModel(model, row.features, row.homeElo, row.awayElo),
         pitcherStats,
+        undefined,
+        buildRunProjection(runModelState, runLineIso, row.game, undefined, RUN_CALIB_TRIALS),
       ),
     );
 
-    // Descriptive reliability / calibration views over the full 2026 season.
+    // Descriptive reliability / calibration views over the full 2022–2026 dataset.
     // Favorite framing: one side per game (predicted probability > 50%) vs. outcome.
     const fullPreds = completedDocs.map((d) => d.pickProb);
     const fullLabels = completedDocs.map((d) => (d.isCorrect ? 1 : 0));
@@ -485,16 +658,22 @@ export const refreshModel = action({
     const highConf = completedDocs.filter((d) => d.pickProb >= 0.65);
     const topDecileWinRate = highConf.length > 0 ? highConf.filter((d) => d.isCorrect).length / highConf.length : 0;
 
-    // 4. Upcoming games (today through +3 days) with starter stat context.
+    // 4. Upcoming games (today through +3 days) with starter stat context,
+    //    run projections, and market odds.
     const upcomingEnriched = attachPitcherStats(upcomingRaw, pitcherStats);
     const upcomingDocs: GameDoc[] = upcomingEnriched
       .filter((g) => g.winner !== "home" && g.winner !== "away")
-      .map((g) =>
-        buildGameDoc(g, predictionFor(g, model, teamState), pitcherStats, {
-          home: teamState.injuries[g.home.id] ?? 0,
-          away: teamState.injuries[g.away.id] ?? 0,
-        }),
-      );
+      .map((g) => {
+        const odds = marketOddsForGame(marketOdds, g);
+        return buildGameDoc(
+          g,
+          predictionFor(g, model, teamState),
+          pitcherStats,
+          { home: teamState.injuries[g.home.id] ?? 0, away: teamState.injuries[g.away.id] ?? 0 },
+          buildRunProjection(runModelState, runLineIso, g, odds?.total, RUN_SIM_TRIALS),
+          odds,
+        );
+      });
 
     // 5. Today's record.
     const todaysRecord = buildTodaysRecord(completedDocs, today);
@@ -537,6 +716,8 @@ export const refreshModel = action({
         stackingWeights: result.stackingWeights,
         crossValidation: result.crossValidation,
         optimizationParams: result.optimizationParams,
+        runModel: result.runModel,
+        runLineCalibration: result.runLineCalibration,
         spearmanRho,
         topDecileWinRate,
         todaysRecord,
@@ -580,22 +761,33 @@ export const predictDate = action({
     }
     const model = reconstructModel(state);
     const teamState = reconstructTeamState(state.powerRankings as PowerRanking[]);
+    const runModelState = state.runModel as RunModel | undefined;
+    const runLineIso = (state.runLineCalibration ?? []) as { x: number; y: number }[];
+    const season = state.season as string;
 
     const raw = await fetchScheduleRange(args.date, args.date);
-    const pitcherIds: number[] = [];
+    const pitcherPairs: { id: number; season: string }[] = [];
     for (const g of raw) {
-      if (g.awayPitcher) pitcherIds.push(g.awayPitcher.id);
-      if (g.homePitcher) pitcherIds.push(g.homePitcher.id);
+      const s = g.season ?? season;
+      if (g.awayPitcher) pitcherPairs.push({ id: g.awayPitcher.id, season: s });
+      if (g.homePitcher) pitcherPairs.push({ id: g.homePitcher.id, season: s });
     }
-    const pitcherStats = await fetchPitcherStats(pitcherIds, state.season as string);
+    const pitcherStats = await fetchPitcherStats(pitcherPairs);
     const enriched = attachPitcherStats(raw, pitcherStats);
 
-    const docs = enriched.map((g) =>
-      buildGameDoc(g, predictionFor(g, model, teamState), pitcherStats, {
-        home: teamState.injuries[g.home.id] ?? 0,
-        away: teamState.injuries[g.away.id] ?? 0,
-      }),
-    );
+    const marketOdds = await fetchMarketOdds();
+
+    const docs = enriched.map((g) => {
+      const odds = marketOddsForGame(marketOdds, g);
+      return buildGameDoc(
+        g,
+        predictionFor(g, model, teamState),
+        pitcherStats,
+        { home: teamState.injuries[g.home.id] ?? 0, away: teamState.injuries[g.away.id] ?? 0 },
+        runModelState ? buildRunProjection(runModelState, runLineIso, g, odds?.total, RUN_SIM_TRIALS) : undefined,
+        odds,
+      );
+    });
     await ctx.runMutation(internal.mlb.replaceGamesForDate, { date: args.date, games: docs });
     return { games: docs.length };
   },
