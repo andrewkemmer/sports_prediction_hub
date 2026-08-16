@@ -1393,18 +1393,25 @@ function buildCalibrationRows(
 export const refreshModel = action({
   args: {},
   handler: async (ctx) => {
+    // Progress reporting is best-effort: it must never abort the refresh
+    // itself (e.g. on an OCC conflict from a second writer on the shared
+    // refreshProgress doc). Swallow write failures and keep going.
     const report = async (
       stage: string,
       pct: number,
       message: string,
       extra: { done?: boolean; error?: string } = {},
     ) => {
-      await ctx.runMutation(internal.mlb.setRefreshProgress, {
-        stage,
-        pct,
-        message,
-        ...extra,
-      });
+      try {
+        await ctx.runMutation(internal.mlb.setRefreshProgress, {
+          stage,
+          pct,
+          message,
+          ...extra,
+        });
+      } catch {
+        // ignore — progress is informational
+      }
     };
 
     const now = new Date();
@@ -1414,16 +1421,15 @@ export const refreshModel = action({
     try {
       const previousState: any = await ctx.runQuery(internal.mlb.getLatestModelState, {});
 
-      // 0a. CONCURRENCY GUARD: if a refresh is already running server-side
-      //     (e.g., the page reloaded or the client reconnected mid-flight),
-      //     don't start a duplicate one that would re-run the expensive
-      //     calibration backfill. This check MUST run before we write our own
-      //     progress report — otherwise the guard sees its own fresh `!done`
-      //     doc and every refresh would short-circuit as "already running".
-      //     The 3-minute window matches the client's staleness heuristic, so
-      //     a dead run stops blocking once its progress doc goes stale.
-      const inFlight = await ctx.runQuery(api.mlb.getRefreshProgress, {});
-      if (inFlight && !inFlight.done && Date.now() - (inFlight.updatedAt ?? 0) < 3 * 60_000) {
+      // 0a. ATOMIC CLAIM: only one refresh may run at a time. The claim is a
+      //     single transaction (claimRefresh), so two concurrent refreshModel
+      //     actions (double-click, multiple tabs, reconnect) cannot both win —
+      //     the loser returns `alreadyRunning` instead of racing the winner on
+      //     the shared progress doc (which caused OptimisticConcurrencyControl
+      //     failures that killed the action). The claim also writes the first
+      //     progress report atomically.
+      const claim = await ctx.runMutation(internal.mlb.claimRefresh, {});
+      if (!claim.claimed) {
         return {
           fast: true,
           alreadyRunning: true,
@@ -1440,8 +1446,6 @@ export const refreshModel = action({
           storedGames: 0,
         };
       }
-
-      await report("Loading stored games", 4, "Reading previously stored games…");
 
       // 0. FAST PATH: a trained model already exists, so skip the full reload
       //    + retrain (the multi-minute path) and just refresh the recent
@@ -1489,11 +1493,11 @@ export const refreshModel = action({
         (completed: number) => {
           const c = Math.min(completed, total);
           const frac = total > 0 ? c / total : 1;
-          void ctx.runMutation(internal.mlb.setRefreshProgress, {
+          ctx.runMutation(internal.mlb.setRefreshProgress, {
             stage: `${stageLabel} ${c}/${total}`,
             pct: startPct + Math.floor(frac * (endPct - startPct)),
             message: `Loading ${stageLabel.toLowerCase()} (${c}/${total})…`,
-          });
+          }).catch(() => {});
         };
 
       let freshRaw: RawGame[];

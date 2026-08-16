@@ -265,6 +265,37 @@ export const setRefreshProgress = internalMutation({
   },
 });
 
+// Atomically claim the right to run a refresh. Mutations are transactional,
+// so two concurrent refreshModel actions cannot both claim — the second sees
+// the first's fresh `!done` doc inside its own transaction and is rejected.
+// This prevents the OptimisticConcurrencyControl failures that happen when
+// multiple actions write the same singleton progress doc concurrently.
+export const claimRefresh = internalMutation({
+  args: {},
+  handler: async (ctx) => {
+    const now = Date.now();
+    const existing = await ctx.db
+      .query("refreshProgress")
+      .withIndex("by_key", (q) => q.eq("key", "current"))
+      .first();
+    const inFlight = existing && !existing.done && now - (existing.updatedAt ?? 0) < 3 * 60_000;
+    if (inFlight) return { claimed: false };
+    const doc = {
+      key: "current",
+      stage: "Loading stored games",
+      pct: 4,
+      message: "Reading previously stored games…",
+      startedAt: existing?.startedAt ?? now,
+      updatedAt: now,
+      done: false,
+      error: undefined as string | undefined,
+    };
+    if (existing) await ctx.db.patch(existing._id, doc);
+    else await ctx.db.insert("refreshProgress", doc);
+    return { claimed: true };
+  },
+});
+
 export const replaceModelState = internalMutation({
   args: { state: v.any() },
   handler: async (ctx, args) => {
