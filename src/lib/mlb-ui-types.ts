@@ -40,6 +40,17 @@ export type {
 };
 export type { RunModel };
 
+export interface RefreshProgressDoc {
+  key: string;
+  stage: string;
+  pct: number;
+  message: string;
+  startedAt: number;
+  updatedAt: number;
+  done: boolean;
+  error?: string;
+}
+
 export interface ModelStateDoc {
   key: string;
   trainedAt: number;

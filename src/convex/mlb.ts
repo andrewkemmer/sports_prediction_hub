@@ -178,6 +178,46 @@ export const getLatestModelState = internalQuery({
       .first(),
 });
 
+// Live progress for the long-running refresh action. The client subscribes to
+// this while the server-side action runs so the refresh button can show a real
+// progress bar instead of an indeterminate spinner.
+export const getRefreshProgress = query({
+  args: {},
+  handler: async (ctx) =>
+    ctx.db
+      .query("refreshProgress")
+      .withIndex("by_key", (q) => q.eq("key", "current"))
+      .first(),
+});
+
+export const setRefreshProgress = internalMutation({
+  args: {
+    stage: v.string(),
+    pct: v.number(),
+    message: v.string(),
+    done: v.optional(v.boolean()),
+    error: v.optional(v.string()),
+  },
+  handler: async (ctx, args) => {
+    const existing = await ctx.db
+      .query("refreshProgress")
+      .withIndex("by_key", (q) => q.eq("key", "current"))
+      .first();
+    const doc = {
+      key: "current",
+      stage: args.stage,
+      pct: args.pct,
+      message: args.message,
+      startedAt: existing?.startedAt ?? Date.now(),
+      updatedAt: Date.now(),
+      done: args.done ?? false,
+      error: args.error,
+    };
+    if (existing) await ctx.db.patch(existing._id, doc);
+    else await ctx.db.insert("refreshProgress", doc);
+  },
+});
+
 export const replaceModelState = internalMutation({
   args: { state: v.any() },
   handler: async (ctx, args) => {

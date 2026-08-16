@@ -1,11 +1,12 @@
 import { api } from "@/convex/_generated/api";
-import type { GameDoc, ModelStateDoc } from "@/lib/mlb-ui-types";
+import type { GameDoc, ModelStateDoc, RefreshProgressDoc } from "@/lib/mlb-ui-types";
 import { addDaysYmd, formatDateLong, todayET } from "@/lib/format";
 import { useAuth } from "@/hooks/use-auth";
 import { CalibrationTab } from "@/components/mlb/CalibrationTab";
 import { GamesTab } from "@/components/mlb/GamesTab";
 import { ModelMonitorTab } from "@/components/mlb/ModelMonitorTab";
 import { PowerRankingsTab } from "@/components/mlb/PowerRankingsTab";
+import { Progress } from "@/components/ui/progress";
 import { useAction, useQuery } from "convex/react";
 import { LogOut, RefreshCw } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
@@ -48,6 +49,7 @@ function BaseballMark() {
 export default function Dashboard() {
   const { user, signOut } = useAuth();
   const modelState = useQuery(api.mlb.getModelState);
+  const refreshProgress = useQuery(api.mlb.getRefreshProgress);
   const refresh = useAction(api.mlbActions.refreshModel);
   const predictDate = useAction(api.mlbActions.predictDate);
 
@@ -58,6 +60,16 @@ export default function Dashboard() {
 
   const games = useQuery(api.mlb.getGamesByDate, { date: selectedDate });
   const requestedDates = useRef(new Set<string>());
+
+  // The refresh action reports its stage through the `refreshProgress` doc so
+  // the UI can render a real progress bar instead of an indeterminate spinner.
+  const activeProgress =
+    refreshProgress &&
+    !refreshProgress.done &&
+    Date.now() - refreshProgress.updatedAt < 10 * 60_000;
+  const progressForUi: RefreshProgressDoc | null =
+    refreshing && (!refreshProgress || refreshProgress.done) ? null : (refreshProgress ?? null);
+  const showProgress = refreshing || !!activeProgress;
 
   // On-demand predictions for a date that has no stored games yet.
   useEffect(() => {
@@ -153,6 +165,7 @@ export default function Dashboard() {
 
       {/* Content */}
       <div className="mx-auto w-full max-w-7xl px-4 py-6 sm:px-6">
+        {showProgress && <RefreshProgressBar progress={progressForUi} />}
         {!modelState ? (
           <EmptyState refreshing={refreshing} onRefresh={handleRefresh} />
         ) : (
@@ -182,6 +195,27 @@ export default function Dashboard() {
         )}
       </div>
     </main>
+  );
+}
+
+function RefreshProgressBar({ progress }: { progress: RefreshProgressDoc | null }) {
+  const pct = progress?.pct ?? 4;
+  const stage = progress?.stage ?? "Starting refresh";
+  const message = progress?.message ?? "Processing on the server…";
+  return (
+    <div className="mb-4 rounded-xl border border-border bg-card/70 p-4 shadow-sm">
+      <div className="flex items-center justify-between gap-3">
+        <div className="flex items-center gap-2">
+          <RefreshCw className="size-3.5 animate-spin text-primary" />
+          <span className="text-sm font-medium">{stage}</span>
+        </div>
+        <span className="text-xs font-medium tabular-nums text-muted-foreground">
+          {Math.round(pct)}%
+        </span>
+      </div>
+      <Progress value={pct} className="mt-2.5" />
+      <p className="mt-2 text-xs text-muted-foreground">{message}</p>
+    </div>
   );
 }
 
