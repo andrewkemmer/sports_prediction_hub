@@ -1264,16 +1264,17 @@ def _automl_panel(ms: dict) -> None:
     max_imp = max((f["importance"] for f in active), default=1e-6)
     sorted_features = sorted(active, key=lambda f: -f["importance"])
 
-    sub = st.segmented_control(
-        "Auto-ML detail",
-        [
-            f"Learned Feature Decisions ({len(active)}/{len(features)} Active)",
-            f"Optimal Model Stacking Weights ({len(candidates)} Models)",
-            "Optimization Parameters",
-            f"Cross-Validation on {fmt_number(ms.get('gamesTrained', 0))} games",
-        ],
-        key="automl_sub",
-    )
+    _automl_options = [
+        f"Learned Feature Decisions ({len(active)}/{len(features)} Active)",
+        f"Optimal Model Stacking Weights ({len(candidates)} Models)",
+        "Optimization Parameters",
+        f"Cross-Validation on {fmt_number(ms.get('gamesTrained', 0))} games",
+    ]
+    sub = st.segmented_control("Auto-ML detail", _automl_options, key="automl_sub", default=_automl_options[0])
+    if not sub:
+        # segmented_control returns None until the user interacts with it;
+        # never call methods on it before this guard.
+        sub = _automl_options[0]
 
     if sub.startswith("Learned Feature Decisions"):
         st.info(
@@ -1481,7 +1482,10 @@ def monitor_tab(bundle) -> None:
         "Monitor view",
         ["Auto-ML Selection & Weights", "Feature Importance (PFI)", "Ensemble Architecture"],
         key="mon_sub",
+        default="Auto-ML Selection & Weights",
     )
+    if not sub:
+        sub = "Auto-ML Selection & Weights"
     if sub == "Auto-ML Selection & Weights":
         _automl_panel(ms)
     elif sub == "Feature Importance (PFI)":
