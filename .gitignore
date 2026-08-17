@@ -12,6 +12,9 @@ dist
 dist-ssr
 *.local
 
+# Streamlit dashboard runtime state (rebuilt by the app)
+mlb_streamlit/cache/
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
