@@ -132,6 +132,18 @@ const FEATURE_META: Record<string, { category: string; description: string }> = 
     category: "Lineup",
     description: "Starting-9 weighted OPS over each batter's last 10 games — a lineup-level hot/cold streak signal.",
   },
+  bvpOpsDiff: {
+    category: "Matchup",
+    description: "Career batter-vs-pitcher OPS edge vs the opposing starter — each batter's BvP sample is PA-saturated and shrunk toward their as-of season OPS so tiny samples can't dominate.",
+  },
+  platoonOpsDiff: {
+    category: "Matchup",
+    description: "Season OPS edge vs the starter's throwing hand (L/R split) across the starting 9 — the platoon advantage the actual lineup holds over the opposing starter.",
+  },
+  vsTeamOpsDiff: {
+    category: "Matchup",
+    description: "Season OPS edge vs the opposing team across the starting 9 — each club's hitters against the specific opponent staff they face.",
+  },
 };
 
 function shortDate(ymd: string): string {

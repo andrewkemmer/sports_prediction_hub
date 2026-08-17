@@ -4,6 +4,7 @@
 export interface PitcherInfo {
   id: number;
   name: string;
+  pitchHand?: "L" | "R"; // throwing handedness (drives the platoon-split feature)
   era?: number;
   k9?: number;
   fip?: number; // fielding-independent pitching (computed from K / BB / HR / IP)
@@ -41,6 +42,11 @@ export interface LineupPlayer {
   woba?: number; // wOBA as-of the game date
   iso?: number; // isolated power as-of the game date
   recentOps?: number; // OPS over the last 10 games (hot-streak signal)
+  // Batter-vs-pitcher + platoon matchup data (MLB Stats API vsPlayer / splits).
+  bvpOPS?: number; // career OPS vs the opposing starter, shrunk toward season OPS
+  bvpPA?: number; // career plate appearances vs the opposing starter (sample size)
+  platoonOPS?: number; // season OPS vs the starter's handedness (L/R split)
+  vsTeamOPS?: number; // season OPS vs the opposing team
 }
 
 /** Actual starting 9 + available bench for a game (from the boxscore). */
@@ -53,8 +59,31 @@ export interface LineupData {
 export interface LineupStats {
   // Weighted means over the starting 9 (slots 1-4 double-weighted), computed
   // strictly as-of the game date.
-  home: { known: boolean; ops: number; woba: number; iso: number; recentOps: number };
-  away: { known: boolean; ops: number; woba: number; iso: number; recentOps: number };
+  home: {
+    known: boolean;
+    ops: number;
+    woba: number;
+    iso: number;
+    recentOps: number;
+    // Matchup edges (present when the real lineup AND the opposing starter are
+    // known): career BvP OPS (PA-saturated), season platoon OPS vs the starter's
+    // hand, and season OPS vs the opposing team.
+    bvpOps?: number;
+    bvpPA?: number; // total career PA in the matchup across the starting 9
+    platoonOps?: number;
+    vsTeamOps?: number;
+  };
+  away: {
+    known: boolean;
+    ops: number;
+    woba: number;
+    iso: number;
+    recentOps: number;
+    bvpOps?: number;
+    bvpPA?: number;
+    platoonOps?: number;
+    vsTeamOps?: number;
+  };
 }
 
 /** A parsed schedule game straight from the MLB Stats API. */
@@ -135,6 +164,9 @@ export interface FeatureValues {
   lineupWobaDiff: number; // home starting-9 wOBA - away (positive favors home)
   lineupIsoDiff: number; // home starting-9 ISO - away (positive favors home)
   lineupHotDiff: number; // home starting-9 L10 OPS - away (positive favors home)
+  bvpOpsDiff: number; // home starting-9 career BvP OPS - away (positive favors home)
+  platoonOpsDiff: number; // home starting-9 OPS vs starter's hand - away (positive favors home)
+  vsTeamOpsDiff: number; // home starting-9 OPS vs away team - away starting-9 OPS vs home team
 }
 
 export const FEATURE_KEYS = [
@@ -162,6 +194,9 @@ export const FEATURE_KEYS = [
   "lineupWobaDiff",
   "lineupIsoDiff",
   "lineupHotDiff",
+  "bvpOpsDiff",
+  "platoonOpsDiff",
+  "vsTeamOpsDiff",
 ] as const;
 
 export type FeatureKey = (typeof FEATURE_KEYS)[number];
@@ -191,6 +226,9 @@ export const FEATURE_LABELS: Record<FeatureKey, string> = {
   lineupWobaDiff: "Starting-9 wOBA edge",
   lineupIsoDiff: "Starting-9 ISO edge",
   lineupHotDiff: "Starting-9 hot streak (L10 OPS)",
+  bvpOpsDiff: "Batter vs. Pitcher (BvP) edge",
+  platoonOpsDiff: "Platoon split edge (vs starter's hand)",
+  vsTeamOpsDiff: "Batter vs. team split edge",
 };
 
 /** A training row: features computed strictly as-of the game time. */

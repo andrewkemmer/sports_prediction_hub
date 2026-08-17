@@ -294,6 +294,13 @@ function buildFeatures(game: RawGame, state: MutableState): FeatureValues {
     lineupWobaDiff: edge(lineupHome?.woba, lineupAway?.woba),
     lineupIsoDiff: edge(lineupHome?.iso, lineupAway?.iso),
     lineupHotDiff: edge(lineupHome?.recentOps, lineupAway?.recentOps),
+    // Matchup edges: career BvP OPS, season platoon OPS vs the starter's
+    // handedness, and season OPS vs the opposing team — all PA/slot-weighted
+    // means over the real starting 9. 0 (with lineupKnown = 0) when no boxscore
+    // lineup exists for the game, mirroring the other lineup features.
+    bvpOpsDiff: edge(lineupHome?.bvpOps, lineupAway?.bvpOps),
+    platoonOpsDiff: edge(lineupHome?.platoonOps, lineupAway?.platoonOps),
+    vsTeamOpsDiff: edge(lineupHome?.vsTeamOps, lineupAway?.vsTeamOps),
   };
 }
 

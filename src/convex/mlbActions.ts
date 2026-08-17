@@ -152,6 +152,18 @@ function scheduleUrl(start: string, end: string): string {
   return `${MLB_BASE}/api/v1/schedule?sportId=1&startDate=${start}&endDate=${end}&hydrate=probablePitcher,linescore,weather`;
 }
 
+/** Parse a probable starter, keeping the throwing hand for platoon features. */
+function parsePitcher(p: any): PitcherInfo | undefined {
+  if (!p?.id) return undefined;
+  const out: PitcherInfo = { id: p.id, name: p.fullName ?? "" };
+  const code = p.pitchHand?.code ?? "";
+  const desc = p.pitchHand?.description ?? "";
+  if (code === "L" || code === "R") out.pitchHand = code;
+  else if (/^L/i.test(desc)) out.pitchHand = "L";
+  else if (/^R/i.test(desc)) out.pitchHand = "R";
+  return out;
+}
+
 function parseGame(g: any): RawGame | null {
   const away = g.teams?.away;
   const home = g.teams?.home;
@@ -185,12 +197,8 @@ function parseGame(g: any): RawGame | null {
       wins: typeof home.leagueRecord?.wins === "number" ? home.leagueRecord.wins : undefined,
       losses: typeof home.leagueRecord?.losses === "number" ? home.leagueRecord.losses : undefined,
     },
-    awayPitcher: away.probablePitcher
-      ? { id: away.probablePitcher.id, name: away.probablePitcher.fullName }
-      : undefined,
-    homePitcher: home.probablePitcher
-      ? { id: home.probablePitcher.id, name: home.probablePitcher.fullName }
-      : undefined,
+    awayPitcher: parsePitcher(away.probablePitcher),
+    homePitcher: parsePitcher(home.probablePitcher),
     venue: g.venue?.name,
     innings: innings > 9 ? innings : undefined,
     winner,
@@ -1054,6 +1062,21 @@ async function fastRefresh(
   const newBatterLogs = await fetchBatterGameLogs(batterIds, season, batterLogs);
   const batterLogsCache: Record<string, HittingLogEntry[]> = { ...batterLogs, ...newBatterLogs };
 
+  await report("Loading matchups", 66, "Fetching BvP & platoon splits…");
+  const lineupsEnriched = attachLineupsAsOf(freshRaw, lineups, batterLogsCache);
+  const matchup = await enrichWithMatchups(
+    lineupsEnriched,
+    batterLogsCache,
+    (previous.bvpLogs ?? {}) as BvpCache,
+    (previous.platoonLogs ?? {}) as PlatoonCache,
+    (previous.vsTeamLogs ?? {}) as VsTeamCache,
+    season,
+  );
+  const enrichedWithLineups = matchup.games;
+  const bvpLogsCache = matchup.bvpLogs;
+  const platoonLogsCache = matchup.platoonLogs;
+  const vsTeamLogsCache = matchup.vsTeamLogs;
+
   await report("Loading injuries", 68, "Loading current IL snapshot…");
   const teamIds = [...new Set(freshRaw.flatMap((g) => [g.home.id, g.away.id]))];
   const currentInjury = await fetchCurrentInjurySnapshot(teamIds, today, season);
@@ -1061,7 +1084,6 @@ async function fastRefresh(
 
   await report("Predicting upcoming", 78, "Scoring the upcoming schedule…");
   const enriched = attachAsOfStats(freshRaw, pitcherLogsCache, teamLogsCache);
-  const enrichedWithLineups = attachLineupsAsOf(enriched, lineups, batterLogsCache);
   const marketOdds = await fetchMarketOdds();
   const freshByPk = new Map<number, RawGame>(enrichedWithLineups.map((g) => [g.gamePk, g]));
 
@@ -1201,6 +1223,9 @@ async function fastRefresh(
       pitcherLogs: pitcherLogsCache,
       teamLogs: teamLogsCache,
       batterLogs: batterLogsCache,
+      bvpLogs: bvpLogsCache,
+      platoonLogs: platoonLogsCache,
+      vsTeamLogs: vsTeamLogsCache,
       calibrationSummary,
       todaysRecord,
     },
@@ -1359,6 +1384,371 @@ function attachLineupsAsOf(
       },
     };
   });
+}
+
+// ---------------------------------------------------------------------------
+// Batter-vs-pitcher matchups + platoon splits (MLB Stats API vsPlayer /
+// statSplits / vsTeam) — attached only where the real boxscore lineup AND the
+// opposing starter are both known (fresh window + upcoming games), mirroring
+// how the lineup-strength features are populated.
+// ---------------------------------------------------------------------------
+
+interface MatchupStat {
+  pa: number; // plate appearances (sample size)
+  ops: number;
+}
+
+/** Career BvP cache: `${batterId}|${pitcherId}` → career OPS/PA vs that pitcher. */
+type BvpCache = Record<string, MatchupStat>;
+
+/** Season platoon cache: `${batterId}|${season}` → OPS vs LHP / RHP. */
+type PlatoonCache = Record<string, { vsLeft?: MatchupStat; vsRight?: MatchupStat }>;
+
+/** Season vs-team cache: `${batterId}|${teamId}|${season}` → OPS vs that team. */
+type VsTeamCache = Record<string, MatchupStat>;
+
+/** OPS from a statsapi hitting `stat` block (falls back to OBP + SLG). */
+function matchupOps(stat: any): number | undefined {
+  const ops = logNum(stat?.ops);
+  if (ops > 0) return round3(ops);
+  const obp = logNum(stat?.obp);
+  const slg = logNum(stat?.slg);
+  if (obp + slg > 0) return round3(obp + slg);
+  return undefined;
+}
+
+/** Plate appearances from a statsapi hitting `stat` block. */
+function matchupPa(stat: any): number {
+  const pa = logNum(stat?.plateAppearances);
+  if (pa > 0) return pa;
+  return logNum(stat?.atBats) + logNum(stat?.baseOnBalls) + logNum(stat?.hitByPitch) + logNum(stat?.sacFlies);
+}
+
+/** Career batter-vs-pitcher totals (`stats=vsPlayer`, no season → career). */
+async function fetchBvpStats(
+  pairs: { batterId: number; pitcherId: number }[],
+  cached: BvpCache = {},
+): Promise<BvpCache> {
+  const out: BvpCache = {};
+  const seen = new Set<string>();
+  const unique = pairs.filter((p) => {
+    const key = `${p.batterId}|${p.pitcherId}`;
+    if (p.batterId <= 0 || p.pitcherId <= 0 || seen.has(key) || cached[key]) return false;
+    seen.add(key);
+    return true;
+  });
+  await mapLimit(unique, 20, async (p) => {
+    try {
+      const data = await fetchJson(
+        `${MLB_BASE}/api/v1/people/${p.batterId}/stats?stats=vsPlayer&opposingPlayerId=${p.pitcherId}&group=hitting`,
+      );
+      const stat = data?.stats?.[0]?.splits?.[0]?.stat;
+      const ops = matchupOps(stat);
+      const pa = matchupPa(stat);
+      if (typeof ops === "number" && pa > 0) {
+        out[`${p.batterId}|${p.pitcherId}`] = { pa, ops };
+      }
+    } catch {
+      // non-fatal
+    }
+  });
+  return out;
+}
+
+/** Season platoon splits (`stats=statSplits&sitCodes=vl,vr`). */
+async function fetchPlatoonSplits(
+  pairs: { id: number; season: string }[],
+  cached: PlatoonCache = {},
+): Promise<PlatoonCache> {
+  const out: PlatoonCache = {};
+  const seen = new Set<string>();
+  const unique = pairs.filter((p) => {
+    const key = `${p.id}|${p.season}`;
+    if (p.id <= 0 || seen.has(key) || cached[key]) return false;
+    seen.add(key);
+    return true;
+  });
+  await mapLimit(unique, 20, async (p) => {
+    try {
+      const data = await fetchJson(
+        `${MLB_BASE}/api/v1/people/${p.id}/stats?stats=statSplits&sitCodes=vl,vr&group=hitting&season=${p.season}`,
+      );
+      const entry: PlatoonCache[string] = {};
+      for (const s of data?.stats?.[0]?.splits ?? []) {
+        const code = s?.split?.sitCode ?? "";
+        const ops = matchupOps(s?.stat);
+        const pa = matchupPa(s?.stat);
+        if (typeof ops !== "number" || pa <= 0) continue;
+        const stat: MatchupStat = { pa, ops };
+        if (code === "vl") entry.vsLeft = stat;
+        else if (code === "vr") entry.vsRight = stat;
+      }
+      if (entry.vsLeft || entry.vsRight) out[`${p.id}|${p.season}`] = entry;
+    } catch {
+      // non-fatal
+    }
+  });
+  return out;
+}
+
+/** Season batter-vs-team totals (`stats=vsTeam`). */
+async function fetchVsTeamStats(
+  pairs: { batterId: number; teamId: number; season: string }[],
+  cached: VsTeamCache = {},
+): Promise<VsTeamCache> {
+  const out: VsTeamCache = {};
+  const seen = new Set<string>();
+  const unique = pairs.filter((p) => {
+    const key = `${p.batterId}|${p.teamId}|${p.season}`;
+    if (p.batterId <= 0 || p.teamId <= 0 || seen.has(key) || cached[key]) return false;
+    seen.add(key);
+    return true;
+  });
+  await mapLimit(unique, 20, async (p) => {
+    try {
+      const data = await fetchJson(
+        `${MLB_BASE}/api/v1/people/${p.batterId}/stats?stats=vsTeam&opposingTeamId=${p.teamId}&group=hitting&season=${p.season}`,
+      );
+      const stat = data?.stats?.[0]?.splits?.[0]?.stat;
+      const ops = matchupOps(stat);
+      const pa = matchupPa(stat);
+      if (typeof ops === "number" && pa > 0) {
+        out[`${p.batterId}|${p.teamId}|${p.season}`] = { pa, ops };
+      }
+    } catch {
+      // non-fatal
+    }
+  });
+  return out;
+}
+
+/** Throwing hand for starters the schedule hydrate didn't include. */
+async function fetchPitcherHands(ids: number[]): Promise<Record<number, "L" | "R">> {
+  const out: Record<number, "L" | "R"> = {};
+  const unique = [...new Set(ids)].filter((id) => id > 0);
+  await mapLimit(unique, 12, async (id) => {
+    try {
+      const data = await fetchJson(`${MLB_BASE}/api/v1/people/${id}`);
+      const person = data?.people?.[0];
+      const code = person?.pitchHand?.code ?? "";
+      const desc = person?.pitchHand?.description ?? "";
+      if (code === "L" || code === "R") out[id] = code;
+      else if (/^L/i.test(desc)) out[id] = "L";
+      else if (/^R/i.test(desc)) out[id] = "R";
+    } catch {
+      // non-fatal
+    }
+  });
+  return out;
+}
+
+/**
+ * Slot-weighted mean (slots 1-4 double) of a matchup stat across the starting
+ * 9, with PA saturation so tiny BvP samples can't dominate. Returns 0 when no
+ * batter in the order has data (the model reads 0 + lineupKnown = "no matchup
+ * data").
+ */
+function matchupLineupMean(
+  lineup: LineupPlayer[] | undefined,
+  key: "bvpOPS" | "platoonOPS" | "vsTeamOPS",
+  paKey?: "bvpPA",
+): number {
+  if (!lineup || lineup.length === 0) return 0;
+  let sum = 0;
+  let w = 0;
+  for (let i = 0; i < lineup.length; i++) {
+    const v = lineup[i][key];
+    if (typeof v !== "number") continue;
+    let weight = i < 4 ? 2 : 1;
+    if (paKey) {
+      const pa = lineup[i][paKey] ?? 0;
+      weight *= Math.min(1, pa / 20);
+    }
+    sum += v * weight;
+    w += weight;
+  }
+  return w > 0 ? round3(sum / w) : 0;
+}
+
+/** Total career PA in the BvP matchup across the starting 9 (display only). */
+function lineupMatchupPa(lineup: LineupPlayer[] | undefined): number {
+  if (!lineup) return 0;
+  return lineup.reduce((s, p) => s + (p.bvpPA ?? 0), 0);
+}
+
+/**
+ * Attach batter-vs-pitcher (career vsPlayer), platoon (vs the starter's
+ * handedness) and batter-vs-team splits to games that have a real boxscore
+ * lineup. BvP OPS is shrunk toward the batter's as-of season OPS (empirical-
+ * Bayes style) so a handful of plate appearances can't dominate; the lineup
+ * edge is the PA-saturated, slot-weighted mean over the starting 9.
+ */
+function attachMatchups(
+  games: RawGame[],
+  batterLogs: Record<string, HittingLogEntry[]>,
+  bvpCache: BvpCache,
+  platoonCache: PlatoonCache,
+  vsTeamCache: VsTeamCache,
+  pitcherHands: Record<number, "L" | "R">,
+): RawGame[] {
+  const SHRINK_PA = 15; // BvP PA count that pulls the blend halfway to season OPS
+  return games.map((g) => {
+    const lu = g.lineups;
+    if (!lu) return g;
+    const season = g.season ?? "";
+    const ymd = g.date;
+    const withMatchup =
+      (starter: PitcherInfo | undefined, opponentTeamId: number) =>
+      (side?: { battingOrder: LineupPlayer[]; bench: LineupPlayer[] }) => {
+        if (!side) return side;
+        const map = (p: LineupPlayer): LineupPlayer => {
+          const seasonOps = batterOpsAsOf(batterLogs[`${p.id}|${season}`], ymd);
+          const bvp = starter ? bvpCache[`${p.id}|${starter.id}`] : undefined;
+          let bvpOPS: number | undefined;
+          if (bvp && bvp.pa > 0) {
+            bvpOPS =
+              typeof seasonOps === "number"
+                ? (bvp.ops * bvp.pa + seasonOps * SHRINK_PA) / (bvp.pa + SHRINK_PA)
+                : bvp.ops;
+            bvpOPS = round3(bvpOPS);
+          }
+          const hand = starter?.pitchHand ?? pitcherHands[starter?.id ?? -1];
+          const platoon = platoonCache[`${p.id}|${season}`];
+          const platoonOps =
+            hand === "L" ? platoon?.vsLeft?.ops : hand === "R" ? platoon?.vsRight?.ops : undefined;
+          const vsTeam = vsTeamCache[`${p.id}|${opponentTeamId}|${season}`];
+          return {
+            ...p,
+            bvpOPS,
+            bvpPA: bvp?.pa,
+            platoonOPS: typeof platoonOps === "number" ? round3(platoonOps) : undefined,
+            vsTeamOPS: typeof vsTeam?.ops === "number" ? round3(vsTeam.ops) : undefined,
+          };
+        };
+        return {
+          battingOrder: side.battingOrder.map(map),
+          bench: side.bench.map(map),
+        };
+      };
+    const home = withMatchup(g.awayPitcher, g.away.id)(lu.home);
+    const away = withMatchup(g.homePitcher, g.home.id)(lu.away);
+    if (!g.lineupStats) return { ...g, lineups: { home, away } };
+    const extend = (
+      side: {
+        known: boolean;
+        ops: number;
+        woba: number;
+        iso: number;
+        recentOps: number;
+        bvpOps?: number;
+        bvpPA?: number;
+        platoonOps?: number;
+        vsTeamOps?: number;
+      },
+      batters: LineupPlayer[] | undefined,
+    ) => ({
+      ...side,
+      bvpOps: matchupLineupMean(batters, "bvpOPS", "bvpPA"),
+      bvpPA: lineupMatchupPa(batters),
+      platoonOps: matchupLineupMean(batters, "platoonOPS"),
+      vsTeamOps: matchupLineupMean(batters, "vsTeamOPS"),
+    });
+    return {
+      ...g,
+      lineups: { home, away },
+      lineupStats: {
+        home: extend(g.lineupStats.home, home?.battingOrder),
+        away: extend(g.lineupStats.away, away?.battingOrder),
+      },
+    };
+  });
+}
+
+/**
+ * Gather the matchup pairs implied by the window's real lineups, fetch the
+ * missing statsapi data (career BvP always refetched; current-season splits
+ * refetched, past-season totals reused from the cache) and attach everything.
+ */
+async function enrichWithMatchups(
+  games: RawGame[],
+  batterLogs: Record<string, HittingLogEntry[]>,
+  bvpCache: BvpCache,
+  platoonCache: PlatoonCache,
+  vsTeamCache: VsTeamCache,
+  season: string,
+): Promise<{
+  games: RawGame[];
+  bvpLogs: BvpCache;
+  platoonLogs: PlatoonCache;
+  vsTeamLogs: VsTeamCache;
+}> {
+  const bvpPairs: { batterId: number; pitcherId: number }[] = [];
+  const platoonPairs: { id: number; season: string }[] = [];
+  const vsTeamPairs: { batterId: number; teamId: number; season: string }[] = [];
+  const pitchersNeedingHand: number[] = [];
+  const seenBvp = new Set<string>();
+  const seenPlatoon = new Set<string>();
+  const seenVsTeam = new Set<string>();
+  const seenHand = new Set<number>();
+  for (const g of games) {
+    const lu = g.lineups;
+    if (!lu) continue;
+    const s = g.season ?? season;
+    const matchups: [LineupPlayer[] | undefined, PitcherInfo | undefined, number][] = [
+      [lu.home?.battingOrder, g.awayPitcher, g.away.id],
+      [lu.away?.battingOrder, g.homePitcher, g.home.id],
+    ];
+    for (const [batters, starter, oppTeamId] of matchups) {
+      if (!batters) continue;
+      for (const p of batters) {
+        if (starter?.id) {
+          const bKey = `${p.id}|${starter.id}`;
+          if (!seenBvp.has(bKey)) {
+            seenBvp.add(bKey);
+            bvpPairs.push({ batterId: p.id, pitcherId: starter.id });
+          }
+          if (!starter.pitchHand && !seenHand.has(starter.id)) {
+            seenHand.add(starter.id);
+            pitchersNeedingHand.push(starter.id);
+          }
+        }
+        const pKey = `${p.id}|${s}`;
+        if (!seenPlatoon.has(pKey)) {
+          seenPlatoon.add(pKey);
+          platoonPairs.push({ id: p.id, season: s });
+        }
+        const vKey = `${p.id}|${oppTeamId}|${s}`;
+        if (!seenVsTeam.has(vKey)) {
+          seenVsTeam.add(vKey);
+          vsTeamPairs.push({ batterId: p.id, teamId: oppTeamId, season: s });
+        }
+      }
+    }
+  }
+
+  // Career BvP is always refetched for the window so repeat matchups stay
+  // fresh; season splits refetch for the current season (they change daily)
+  // and reuse cached totals for past seasons (they are complete).
+  const newBvp = await fetchBvpStats(bvpPairs, {});
+  const bvpLogs: BvpCache = { ...bvpCache, ...newBvp };
+  const curPlatoon = platoonPairs.filter((p) => p.season === season);
+  const pastPlatoon = platoonPairs.filter((p) => p.season !== season);
+  const newPlatoon = await fetchPlatoonSplits(curPlatoon, {});
+  const reusedPlatoon = await fetchPlatoonSplits(pastPlatoon, platoonCache);
+  const platoonLogs: PlatoonCache = { ...platoonCache, ...reusedPlatoon, ...newPlatoon };
+  const curVsTeam = vsTeamPairs.filter((p) => p.season === season);
+  const pastVsTeam = vsTeamPairs.filter((p) => p.season !== season);
+  const newVsTeam = await fetchVsTeamStats(curVsTeam, {});
+  const reusedVsTeam = await fetchVsTeamStats(pastVsTeam, vsTeamCache);
+  const vsTeamLogs: VsTeamCache = { ...vsTeamCache, ...reusedVsTeam, ...newVsTeam };
+  const pitcherHands = await fetchPitcherHands(pitchersNeedingHand);
+
+  return {
+    games: attachMatchups(games, batterLogs, bvpLogs, platoonLogs, vsTeamLogs, pitcherHands),
+    bvpLogs,
+    platoonLogs,
+    vsTeamLogs,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -1907,7 +2297,25 @@ export const refreshModel = action({
       }
       const newBatterLogs = await fetchBatterGameLogs(batterIds, season, previousBatterLogs);
       const batterLogs: Record<string, HittingLogEntry[]> = { ...previousBatterLogs, ...newBatterLogs };
-      const enrichedWithLineups = attachLineupsAsOf(enriched, lineups, batterLogs);
+      const lineupsEnriched = attachLineupsAsOf(enriched, lineups, batterLogs);
+
+      // 6b. Batter-vs-pitcher matchups + platoon / vs-team splits for the fresh
+      //     window (real lineups + opposing starters only, like the lineup
+      //     features). Career BvP is always refetched; current-season splits
+      //     refetch, past-season totals reuse the cached values.
+      await report("Fetching matchups", 52, "Loading BvP & platoon splits…");
+      const matchup = await enrichWithMatchups(
+        lineupsEnriched,
+        batterLogs,
+        (previousState?.bvpLogs ?? {}) as BvpCache,
+        (previousState?.platoonLogs ?? {}) as PlatoonCache,
+        (previousState?.vsTeamLogs ?? {}) as VsTeamCache,
+        season,
+      );
+      const enrichedWithLineups = matchup.games;
+      const bvpLogs = matchup.bvpLogs;
+      const platoonLogs = matchup.platoonLogs;
+      const vsTeamLogs = matchup.vsTeamLogs;
 
       // 7. Pull as-of-time injured-list snapshots for every team that has played,
       //    then train, select features/model, calibrate, and decide on Monte Carlo.
@@ -2055,6 +2463,9 @@ export const refreshModel = action({
           pitcherLogs,
           teamLogs,
           batterLogs,
+          bvpLogs,
+          platoonLogs,
+          vsTeamLogs,
           injurySnapshots: Object.fromEntries(injurySnapshots),
           calibrationSummary,
           spearmanRho,
@@ -2171,7 +2582,18 @@ export const predictDate = action({
     }
     const newBatterLogs = await fetchBatterGameLogs(batterIds, season, storedBatterLogs);
     const batterLogs: Record<string, HittingLogEntry[]> = { ...storedBatterLogs, ...newBatterLogs };
-    const enrichedWithLineups = attachLineupsAsOf(enriched, lineups, batterLogs);
+    const lineupsEnriched = attachLineupsAsOf(enriched, lineups, batterLogs);
+
+    // BvP / platoon / vs-team splits for the selected date's real lineups.
+    const matchup = await enrichWithMatchups(
+      lineupsEnriched,
+      batterLogs,
+      (state.bvpLogs ?? {}) as BvpCache,
+      (state.platoonLogs ?? {}) as PlatoonCache,
+      (state.vsTeamLogs ?? {}) as VsTeamCache,
+      season,
+    );
+    const enrichedWithLineups = matchup.games;
 
     const marketOdds = await fetchMarketOdds();
     const emptyPitcherStats = new Map<string, PitcherSeasonStats>();

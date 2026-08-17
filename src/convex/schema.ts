@@ -33,6 +33,7 @@ const teamInfo = v.object({
 const pitcherInfo = v.object({
   id: v.number(),
   name: v.string(),
+  pitchHand: v.optional(v.union(v.literal("L"), v.literal("R"))), // throwing handedness (platoon features)
   era: v.optional(v.number()),
   k9: v.optional(v.number()),
   fip: v.optional(v.number()),
@@ -185,6 +186,9 @@ const schema = defineSchema(
       pitcherLogs: v.optional(v.any()), // cached as-of pitcher game logs (`id|season` → entries)
       teamLogs: v.optional(v.any()), // cached as-of team game logs (`id|season` → hitting/pitching/fielding)
       batterLogs: v.optional(v.any()), // cached as-of batter game logs (`id|season` → entries)
+      bvpLogs: v.optional(v.any()), // cached career BvP splits (`batterId|pitcherId` → { pa, ops })
+      platoonLogs: v.optional(v.any()), // cached season platoon splits (`batterId|season` → { vsLeft, vsRight })
+      vsTeamLogs: v.optional(v.any()), // cached season vs-team splits (`batterId|teamId|season` → { pa, ops })
       injurySnapshots: v.optional(v.any()),
       calibrationSummary: v.optional(v.any()),
       todaysRecord: v.any(),

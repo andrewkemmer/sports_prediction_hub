@@ -93,6 +93,9 @@ export interface ModelStateDoc {
   pitcherLogs?: Record<string, { d: string; ip: number; er: number; h: number; so: number; bb: number; hbp: number; hr: number }[]>;
   teamLogs?: Record<string, { hitting?: { d: string; ab: number; h: number; bb: number; ibb: number; hbp: number; sf: number; tb: number; "2b": number; "3b": number; hr: number }[]; pitching?: { d: string; ip: number; er: number; h: number; so: number; bb: number; hbp: number; hr: number }[]; fielding?: { d: string; po: number; a: number; e: number }[] }>;
   batterLogs?: Record<string, { d: string; ab: number; h: number; bb: number; ibb: number; hbp: number; sf: number; tb: number; "2b": number; "3b": number; hr: number }[]>;
+  bvpLogs?: Record<string, { pa: number; ops: number }>;
+  platoonLogs?: Record<string, { vsLeft?: { pa: number; ops: number }; vsRight?: { pa: number; ops: number } }>;
+  vsTeamLogs?: Record<string, { pa: number; ops: number }>;
   injurySnapshots?: Record<string, { date: string; count: number }[]>;
   calibrationSummary?: CalibrationSummary;
   spearmanRho?: number;

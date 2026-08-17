@@ -39,11 +39,28 @@ function lineupOpsText(lu: LineupData | undefined, side: "home" | "away"): strin
   return (weighted / w).toFixed(3);
 }
 
+/** Compact BvP / platoon / vs-team summary for a side, when matchup data exists. */
+function lineupMatchupText(
+  stats: GameDoc["lineupStats"] | undefined,
+  side: "home" | "away",
+): string | null {
+  const s = stats?.[side];
+  if (!s || typeof s.bvpOps !== "number") return null;
+  const parts: string[] = [];
+  parts.push(`BvP ${s.bvpOps.toFixed(3)}${s.bvpPA ? ` (${s.bvpPA} PA)` : ""}`);
+  if (typeof s.platoonOps === "number") parts.push(`Platoon ${s.platoonOps.toFixed(3)}`);
+  if (typeof s.vsTeamOps === "number") parts.push(`vs-team ${s.vsTeamOps.toFixed(3)}`);
+  return parts.join(" · ");
+}
+
 function LineupPanel({ game }: { game: GameDoc }) {
   const lu = game.lineups;
   if (!lu) return null;
   const hasData = (lu.home?.battingOrder.length ?? 0) > 0 || (lu.away?.battingOrder.length ?? 0) > 0;
   if (!hasData) return null;
+  const awayMatchup = lineupMatchupText(game.lineupStats, "away");
+  const homeMatchup = lineupMatchupText(game.lineupStats, "home");
+  const hasMatchups = awayMatchup !== null || homeMatchup !== null;
   return (
     <div className="border-t border-border/70 px-4 py-3">
       <div className="mb-2 flex items-center gap-1.5 text-xs font-medium text-muted-foreground">
@@ -56,6 +73,12 @@ function LineupPanel({ game }: { game: GameDoc }) {
           </span>
         )}
       </div>
+      {hasMatchups && (
+        <div className="-mt-1 mb-2 flex flex-wrap items-center gap-x-4 gap-y-0.5 text-[10px] tabular-nums text-muted-foreground/80">
+          {awayMatchup && <span>{game.away.abbrev}: {awayMatchup}</span>}
+          {homeMatchup && <span>{game.home.abbrev}: {homeMatchup}</span>}
+        </div>
+      )}
       <div className="grid grid-cols-2 gap-2">
         {(["home", "away"] as const).map((side) => {
           const data = lu[side];
