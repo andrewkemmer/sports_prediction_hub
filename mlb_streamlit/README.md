@@ -93,7 +93,8 @@ Any date the user picks in the Games tab is predicted on demand via
 ## Testing
 
 ```bash
-python3 mlb_streamlit/scripts/smoke_test.py
+python3 mlb_streamlit/scripts/smoke_test.py          # engine + data pipeline (114 checks)
+python3 mlb_streamlit/scripts/ui_render_test.py       # Streamlit UI panels with stubbed streamlit/plotly
 ```
 
 The smoke test exercises the whole engine — metrics, logistic fitting,
