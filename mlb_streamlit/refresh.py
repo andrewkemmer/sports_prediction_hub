@@ -463,23 +463,57 @@ def run_refresh(
 
     enriched = attach_team_season_stats(attach_pitcher_stats(all_games, pitcher_stats), team_cache)
 
-    # 5. Lineups (last 2 days + upcoming window) + player OPS.
-    rep("Fetching lineups", 46, "Loading actual starting lineups…")
-    lineup_games = [
-        g for g in enriched
-        if add_days(today, -2) <= g["date"] <= add_days(today, UPCOMING_WINDOW_DAYS)
-    ]
-    lineups = fetch_lineups_for_games(lineup_games, 16)
-    batter_ids = []
-    for lu in lineups.values():
+    # 5. Lineups (ALL games; incremental via disk cache) + per-season player OPS.
+    #    Historical lineups matter: lineupOpsDiff is a model feature, and it is
+    #    only non-zero when a game has lineup data. Lineups used to be fetched
+    #    for the recent window only, so training history saw a constant 0 and
+    #    the ML feature selection rightly dropped the feature. Fetching the
+    #    boxscore lineup for every completed game (it is final data, cached per
+    #    gamePk) gives the model a real batter-level signal to weigh.
+    rep("Fetching lineups", 46, "Loading starting lineups (historical + upcoming)…")
+    lineup_cache = cache.load_lineups()
+    to_fetch = [g for g in enriched if g["gamePk"] not in lineup_cache]
+    if to_fetch:
+        fetched = fetch_lineups_for_games(to_fetch, 16)
+        for g in to_fetch:
+            lu = fetched.get(g["gamePk"])
+            if lu:
+                lineup_cache[g["gamePk"]] = lu
+            elif g.get("winner") in ("home", "away"):
+                # Completed game with no posted lineups — final, never refetch.
+                lineup_cache[g["gamePk"]] = None
+        cached_count = sum(1 for v in lineup_cache.values() if v)
+        rep("Lineups loaded", 48, f"Cached lineups for {cached_count} games.")
+    lineups = {pk: lu for pk, lu in lineup_cache.items() if lu}
+
+    batter_ids_by_season: dict[str, set[int]] = {}
+    for g in enriched:
+        lu = lineups.get(g["gamePk"])
+        if not lu:
+            continue
+        s = g.get("season") or season
         for side in (lu.get("home"), lu.get("away")):
             if not side:
                 continue
             for p in side["battingOrder"] + side["bench"]:
-                batter_ids.append(p["id"])
-    player_ops = fetch_player_season_ops(batter_ids, season, player_ops_cache)
-    player_ops_cache.update({f"{pid}|{season}": ops for pid, ops in player_ops.items()})
-    enriched = attach_lineups(enriched, lineups, player_ops)
+                batter_ids_by_season.setdefault(s, set()).add(p["id"])
+
+    # Batter OPS must come from the game's own season (2024 games get 2024
+    # stats), otherwise a batter's 2026 numbers would leak into 2024 rows.
+    season_ops: dict[str, dict] = {}
+    for s, ids in batter_ids_by_season.items():
+        ops = fetch_player_season_ops(sorted(ids), s, player_ops_cache)
+        player_ops_cache.update({f"{pid}|{s}": ops for pid, ops in ops.items()})
+        season_ops[s] = ops
+
+    if season_ops:
+        reattached = []
+        for s, ops in season_ops.items():
+            group = [g for g in enriched if (g.get("season") or season) == s]
+            reattached.extend(attach_lineups(group, lineups, ops))
+        enriched = reattached
+    else:
+        enriched = attach_lineups(enriched, lineups, {})
 
     # 6. Injury snapshots (current season; only new dates) + current-day counts.
     rep("Fetching injury data", 54, "Loading injured-list snapshots…")
@@ -637,6 +671,7 @@ def run_refresh(
     cache.save_pitcher_stats(pitcher_cache)
     cache.save_team_stats(team_cache)
     cache.save_player_ops(player_ops_cache)
+    cache.save_lineups(lineup_cache)
     cache.save_injury_snapshots(injury_cache)
 
     # 12. Update the games-by-date doc cache for the fresh window.

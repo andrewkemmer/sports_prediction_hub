@@ -33,10 +33,12 @@ ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(ROOT))
 
 from mlb_streamlit import cache  # noqa: E402
+from mlb_streamlit.data import attach_lineups, lineup_ops  # noqa: E402
 from mlb_streamlit.engine.features import (  # noqa: E402
     FEATURE_KEYS,
     build_features_for_game,
     compute_elo_and_features,
+    new_state,
 )
 from mlb_streamlit.engine.logistic import (  # noqa: E402
     build_stacking_weights,
@@ -257,6 +259,55 @@ def test_features_and_elo() -> None:
     feats = build_features_for_game(upcoming, fe["teamState"])
     check("upcoming features built", all(f in feats for f in FEATURE_KEYS))
     check("home field present", feats["homeField"] == 1.0)
+
+
+def test_lineups() -> None:
+    print("lineups")
+    # lineup_ops: batting-order slots 1-4 carry 2x weight.
+    lu = [
+        {"ops": 0.800}, {"ops": 0.750}, {"ops": 0.700}, {"ops": 0.650},
+        {"ops": 0.600}, {"ops": 0.550}, {"ops": 0.500}, {"ops": 0.450}, {"ops": 0.400},
+    ]
+    expected = (2 * (0.800 + 0.750 + 0.700 + 0.650) + (0.600 + 0.550 + 0.500 + 0.450 + 0.400)) / (2 * 4 + 5)
+    got = lineup_ops(lu)
+    check("lineup_ops top-4 double-weighted", abs(got - expected) < 1e-9, f"{got} vs {expected}")
+    check("lineup_ops empty = 0", lineup_ops([]) == 0.0)
+    check("lineup_ops skips missing ops", lineup_ops([{"ops": 0.800}, {}]) == 0.8)
+
+    # Per-season attach: a batter's OPS must come from the game's own season,
+    # otherwise 2026 numbers would leak into 2024 training rows.
+    lineup = {
+        "home": {"battingOrder": [{"id": 1, "name": "A"}, {"id": 2, "name": "B"}], "bench": []},
+        "away": {"battingOrder": [{"id": 3, "name": "C"}, {"id": 4, "name": "D"}], "bench": []},
+    }
+    g24 = {"gamePk": 1, "date": "2024-06-01", "season": "2024",
+           "home": {"id": 119, "name": "Dodgers", "abbrev": "LAD"},
+           "away": {"id": 108, "name": "Angels", "abbrev": "LAA"}}
+    g26 = {"gamePk": 2, "date": "2026-06-01", "season": "2026",
+           "home": {"id": 119, "name": "Dodgers", "abbrev": "LAD"},
+           "away": {"id": 108, "name": "Angels", "abbrev": "LAA"}}
+    ops24 = {1: 0.720, 2: 0.680, 3: 0.700, 4: 0.640}
+    ops26 = {1: 0.910, 2: 0.870, 3: 0.850, 4: 0.820}
+    st = new_state()
+    f24 = build_features_for_game(attach_lineups([g24], {1: lineup}, ops24)[0], st)
+    f26 = build_features_for_game(attach_lineups([g26], {2: lineup}, ops26)[0], st)
+    check("lineupKnown=1 with lineups", f24["lineupKnown"] == 1 and f26["lineupKnown"] == 1)
+    check("lineupOpsDiff non-zero", f24["lineupOpsDiff"] > 0 and f26["lineupOpsDiff"] > 0)
+    check("per-season OPS respected", f26["lineupOpsDiff"] > f24["lineupOpsDiff"],
+          f"2024={f24['lineupOpsDiff']:.4f} 2026={f26['lineupOpsDiff']:.4f}")
+    f_none = build_features_for_game(g24, st)
+    check("no lineup -> feature 0", f_none["lineupOpsDiff"] == 0.0 and f_none["lineupKnown"] == 0)
+
+    # Lineups cache round-trip preserves None (completed games with no boxscore lineups).
+    marker = "_smoke_lineups.json"
+    try:
+        cache.save_json(marker, {"1": None, "2": lineup})
+        data = cache.load_json(marker)
+        check("lineups cache keeps None entries", data == {"1": None, "2": lineup}, f"{data}")
+    finally:
+        p = cache._path(marker)
+        if p.exists():
+            os.remove(p)
 
 
 def test_runs_model() -> None:
@@ -511,6 +562,7 @@ def main() -> int:
     test_metrics()
     test_logistic()
     test_features_and_elo()
+    test_lineups()
     test_runs_model()
     test_data_layer()
     test_market_odds()

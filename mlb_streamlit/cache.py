@@ -19,6 +19,7 @@ _CALIBRATION = "calibration_rows.json"
 _PITCHER_STATS = "pitcher_stats.json"
 _TEAM_STATS = "team_stats.json"
 _PLAYER_OPS = "player_ops.json"
+_LINEUPS = "lineups.json"
 _INJURIES = "injury_snapshots.json"
 _DOCS_BY_DATE = "docs_by_date.json"
 _MARKET_ODDS = "market_odds.json"
@@ -101,6 +102,15 @@ def load_player_ops() -> dict:
 
 def save_player_ops(stats: dict) -> None:
     save_json(_PLAYER_OPS, stats)
+
+
+def load_lineups() -> dict:
+    """{gamePk} -> parsed lineup, or None for completed games with no posted lineups."""
+    return load_json(_LINEUPS, {}) or {}
+
+
+def save_lineups(lineups: dict) -> None:
+    save_json(_LINEUPS, lineups)
 
 
 def load_injury_snapshots() -> dict:
