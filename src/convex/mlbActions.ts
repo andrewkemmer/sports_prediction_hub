@@ -19,6 +19,7 @@ import { expectedMargin, expectedTotal, RunModel, simulateRuns } from "./ml/runs
 import { teamMeta } from "./ml/teams";
 import {
   CalibrationSummary,
+  TeamInfo,
   FeatureRow,
   GameDoc,
   GameWeather,
@@ -103,12 +104,6 @@ function dateRanges(start: string, end: string, chunkDays: number): { start: str
     cur = new Date(next.getTime() + 86400000);
   }
   return ranges;
-}
-
-/** True if `g.date` falls within the last N days of `today`. */
-function isWithinRecentWind(g: RawGame, today: string, days: number): boolean {
-  const start = addDays(today, -days);
-  return g.date >= start && g.date <= today;
 }
 
 async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
@@ -261,24 +256,6 @@ async function fetchAllSeasons(
   return all.sort((a, b) => (a.gameDate < b.gameDate ? -1 : 1));
 }
 
-// ---------------------------------------------------------------------------
-// Pitcher stats (season ERA / K/9) — display + matchup context
-// ---------------------------------------------------------------------------
-
-interface PitcherSeasonStats {
-  era?: number;
-  k9?: number;
-  fip?: number;
-}
-
-function statNumber(value: unknown): number | undefined {
-  if (typeof value === "string") {
-    const n = parseFloat(value);
-    return Number.isFinite(n) ? n : undefined;
-  }
-  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
-}
-
 /** "187.2" → 187.666… (baseball innings convention: .1 = ⅓, .2 = ⅔). */
 function inningsPitchedValue(ip: unknown): number {
   if (typeof ip === "number") return ip;
@@ -292,111 +269,428 @@ function inningsPitchedValue(ip: unknown): number {
 /** FIP constant keeps values ERA-like; it cancels out in the feature delta. */
 const FIP_CONSTANT = 3.1;
 
-async function fetchPitcherStats(
-  pairs: { id: number; season: string }[]): Promise<Map<string, PitcherSeasonStats>> {
-  const out = new Map<string, PitcherSeasonStats>();
+// ---------------------------------------------------------------------------
+// As-of-date game-log stats (pitcher / team / batter) — no lookahead
+//
+// The season-total endpoints leak information from AFTER a game's date into
+// that game's features (a July game would see August stats). For honest
+// training the pipeline accumulates each entity's per-game game log strictly
+// BEFORE the target game's date. Logs are cached on the model state, so any
+// as-of date is a cheap local sum and refreshes only fetch missing seasons.
+// ---------------------------------------------------------------------------
+
+interface PitcherLogEntry {
+  d: string; // game date YYYY-MM-DD
+  ip: number;
+  er: number;
+  h: number;
+  so: number;
+  bb: number;
+  hbp: number;
+  hr: number;
+}
+
+interface HittingLogEntry {
+  d: string;
+  ab: number;
+  h: number;
+  bb: number;
+  ibb: number;
+  hbp: number;
+  sf: number;
+  tb: number;
+  "2b": number;
+  "3b": number;
+  hr: number;
+}
+
+interface FieldingLogEntry {
+  d: string;
+  po: number;
+  a: number;
+  e: number;
+}
+
+interface TeamGameLog {
+  hitting?: HittingLogEntry[];
+  pitching?: PitcherLogEntry[];
+  fielding?: FieldingLogEntry[];
+}
+
+function round2(n: number): number {
+  return Math.round(n * 100) / 100;
+}
+
+function round3(n: number): number {
+  return Math.round(n * 1000) / 1000;
+}
+
+function logNum(value: unknown): number {
+  if (typeof value === "string") {
+    const n = parseFloat(value);
+    return Number.isFinite(n) ? n : 0;
+  }
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
+function compactPitcherEntry(split: any): PitcherLogEntry | null {
+  const st = split?.stat ?? {};
+  const ip = inningsPitchedValue(st.inningsPitched);
+  if (ip <= 0) return null;
+  return {
+    d: split?.date ?? "",
+    ip: Math.round(ip * 1000) / 1000,
+    er: logNum(st.earnedRuns),
+    h: logNum(st.hits),
+    so: logNum(st.strikeOuts),
+    bb: logNum(st.baseOnBalls),
+    hbp: logNum(st.hitByPitch),
+    hr: logNum(st.homeRuns),
+  };
+}
+
+function compactHittingEntry(split: any): HittingLogEntry | null {
+  const st = split?.stat ?? {};
+  return {
+    d: split?.date ?? "",
+    ab: logNum(st.atBats),
+    h: logNum(st.hits),
+    bb: logNum(st.baseOnBalls),
+    ibb: logNum(st.intentionalWalks),
+    hbp: logNum(st.hitByPitch),
+    sf: logNum(st.sacFlies),
+    tb: logNum(st.totalBases),
+    "2b": logNum(st.doubles),
+    "3b": logNum(st.triples),
+    hr: logNum(st.homeRuns),
+  };
+}
+
+function compactFieldingEntry(split: any): FieldingLogEntry | null {
+  const st = split?.stat ?? {};
+  return {
+    d: split?.date ?? "",
+    po: logNum(st.putOuts),
+    a: logNum(st.assists),
+    e: logNum(st.errors),
+  };
+}
+
+/** Fetch per-game pitching logs for `{id|season}` pairs, reusing the cache. */
+async function fetchPitcherGameLogs(
+  pairs: { id: number; season: string }[],
+  cached: Record<string, PitcherLogEntry[]> = {},
+): Promise<Record<string, PitcherLogEntry[]>> {
+  const out: Record<string, PitcherLogEntry[]> = {};
   const seen = new Set<string>();
   const unique = pairs.filter((p) => {
     const key = `${p.id}|${p.season}`;
-    if (p.id <= 0 || seen.has(key)) return false;
+    if (p.id <= 0 || seen.has(key) || cached[key]) return false;
     seen.add(key);
     return true;
   });
   await mapLimit(unique, 16, async (p) => {
     try {
       const data = await fetchJson(
-        `${MLB_BASE}/api/v1/people/${p.id}/stats?stats=season&group=pitching&season=${p.season}`);
-      const stat = data?.stats?.[0]?.splits?.[0]?.stat;
-      if (stat) {
-        const era = statNumber(stat.era);
-        const k9 = statNumber(stat.strikeoutsPer9Inn);
-        const hr = statNumber(stat.homeRuns) ?? 0;
-        const bb = statNumber(stat.baseOnBalls) ?? 0;
-        const hbp = statNumber(stat.hitByPitch) ?? 0;
-        const so = statNumber(stat.strikeOuts) ?? 0;
-        const ip = inningsPitchedValue(stat.inningsPitched);
-        const fip = ip > 0 ? (13 * hr + 3 * (bb + hbp) - 2 * so) / ip + FIP_CONSTANT : undefined;
-        out.set(`${p.id}|${p.season}`, {
-          era,
-          k9,
-          fip: fip === undefined ? undefined : Math.round(fip * 100) / 100,
-        });
-      }
+        `${MLB_BASE}/api/v1/people/${p.id}/stats?stats=gameLog&group=pitching&season=${p.season}&gameType=R`,
+      );
+      const splits = data?.stats?.[0]?.splits ?? [];
+      const entries = splits
+        .map((s: any) => compactPitcherEntry(s))
+        .filter((e: PitcherLogEntry | null): e is PitcherLogEntry => !!e && !!e.d);
+      entries.sort((a: PitcherLogEntry, b: PitcherLogEntry) => (a.d < b.d ? -1 : 1));
+      if (entries.length > 0) out[`${p.id}|${p.season}`] = entries;
     } catch {
-      // ignore individual pitcher stat failures
+      // individual log failures are non-fatal
     }
   });
   return out;
 }
 
-/** Attach ERA/K9/FIP to each game's probable pitchers in place (new array). */
-function attachPitcherStats(
-  games: RawGame[],
-  stats: Map<string, PitcherSeasonStats>): RawGame[] {
-  return games.map((g) => ({
-    ...g,
-    awayPitcher: g.awayPitcher
-      ? { ...g.awayPitcher, ...(stats.get(`${g.awayPitcher.id}|${g.season}`) ?? {}) }
-      : undefined,
-    homePitcher: g.homePitcher
-      ? { ...g.homePitcher, ...(stats.get(`${g.homePitcher.id}|${g.season}`) ?? {}) }
-      : undefined,
-  }));
-}
-
-// ---------------------------------------------------------------------------
-// Team season stats (OPS / ERA / fielding%) — statsapi-only features
-// ---------------------------------------------------------------------------
-
-interface TeamSeasonStats {
-  ops?: number;
-  era?: number;
-  fieldingPct?: number;
-}
-
-async function fetchTeamSeasonStats(
-  pairs: { id: number; season: string }[]): Promise<Map<string, TeamSeasonStats>> {
-  const out = new Map<string, TeamSeasonStats>();
+/** Fetch per-game team logs (hitting / pitching / fielding), reusing the cache. */
+async function fetchTeamGameLogs(
+  pairs: { id: number; season: string }[],
+  cached: Record<string, TeamGameLog> = {},
+): Promise<Record<string, TeamGameLog>> {
+  const out: Record<string, TeamGameLog> = {};
   const seen = new Set<string>();
   const unique = pairs.filter((p) => {
     const key = `${p.id}|${p.season}`;
-    if (p.id <= 0 || seen.has(key)) return false;
+    if (p.id <= 0 || seen.has(key) || cached[key]) return false;
     seen.add(key);
     return true;
   });
   await mapLimit(unique, 16, async (p) => {
     try {
       const data = await fetchJson(
-        `${MLB_BASE}/api/v1/teams/${p.id}/stats?stats=season&group=hitting,pitching,fielding&season=${p.season}`);
-      const stats = (data?.stats ?? []) as any[];
-      const result: TeamSeasonStats = {};
-      for (const block of stats) {
-        const group = block?.group?.displayName;
-        const stat = block?.splits?.[0]?.stat;
-        if (!stat) continue;
-        if (group === "hitting") result.ops = statNumber(stat.ops);
-        else if (group === "pitching") result.era = statNumber(stat.era);
-        else if (group === "fielding") result.fieldingPct = statNumber(stat.fielding);
+        `${MLB_BASE}/api/v1/teams/${p.id}/stats?stats=gameLog&group=hitting,pitching,fielding&season=${p.season}&gameType=R`,
+      );
+      const result: TeamGameLog = {};
+      for (const block of data?.stats ?? []) {
+        const group = block?.group?.displayName ?? "";
+        const splits = block?.splits ?? [];
+        if (group === "hitting") {
+          result.hitting = splits
+            .map((s: any) => compactHittingEntry(s))
+            .filter((e: HittingLogEntry | null): e is HittingLogEntry => !!e && !!e.d);
+        } else if (group === "pitching") {
+          result.pitching = splits
+            .map((s: any) => compactPitcherEntry(s))
+            .filter((e: PitcherLogEntry | null): e is PitcherLogEntry => !!e && !!e.d);
+        } else if (group === "fielding") {
+          result.fielding = splits
+            .map((s: any) => compactFieldingEntry(s))
+            .filter((e: FieldingLogEntry | null): e is FieldingLogEntry => !!e && !!e.d);
+        }
       }
-      if (Object.keys(result).length > 0) out.set(`${p.id}|${p.season}`, result);
+      if (Object.keys(result).length > 0) out[`${p.id}|${p.season}`] = result;
     } catch {
-      // ignore individual team stat failures
+      // non-fatal
     }
   });
   return out;
 }
 
-/** Attach season team OPS / ERA / fielding% to each game's two teams. */
-function attachTeamSeasonStats(
+/** Fetch per-game batting logs for batters in a season, reusing the cache. */
+async function fetchBatterGameLogs(
+  ids: number[],
+  season: string,
+  cached: Record<string, HittingLogEntry[]> = {},
+): Promise<Record<string, HittingLogEntry[]>> {
+  const out: Record<string, HittingLogEntry[]> = {};
+  const unique = [...new Set(ids)].filter((id) => id > 0 && !cached[`${id}|${season}`]);
+  await mapLimit(unique, 24, async (id) => {
+    try {
+      const data = await fetchJson(
+        `${MLB_BASE}/api/v1/people/${id}/stats?stats=gameLog&group=hitting&season=${season}&gameType=R`,
+      );
+      const splits = data?.stats?.[0]?.splits ?? [];
+      const entries = splits
+        .map((s: any) => compactHittingEntry(s))
+        .filter((e: HittingLogEntry | null): e is HittingLogEntry => !!e && !!e.d);
+      entries.sort((a: HittingLogEntry, b: HittingLogEntry) => (a.d < b.d ? -1 : 1));
+      if (entries.length > 0) out[`${id}|${season}`] = entries;
+    } catch {
+      // non-fatal
+    }
+  });
+  return out;
+}
+
+/**
+ * Season ERA / K9 / FIP / WHIP + recent-form ERA, strictly before `ymd`.
+ * `recentEra` covers the pitcher's last `recentStarts` starts (hot/cold
+ * starter signal).
+ */
+function pitcherAsOf(entries: PitcherLogEntry[] | undefined, ymd: string, recentStarts = 3): Partial<PitcherInfo> {
+  if (!entries || entries.length === 0) return {};
+  let ip = 0;
+  let er = 0;
+  let so = 0;
+  let bb = 0;
+  let hbp = 0;
+  let hr = 0;
+  let h = 0;
+  const recent: PitcherLogEntry[] = [];
+  for (const e of entries) {
+    if (e.d >= ymd) break;
+    ip += e.ip;
+    er += e.er;
+    so += e.so;
+    bb += e.bb;
+    hbp += e.hbp;
+    hr += e.hr;
+    h += e.h;
+    recent.push(e);
+    if (recent.length > recentStarts) recent.shift();
+  }
+  if (ip <= 0) return {};
+  const out: Partial<PitcherInfo> = {
+    era: round2((er * 9) / ip),
+    k9: round2((so * 9) / ip),
+    fip: round2((13 * hr + 3 * (bb + hbp) - 2 * so) / ip + FIP_CONSTANT),
+    whip: round2((bb + h) / ip),
+  };
+  const rIp = recent.reduce((s, e) => s + e.ip, 0);
+  const rEr = recent.reduce((s, e) => s + e.er, 0);
+  if (rIp > 0) out.recentEra = round2((rEr * 9) / rIp);
+  return out;
+}
+
+function opsFromHitting(ab: number, h: number, bb: number, hbp: number, sf: number, tb: number): number | undefined {
+  if (ab + bb + hbp + sf <= 0) return undefined;
+  const obp = (h + bb + hbp) / (ab + bb + hbp + sf);
+  const slg = ab > 0 ? tb / ab : 0;
+  return obp + slg;
+}
+
+// FanGraphs-style wOBA weights (2019+ scale). Higher is better for hitters.
+const WOBA_UBB = 0.69;
+const WOBA_HBP = 0.72;
+const WOBA_1B = 0.89;
+const WOBA_2B = 1.27;
+const WOBA_3B = 1.62;
+const WOBA_HR = 2.1;
+
+interface HittingTotals {
+  ab: number;
+  h: number;
+  bb: number;
+  ibb: number;
+  hbp: number;
+  sf: number;
+  tb: number;
+  "2b": number;
+  "3b": number;
+  hr: number;
+}
+
+function wobaFromHitting(t: HittingTotals): number | undefined {
+  const ubb = Math.max(0, t.bb - t.ibb);
+  const den = t.ab + ubb + t.sf + t.hbp;
+  if (den <= 0) return undefined;
+  const singles = Math.max(0, t.h - t["2b"] - t["3b"] - t.hr);
+  const num =
+    WOBA_UBB * ubb +
+    WOBA_HBP * t.hbp +
+    WOBA_1B * singles +
+    WOBA_2B * t["2b"] +
+    WOBA_3B * t["3b"] +
+    WOBA_HR * t.hr;
+  return num / den;
+}
+
+function isoFromHitting(h: number, tb: number, ab: number): number | undefined {
+  if (ab <= 0) return undefined;
+  return (tb - h) / ab;
+}
+
+function hittingTotalsAsOf(entries: HittingLogEntry[] | undefined, ymd: string): HittingTotals {
+  const t: HittingTotals = { ab: 0, h: 0, bb: 0, ibb: 0, hbp: 0, sf: 0, tb: 0, "2b": 0, "3b": 0, hr: 0 };
+  for (const e of entries ?? []) {
+    if (e.d >= ymd) break;
+    t.ab += e.ab;
+    t.h += e.h;
+    t.bb += e.bb;
+    t.ibb += e.ibb;
+    t.hbp += e.hbp;
+    t.sf += e.sf;
+    t.tb += e.tb;
+    t["2b"] += e["2b"];
+    t["3b"] += e["3b"];
+    t.hr += e.hr;
+  }
+  return t;
+}
+
+/** Batter season OPS accumulated strictly before `ymd`; undefined with no prior games. */
+function batterOpsAsOf(entries: HittingLogEntry[] | undefined, ymd: string): number | undefined {
+  const t = hittingTotalsAsOf(entries, ymd);
+  const v = opsFromHitting(t.ab, t.h, t.bb, t.hbp, t.sf, t.tb);
+  return v === undefined ? undefined : round3(v);
+}
+
+/** Batter wOBA accumulated strictly before `ymd`; undefined with no prior games. */
+function batterWobaAsOf(entries: HittingLogEntry[] | undefined, ymd: string): number | undefined {
+  const v = wobaFromHitting(hittingTotalsAsOf(entries, ymd));
+  return v === undefined ? undefined : round3(v);
+}
+
+/** Batter isolated power accumulated strictly before `ymd`; undefined with no prior games. */
+function batterIsoAsOf(entries: HittingLogEntry[] | undefined, ymd: string): number | undefined {
+  const t = hittingTotalsAsOf(entries, ymd);
+  const v = isoFromHitting(t.h, t.tb, t.ab);
+  return v === undefined ? undefined : round3(v);
+}
+
+/** OPS over the batter's last `window` games before `ymd` (hot-streak signal). */
+function batterRecentOpsAsOf(entries: HittingLogEntry[] | undefined, ymd: string, window = 10): number | undefined {
+  if (!entries || entries.length === 0) return undefined;
+  const recent = entries.filter((e) => e.d < ymd).slice(-window);
+  if (recent.length === 0) return undefined;
+  const t = hittingTotalsAsOf(recent, "9999-12-31");
+  const v = opsFromHitting(t.ab, t.h, t.bb, t.hbp, t.sf, t.tb);
+  return v === undefined ? undefined : round3(v);
+}
+
+/**
+ * Team OPS / staff ERA / K9 / WHIP / fielding pct accumulated strictly before
+ * `ymd` (no lookahead).
+ */
+function teamAsOf(log: TeamGameLog | undefined, ymd: string): Partial<TeamInfo> {
+  if (!log) return {};
+  const out: Partial<TeamInfo> = {};
+
+  let ab = 0;
+  let h = 0;
+  let bb = 0;
+  let hbp = 0;
+  let sf = 0;
+  let tb = 0;
+  for (const e of log.hitting ?? []) {
+    if (e.d >= ymd) break;
+    ab += e.ab;
+    h += e.h;
+    bb += e.bb;
+    hbp += e.hbp;
+    sf += e.sf;
+    tb += e.tb;
+  }
+  const ops = opsFromHitting(ab, h, bb, hbp, sf, tb);
+  if (ops !== undefined) out.ops = round3(ops);
+
+  let ip = 0;
+  let er = 0;
+  let so = 0;
+  let pbb = 0;
+  let ph = 0;
+  for (const e of log.pitching ?? []) {
+    if (e.d >= ymd) break;
+    ip += e.ip;
+    er += e.er;
+    so += e.so;
+    pbb += e.bb;
+    ph += e.h;
+  }
+  if (ip > 0) {
+    out.era = round2((er * 9) / ip);
+    out.k9 = round2((so * 9) / ip);
+    out.whip = round2((pbb + ph) / ip);
+  }
+
+  let po = 0;
+  let a = 0;
+  let err = 0;
+  for (const e of log.fielding ?? []) {
+    if (e.d >= ymd) break;
+    po += e.po;
+    a += e.a;
+    err += e.e;
+  }
+  const chances = po + a + err;
+  if (chances > 0) out.fieldingPct = round3((po + a) / chances);
+  return out;
+}
+
+/** Attach per-game as-of-date pitcher + team stats (no lookahead). */
+function attachAsOfStats(
   games: RawGame[],
-  stats: Record<string, TeamSeasonStats>): RawGame[] {
+  pitcherLogs: Record<string, PitcherLogEntry[]>,
+  teamLogs: Record<string, TeamGameLog>,
+): RawGame[] {
   return games.map((g) => {
-    const homeStats = stats[`${g.home.id}|${g.season}`];
-    const awayStats = stats[`${g.away.id}|${g.season}`];
+    const season = g.season ?? "";
+    const ymd = g.date;
+    const withPitcher = (p?: PitcherInfo): PitcherInfo | undefined => {
+      if (!p) return p;
+      return { ...p, ...pitcherAsOf(pitcherLogs[`${p.id}|${season}`], ymd) };
+    };
     return {
       ...g,
-      home: { ...g.home, ...(homeStats ?? {}) },
-      away: { ...g.away, ...(awayStats ?? {}) },
+      awayPitcher: withPitcher(g.awayPitcher),
+      homePitcher: withPitcher(g.homePitcher),
+      home: { ...g.home, ...teamAsOf(teamLogs[`${g.home.id}|${season}`], ymd) },
+      away: { ...g.away, ...teamAsOf(teamLogs[`${g.away.id}|${season}`], ymd) },
     };
   });
 }
@@ -672,21 +966,25 @@ async function fetchCurrentInjurySnapshot(
  * team state from the last week of new results and re-predict the upcoming
  * window. Skips loadStoredGames, full schedule history, retraining, and
  * bulk injury history fetches — the action completes in seconds, not
- * minutes. The model weights stay frozen as of the last retrain.
+ * minutes. The model weights stay frozen as of the last retrain. Pitcher /
+ * team / batter stats come from the cached as-of game logs (only missing
+ * logs are fetched), so every feature stays strictly no-lookahead.
  */
 async function fastRefresh(
   ctx: any,
   previous: any,
   season: string,
   today: string,
-  report: (stage: string, pct: number, message: string, extra?: { done?: boolean; error?: string }) => Promise<void>): Promise<void> {
+  report: (stage: string, pct: number, message: string, extra?: { done?: boolean; error?: string }) => Promise<void>,
+): Promise<void> {
   await report("Reading previous model", 6, "Reusing the trained model…");
   const model = reconstructModel(previous);
   const runModelState = previous.runModel as RunModel | undefined;
   const runLineIso = (previous.runLineCalibration ?? []) as { x: number; y: number }[];
   const runMarginCal = (previous.runMarginCalibration ?? { slope: 0, intercept: 0 }) as RunMarginCalibration;
-  const previousTeamStats = (previous.teamSeasonStats ?? {}) as Record<string, TeamSeasonStats>;
-  const previousPlayerOps = (previous.playerOps ?? {}) as Record<string, number>;
+  const pitcherLogs = (previous.pitcherLogs ?? {}) as Record<string, PitcherLogEntry[]>;
+  const teamLogs = (previous.teamLogs ?? {}) as Record<string, TeamGameLog>;
+  const batterLogs = (previous.batterLogs ?? {}) as Record<string, HittingLogEntry[]>;
 
   await report("Fetching fresh games", 18, "Loading the last week + upcoming schedule…");
   const freshRaw = await fetchScheduleRange(
@@ -699,7 +997,7 @@ async function fastRefresh(
     return;
   }
 
-  await report("Pitcher stats", 28, "Loading ERA / K9 for fresh window starters…");
+  await report("Pitcher logs", 28, "Loading as-of stats for fresh window starters…");
   const freshPitcherPairs: { id: number; season: string }[] = [];
   const seenPitcher = new Set<string>();
   for (const g of freshRaw) {
@@ -714,9 +1012,10 @@ async function fastRefresh(
       }
     }
   }
-  const freshPitcherStats = await fetchPitcherStats(freshPitcherPairs);
+  const newPitcherLogs = await fetchPitcherGameLogs(freshPitcherPairs, pitcherLogs);
+  const pitcherLogsCache: Record<string, PitcherLogEntry[]> = { ...pitcherLogs, ...newPitcherLogs };
 
-  await report("Team stats", 40, "Refreshing current-season team batting / pitching stats…");
+  await report("Team logs", 40, "Refreshing as-of team game logs…");
   const teamSeasonPairs = new Map<string, { id: number; season: string }>();
   for (const g of freshRaw) {
     const s = g.season ?? season;
@@ -728,13 +1027,10 @@ async function fastRefresh(
   const teamStatsToFetch = [...teamSeasonPairs.values()].filter((p) => {
     const key = `${p.id}|${p.season}`;
     if (p.season === season) return true;
-    return previousTeamStats[key] === undefined;
+    return teamLogs[key] === undefined;
   });
-  const freshTeamStats = await fetchTeamSeasonStats(teamStatsToFetch);
-  const teamSeasonStats: Record<string, TeamSeasonStats> = {
-    ...previousTeamStats,
-    ...Object.fromEntries(freshTeamStats),
-  };
+  const newTeamLogs = await fetchTeamGameLogs(teamStatsToFetch, teamLogs);
+  const teamLogsCache: Record<string, TeamGameLog> = { ...teamLogs, ...newTeamLogs };
 
   await report("Updating team state", 48, "Applying Elo + records from new results…");
   const teamState = reconstructTeamState((previous.powerRankings ?? []) as PowerRanking[]);
@@ -755,11 +1051,8 @@ async function fastRefresh(
       for (const p of [...side.battingOrder, ...side.bench]) batterIds.push(p.id);
     }
   }
-  const playerOps = await fetchPlayerSeasonOps(batterIds, season, previousPlayerOps);
-  const playerOpsCache: Record<string, number> = {
-    ...previousPlayerOps,
-    ...Object.fromEntries([...playerOps].map(([id, ops]) => [`${id}|${season}`, ops])),
-  };
+  const newBatterLogs = await fetchBatterGameLogs(batterIds, season, batterLogs);
+  const batterLogsCache: Record<string, HittingLogEntry[]> = { ...batterLogs, ...newBatterLogs };
 
   await report("Loading injuries", 68, "Loading current IL snapshot…");
   const teamIds = [...new Set(freshRaw.flatMap((g) => [g.home.id, g.away.id]))];
@@ -767,13 +1060,14 @@ async function fastRefresh(
   for (const [id, count] of currentInjury) teamState.injuries[id] = count;
 
   await report("Predicting upcoming", 78, "Scoring the upcoming schedule…");
-  const enriched = attachTeamSeasonStats(attachPitcherStats(freshRaw, freshPitcherStats), teamSeasonStats);
-  const enrichedWithLineups = attachLineups(enriched, lineups, playerOps);
+  const enriched = attachAsOfStats(freshRaw, pitcherLogsCache, teamLogsCache);
+  const enrichedWithLineups = attachLineupsAsOf(enriched, lineups, batterLogsCache);
   const marketOdds = await fetchMarketOdds();
   const freshByPk = new Map<number, RawGame>(enrichedWithLineups.map((g) => [g.gamePk, g]));
 
   // Upcoming games (no result yet) get a fresh pre-game prediction built from
   // the current team state — which already includes every result applied above.
+  const emptyPitcherStats = new Map<string, PitcherSeasonStats>();
   const freshDocsByPk = new Map<number, GameDoc>();
   for (const g of enrichedWithLineups) {
     if (g.winner === "home" || g.winner === "away") continue;
@@ -784,7 +1078,7 @@ async function fastRefresh(
       buildGameDoc(
         g,
         pred,
-        freshPitcherStats,
+        emptyPitcherStats,
         { home: teamState.injuries[g.home.id] ?? 0, away: teamState.injuries[g.away.id] ?? 0 },
         runModelState ? buildRunProjection(runModelState, runLineIso, g, odds?.total, odds?.runLine, RUN_SIM_TRIALS, pred.homeWinProb, runMarginCal) : undefined,
         odds,
@@ -904,8 +1198,9 @@ async function fastRefresh(
       trainedAt: Date.now(),
       asOfDate: today,
       powerRankings: newPowerRankings,
-      teamSeasonStats,
-      playerOps: playerOpsCache,
+      pitcherLogs: pitcherLogsCache,
+      teamLogs: teamLogsCache,
+      batterLogs: batterLogsCache,
       calibrationSummary,
       todaysRecord,
     },
@@ -992,70 +1287,75 @@ async function fetchLineupsForGames(
   return out;
 }
 
-/** Season hitting OPS for a set of players, reusing the cached map. */
-async function fetchPlayerSeasonOps(
-  ids: number[],
-  season: string,
-  cached: Record<string, number> = {}): Promise<Map<number, number>> {
-  const out = new Map<number, number>();
-  const unique = [...new Set(ids)].filter((id) => id > 0 && typeof cached[`${id}|${season}`] !== "number");
-  await mapLimit(unique, 24, async (id) => {
-    try {
-      const data = await fetchJson(
-        `${MLB_BASE}/api/v1/people/${id}/stats?stats=season&group=hitting&season=${season}`);
-      const stat = data?.stats?.[0]?.splits?.[0]?.stat;
-      const ops = statNumber(stat?.ops);
-      if (ops !== undefined) out.set(id, ops);
-    } catch {
-      // individual player stat failures are non-fatal
-    }
-  });
-  return out;
-}
-
-/** Weighted mean OPS of a lineup — slots 1-4 (most PAs) count double. */
-function lineupOps(lineup: LineupPlayer[] | undefined): number {
+/** Weighted mean of a batter stat across a starting 9 — slots 1-4 count double. */
+function lineupMean(lineup: LineupPlayer[] | undefined, key: "ops" | "woba" | "iso" | "recentOps"): number {
   if (!lineup || lineup.length === 0) return 0;
   let sum = 0;
   let w = 0;
   for (let i = 0; i < lineup.length; i++) {
-    const ops = lineup[i].ops;
-    if (typeof ops !== "number") continue;
+    const v = lineup[i][key];
+    if (typeof v !== "number") continue;
     const weight = i < 4 ? 2 : 1;
-    sum += ops * weight;
+    sum += v * weight;
     w += weight;
   }
   return w > 0 ? sum / w : 0;
 }
 
 /**
- * Attach lineup data + computed lineup-strength features to games that have a
- * fetched boxscore lineup. `playerOps` is a game-season map of player OPS.
+ * Attach lineup data + as-of-date lineup-strength features (OPS / wOBA / ISO /
+ * L10 hot streak) computed strictly from each batter's game log before the
+ * game date — no lookahead. `batterLogs` is the `${id}|${season}` → game-log
+ * cache stored on the model state.
  */
-function attachLineups(
+function attachLineupsAsOf(
   games: RawGame[],
   lineups: Map<number, LineupData>,
-  playerOps: Map<number, number>): RawGame[] {
+  batterLogs: Record<string, HittingLogEntry[]>,
+): RawGame[] {
   return games.map((g) => {
     const lu = lineups.get(g.gamePk);
     if (!lu) return g;
-    const withOps = (side?: { battingOrder: LineupPlayer[]; bench: LineupPlayer[] }) => {
+    const season = g.season ?? "";
+    const withStats = (side?: { battingOrder: LineupPlayer[]; bench: LineupPlayer[] }) => {
       if (!side) return side;
+      const map = (p: LineupPlayer): LineupPlayer => {
+        const log = batterLogs[`${p.id}|${season}`];
+        return {
+          ...p,
+          ops: batterOpsAsOf(log, g.date),
+          woba: batterWobaAsOf(log, g.date),
+          iso: batterIsoAsOf(log, g.date),
+          recentOps: batterRecentOpsAsOf(log, g.date),
+        };
+      };
       return {
-        battingOrder: side.battingOrder.map((p) => ({ ...p, ops: playerOps.get(p.id) })),
-        bench: side.bench.map((p) => ({ ...p, ops: playerOps.get(p.id) })),
+        battingOrder: side.battingOrder.map(map),
+        bench: side.bench.map(map),
       };
     };
-    const home = withOps(lu.home);
-    const away = withOps(lu.away);
-    const homeOps = lineupOps(home?.battingOrder);
-    const awayOps = lineupOps(away?.battingOrder);
+    const home = withStats(lu.home);
+    const away = withStats(lu.away);
+    const homeOps = lineupMean(home?.battingOrder, "ops");
+    const awayOps = lineupMean(away?.battingOrder, "ops");
     return {
       ...g,
       lineups: { home, away },
       lineupStats: {
-        home: { known: homeOps > 0, ops: homeOps },
-        away: { known: awayOps > 0, ops: awayOps },
+        home: {
+          known: homeOps > 0,
+          ops: homeOps,
+          woba: lineupMean(home?.battingOrder, "woba"),
+          iso: lineupMean(home?.battingOrder, "iso"),
+          recentOps: lineupMean(home?.battingOrder, "recentOps"),
+        },
+        away: {
+          known: awayOps > 0,
+          ops: awayOps,
+          woba: lineupMean(away?.battingOrder, "woba"),
+          iso: lineupMean(away?.battingOrder, "iso"),
+          recentOps: lineupMean(away?.battingOrder, "recentOps"),
+        },
       },
     };
   });
@@ -1098,6 +1398,13 @@ function reconstructTeamState(rankings: PowerRanking[]): TeamState {
 // Game document building
 // ---------------------------------------------------------------------------
 
+/** Season totals (legacy display fallback; as-of stats on the game win). */
+interface PitcherSeasonStats {
+  era?: number;
+  k9?: number;
+  fip?: number;
+}
+
 function buildGameDoc(
   game: RawGame,
   pred: { homeWinProb: number; awayWinProb: number; pickTeam: "home" | "away"; pickProb: number; shap: GameDoc["shap"]; edge: number; fairHomeOdds: number; fairAwayOdds: number },
@@ -1105,12 +1412,21 @@ function buildGameDoc(
   injuries?: { home: number; away: number },
   runProjection?: RunProjection,
   marketOdds?: MarketOdds): GameDoc {
-  const awayPitcher: PitcherInfo | undefined = game.awayPitcher
-    ? { ...game.awayPitcher, ...(pitcherStats.get(`${game.awayPitcher.id}|${game.season}`) ?? {}) }
-    : undefined;
-  const homePitcher: PitcherInfo | undefined = game.homePitcher
-    ? { ...game.homePitcher, ...(pitcherStats.get(`${game.homePitcher.id}|${game.season}`) ?? {}) }
-    : undefined;
+  // As-of-date stats attached to the game (attachAsOfStats) win over the
+  // season-total map: the map only fills gaps so displayed ERA / K9 / FIP never
+  // leak post-game data into a game's own prediction.
+  const withPitcherStats = (p?: PitcherInfo): PitcherInfo | undefined => {
+    if (!p) return p;
+    const st = pitcherStats.get(`${p.id}|${game.season}`);
+    return {
+      ...p,
+      era: typeof p.era === "number" ? p.era : st?.era,
+      k9: typeof p.k9 === "number" ? p.k9 : st?.k9,
+      fip: typeof p.fip === "number" ? p.fip : st?.fip,
+    };
+  };
+  const awayPitcher = withPitcherStats(game.awayPitcher);
+  const homePitcher = withPitcherStats(game.homePitcher);
 
   const doc: GameDoc = {
     gamePk: game.gamePk,
@@ -1196,6 +1512,8 @@ function mergePitcher(fresh?: PitcherInfo, stored?: PitcherInfo): PitcherInfo | 
     era: typeof fresh.era === "number" ? fresh.era : stored.era,
     k9: typeof fresh.k9 === "number" ? fresh.k9 : stored.k9,
     fip: typeof fresh.fip === "number" ? fresh.fip : stored.fip,
+    whip: typeof fresh.whip === "number" ? fresh.whip : stored.whip,
+    recentEra: typeof fresh.recentEra === "number" ? fresh.recentEra : stored.recentEra,
   };
 }
 
@@ -1513,23 +1831,17 @@ export const refreshModel = action({
         );
       }
 
-      // 4. Fetch pitcher stats only for games whose starters still lack them
-      //    (stored games already carry their ERA / K9 / FIP). On a cold start we
-      //    pull stats for the current-season starters only — older-season pitcher
-      //    deltas are folded into the team pitching/ERA feature instead.
-      await report("Fetching pitcher stats", 28, "Loading starting-pitcher ERA / FIP…");
-      const statsSeasons = new Set([season, String(Number(season) - 1)]);
-      const needsStats = allRaw
-        .filter(
-          (g) =>
-            statsSeasons.has(g.season ?? season) &&
-            ((g.awayPitcher && typeof g.awayPitcher.era !== "number") ||
-              (g.homePitcher && typeof g.homePitcher.era !== "number")),
-        )
-        .filter((g) => hasFullHistory || g.season === season || isWithinRecentWind(g, today, 30));
+      // 4. As-of-date game logs for pitchers + teams across the training window
+      //    (accumulated strictly before each game's date — no lookahead). Logs
+      //    are cached on the model state, so refreshes only fetch missing
+      //    seasons and any as-of date is a cheap local sum.
+      await report("Fetching game logs", 28, "Loading as-of pitcher / team game logs…");
+      const previousPitcherLogs = (previousState?.pitcherLogs ?? {}) as Record<string, PitcherLogEntry[]>;
+      const previousTeamLogs = (previousState?.teamLogs ?? {}) as Record<string, TeamGameLog>;
+      const previousBatterLogs = (previousState?.batterLogs ?? {}) as Record<string, HittingLogEntry[]>;
       const pitcherPairs: { id: number; season: string }[] = [];
       const seenPitcher = new Set<string>();
-      for (const g of needsStats) {
+      for (const g of allRaw) {
         const s = g.season ?? season;
         if (g.awayPitcher) {
           const k = `${g.awayPitcher.id}|${s}`;
@@ -1546,20 +1858,17 @@ export const refreshModel = action({
           }
         }
       }
-      const pitcherStats = await fetchPitcherStats(pitcherPairs);
+      const newPitcherLogs = await fetchPitcherGameLogs(pitcherPairs, previousPitcherLogs);
+      const pitcherLogs: Record<string, PitcherLogEntry[]> = { ...previousPitcherLogs, ...newPitcherLogs };
       await report(
-        "Pitcher stats loaded",
+        "Pitcher logs loaded",
         34,
-        `Loaded ${pitcherStats.size} pitcher seasons.`);
+        `Fetched ${Object.keys(newPitcherLogs).length} pitcher game logs.`);
 
-      // 5. Fetch season team OPS / ERA / fielding% (statsapi-only features).
-      //    Past seasons are reused from the previously stored model state, so a
-      //    normal refresh only refreshes the current season (~30 requests). On
-      //    a cold start we still need current-season + the previous year only;
-      //    the deeper history is folded into the team pitching/ERA feature by
-      //    the run model.
-      await report("Fetching team stats", 40, "Loading team OPS / ERA / fielding…");
-      const previousTeamStats = (previousState?.teamSeasonStats ?? {}) as Record<string, TeamSeasonStats>;
+      // 5. Team game logs (hitting / pitching / fielding) per season. Current
+      //    season always refreshes (new games accumulate); past seasons reuse
+      //    the cached logs on the model state.
+      await report("Fetching team logs", 40, "Loading as-of team game logs…");
       const teamSeasonPairs = new Map<string, { id: number; season: string }>();
       for (const g of allRaw) {
         const s = g.season ?? season;
@@ -1570,25 +1879,20 @@ export const refreshModel = action({
       }
       const teamStatsToFetch = [...teamSeasonPairs.values()].filter((p) => {
         const key = `${p.id}|${p.season}`;
-        if (hasFullHistory) return p.season === season || previousTeamStats[key] === undefined;
-        // Cold start — only current + previous season; historic team deltas aren't
-        // useful features this late into the model anyway.
-        return key.endsWith(`|${season}`) || key.endsWith(`|${String(Number(season) - 1)}`);
+        return p.season === season || previousTeamLogs[key] === undefined;
       });
-      const freshTeamStats = await fetchTeamSeasonStats(teamStatsToFetch);
-      const teamSeasonStats: Record<string, TeamSeasonStats> = {
-        ...previousTeamStats,
-        ...Object.fromEntries(freshTeamStats),
-      };
+      const newTeamLogs = await fetchTeamGameLogs(teamStatsToFetch, previousTeamLogs);
+      const teamLogs: Record<string, TeamGameLog> = { ...previousTeamLogs, ...newTeamLogs };
       await report(
-        "Team stats loaded",
+        "Team logs loaded",
         44,
-        `Loaded ${freshTeamStats.size} team-season stat blocks.`);
-      const enriched = attachTeamSeasonStats(attachPitcherStats(allRaw, pitcherStats), teamSeasonStats);
+        `Fetched ${Object.keys(newTeamLogs).length} team-season game logs.`);
+      const enriched = attachAsOfStats(allRaw, pitcherLogs, teamLogs);
 
       // 6. Actual starting lineups (last 2 days + upcoming window): fetch the
       //    boxscore for each game, attach the starting 9 + bench, and pull each
-      //    batter's season OPS so the model gets a real lineup-strength feature.
+      //    batter's as-of game log so the model gets real lineup-strength
+      //    features (weighted OPS / wOBA / ISO / L10 hot streak — no lookahead).
       await report("Fetching lineups", 46, "Loading actual starting lineups…");
       const lineupGames = enriched.filter(
         (g) => g.date >= addDays(today, -2) && g.date <= addDays(today, UPCOMING_WINDOW_DAYS));
@@ -1601,13 +1905,9 @@ export const refreshModel = action({
           for (const p of [...side.battingOrder, ...side.bench]) batterIds.push(p.id);
         }
       }
-      const previousPlayerOps = (previousState?.playerOps ?? {}) as Record<string, number>;
-      const playerOps = await fetchPlayerSeasonOps(batterIds, season, previousPlayerOps);
-      const playerOpsCache: Record<string, number> = {
-        ...previousPlayerOps,
-        ...Object.fromEntries([...playerOps].map(([id, ops]) => [`${id}|${season}`, ops])),
-      };
-      const enrichedWithLineups = attachLineups(enriched, lineups, playerOps);
+      const newBatterLogs = await fetchBatterGameLogs(batterIds, season, previousBatterLogs);
+      const batterLogs: Record<string, HittingLogEntry[]> = { ...previousBatterLogs, ...newBatterLogs };
+      const enrichedWithLineups = attachLineupsAsOf(enriched, lineups, batterLogs);
 
       // 7. Pull as-of-time injured-list snapshots for every team that has played,
       //    then train, select features/model, calibrate, and decide on Monte Carlo.
@@ -1675,6 +1975,7 @@ export const refreshModel = action({
       const freshDates = new Set(freshRaw.map((g) => g.date));
       const rowsByPk = new Map(rows.map((r) => [r.game.gamePk, r]));
       const freshDocs: GameDoc[] = [];
+      const emptyPitcherStats = new Map<string, PitcherSeasonStats>();
       for (const g of enrichedWithLineups) {
         if (!freshDates.has(g.date)) continue;
         if (g.winner === "home" || g.winner === "away") {
@@ -1685,7 +1986,7 @@ export const refreshModel = action({
             buildGameDoc(
               g,
               pred,
-              pitcherStats,
+              emptyPitcherStats,
               undefined,
               buildRunProjection(runModelState, runLineIso, g, undefined, undefined, RUN_CALIB_TRIALS, pred.homeWinProb, runMarginCal),
             ),
@@ -1697,7 +1998,7 @@ export const refreshModel = action({
             buildGameDoc(
               g,
               pred,
-              pitcherStats,
+              emptyPitcherStats,
               { home: teamState.injuries[g.home.id] ?? 0, away: teamState.injuries[g.away.id] ?? 0 },
               buildRunProjection(runModelState, runLineIso, g, odds?.total, odds?.runLine, RUN_SIM_TRIALS, pred.homeWinProb, runMarginCal),
               odds,
@@ -1751,9 +2052,10 @@ export const refreshModel = action({
           runModel: result.runModel,
           runLineCalibration: result.runLineCalibration,
           runMarginCalibration: runMarginCal,
-          teamSeasonStats,
+          pitcherLogs,
+          teamLogs,
+          batterLogs,
           injurySnapshots: Object.fromEntries(injurySnapshots),
-          playerOps: playerOpsCache,
           calibrationSummary,
           spearmanRho,
           topDecileWinRate,
@@ -1835,11 +2137,15 @@ export const predictDate = action({
       if (g.awayPitcher) pitcherPairs.push({ id: g.awayPitcher.id, season: s });
       if (g.homePitcher) pitcherPairs.push({ id: g.homePitcher.id, season: s });
     }
-    const pitcherStats = await fetchPitcherStats(pitcherPairs);
 
-    // Team season stats are cached on the model state; refresh only any current
-    // season team that is still missing before predicting a date.
-    const storedTeamStats = (state.teamSeasonStats ?? {}) as Record<string, TeamSeasonStats>;
+    // As-of game logs are cached on the model state; only missing seasons are
+    // fetched, and stats accumulate strictly before the selected game date.
+    const storedPitcherLogs = (state.pitcherLogs ?? {}) as Record<string, PitcherLogEntry[]>;
+    const storedTeamLogs = (state.teamLogs ?? {}) as Record<string, TeamGameLog>;
+    const storedBatterLogs = (state.batterLogs ?? {}) as Record<string, HittingLogEntry[]>;
+    const newPitcherLogs = await fetchPitcherGameLogs(pitcherPairs, storedPitcherLogs);
+    const pitcherLogs: Record<string, PitcherLogEntry[]> = { ...storedPitcherLogs, ...newPitcherLogs };
+
     const teamPairs = new Map<string, { id: number; season: string }>();
     for (const g of raw) {
       const s = g.season ?? season;
@@ -1848,18 +2154,13 @@ export const predictDate = action({
         if (!teamPairs.has(key)) teamPairs.set(key, { id, season: s });
       }
     }
-    const missingTeamStats = [...teamPairs.values()].filter(
-      (p) => storedTeamStats[`${p.id}|${p.season}`] === undefined,
-    );
-    const freshTeamStats = await fetchTeamSeasonStats(missingTeamStats);
-    const teamSeasonStats: Record<string, TeamSeasonStats> = {
-      ...storedTeamStats,
-      ...Object.fromEntries(freshTeamStats),
-    };
-    const enriched = attachTeamSeasonStats(attachPitcherStats(raw, pitcherStats), teamSeasonStats);
+    const newTeamLogs = await fetchTeamGameLogs([...teamPairs.values()], storedTeamLogs);
+    const teamLogs: Record<string, TeamGameLog> = { ...storedTeamLogs, ...newTeamLogs };
+    const enriched = attachAsOfStats(raw, pitcherLogs, teamLogs);
 
     // Actual starting lineups for the selected date (boxscore), with each
-    // batter's season OPS pulled from the cached map + fresh fetches.
+    // batter's as-of stats (OPS / wOBA / ISO / L10) pulled from the cached
+    // game-log map + fresh fetches.
     const lineups = await fetchLineupsForGames(enriched, 16);
     const batterIds: number[] = [];
     for (const lu of lineups.values()) {
@@ -1868,11 +2169,12 @@ export const predictDate = action({
         for (const p of [...side.battingOrder, ...side.bench]) batterIds.push(p.id);
       }
     }
-    const previousPlayerOps = (state.playerOps ?? {}) as Record<string, number>;
-    const playerOps = await fetchPlayerSeasonOps(batterIds, season, previousPlayerOps);
-    const enrichedWithLineups = attachLineups(enriched, lineups, playerOps);
+    const newBatterLogs = await fetchBatterGameLogs(batterIds, season, storedBatterLogs);
+    const batterLogs: Record<string, HittingLogEntry[]> = { ...storedBatterLogs, ...newBatterLogs };
+    const enrichedWithLineups = attachLineupsAsOf(enriched, lineups, batterLogs);
 
     const marketOdds = await fetchMarketOdds();
+    const emptyPitcherStats = new Map<string, PitcherSeasonStats>();
 
     const docs = enrichedWithLineups.map((g) => {
       const odds = marketOddsForGame(marketOdds, g);
@@ -1880,7 +2182,7 @@ export const predictDate = action({
       return buildGameDoc(
         g,
         pred,
-        pitcherStats,
+        emptyPitcherStats,
         { home: teamState.injuries[g.home.id] ?? 0, away: teamState.injuries[g.away.id] ?? 0 },
         runModelState ? buildRunProjection(runModelState, runLineIso, g, odds?.total, odds?.runLine, RUN_SIM_TRIALS, pred.homeWinProb, runMarginCal) : undefined,
         odds,

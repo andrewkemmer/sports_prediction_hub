@@ -90,9 +90,10 @@ export interface ModelStateDoc {
   runModel?: RunModel;
   runLineCalibration?: { x: number; y: number }[];
   runMarginCalibration?: { slope: number; intercept: number };
-  teamSeasonStats?: Record<string, { ops?: number; era?: number; fieldingPct?: number }>;
+  pitcherLogs?: Record<string, { d: string; ip: number; er: number; h: number; so: number; bb: number; hbp: number; hr: number }[]>;
+  teamLogs?: Record<string, { hitting?: { d: string; ab: number; h: number; bb: number; ibb: number; hbp: number; sf: number; tb: number; "2b": number; "3b": number; hr: number }[]; pitching?: { d: string; ip: number; er: number; h: number; so: number; bb: number; hbp: number; hr: number }[]; fielding?: { d: string; po: number; a: number; e: number }[] }>;
+  batterLogs?: Record<string, { d: string; ab: number; h: number; bb: number; ibb: number; hbp: number; sf: number; tb: number; "2b": number; "3b": number; hr: number }[]>;
   injurySnapshots?: Record<string, { date: string; count: number }[]>;
-  playerOps?: Record<string, number>;
   calibrationSummary?: CalibrationSummary;
   spearmanRho?: number;
   topDecileWinRate?: number;

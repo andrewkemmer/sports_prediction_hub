@@ -217,6 +217,16 @@ function starterDelta(
   return away - home;
 }
 
+/**
+ * Signed edge so positive values favor the home team (0 when either side is
+ * missing). `lowerBetter` inverts the sign for stats where lower is better
+ * (ERA / WHIP) so the convention stays uniform across all features.
+ */
+function edge(home: unknown, away: unknown, lowerBetter = false): number {
+  if (typeof home !== "number" || typeof away !== "number") return 0;
+  return lowerBetter ? away - home : home - away;
+}
+
 function buildFeatures(game: RawGame, state: MutableState): FeatureValues {
   const homeElo = state.elo[game.home.id] ?? ELO_INIT;
   const awayElo = state.elo[game.away.id] ?? ELO_INIT;
@@ -239,6 +249,10 @@ function buildFeatures(game: RawGame, state: MutableState): FeatureValues {
   const awayTeamEra = game.away.era;
   const homeFielding = game.home.fieldingPct;
   const awayFielding = game.away.fieldingPct;
+  const homeTeamK9 = game.home.k9;
+  const awayTeamK9 = game.away.k9;
+  const homeTeamWhip = game.home.whip;
+  const awayTeamWhip = game.away.whip;
   const tempF = game.weather?.tempF;
   const wind = game.weather?.windMph;
 
@@ -264,14 +278,22 @@ function buildFeatures(game: RawGame, state: MutableState): FeatureValues {
     homeField: 1,
     spFipDiff: starterDelta(game.homePitcher, game.awayPitcher, "fip"),
     spEraDiff: starterDelta(game.homePitcher, game.awayPitcher, "era"),
+    spK9Diff: edge(game.homePitcher?.k9, game.awayPitcher?.k9),
+    spWhipDiff: edge(game.homePitcher?.whip, game.awayPitcher?.whip, true),
+    spRecentDiff: edge(game.homePitcher?.recentEra, game.awayPitcher?.recentEra, true),
     opsDiff: typeof homeOps === "number" && typeof awayOps === "number" ? homeOps - awayOps : 0,
     teamEraDiff: typeof awayTeamEra === "number" && typeof homeTeamEra === "number" ? awayTeamEra - homeTeamEra : 0,
+    teamK9Diff: edge(homeTeamK9, awayTeamK9),
+    teamWhipDiff: edge(homeTeamWhip, awayTeamWhip, true),
     defEffDiff: typeof homeFielding === "number" && typeof awayFielding === "number" ? homeFielding - awayFielding : 0,
     parkFactor: PARK_FACTORS[game.home.id] ?? 1,
     tempDev: typeof tempF === "number" ? tempF - 72 : 0,
     windMph: typeof wind === "number" ? wind : 0,
     lineupKnown,
     lineupOpsDiff,
+    lineupWobaDiff: edge(lineupHome?.woba, lineupAway?.woba),
+    lineupIsoDiff: edge(lineupHome?.iso, lineupAway?.iso),
+    lineupHotDiff: edge(lineupHome?.recentOps, lineupAway?.recentOps),
   };
 }
 

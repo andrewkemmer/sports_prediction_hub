@@ -7,6 +7,8 @@ export interface PitcherInfo {
   era?: number;
   k9?: number;
   fip?: number; // fielding-independent pitching (computed from K / BB / HR / IP)
+  whip?: number; // walks + hits per inning pitched (as-of-date)
+  recentEra?: number; // ERA over the last 3 starts (as-of-date hot/cold signal)
 }
 
 export interface TeamInfo {
@@ -19,6 +21,8 @@ export interface TeamInfo {
   ops?: number; // season team OPS (hitting / batter production)
   era?: number; // season team ERA (pitching staff incl. bullpen)
   fieldingPct?: number; // season fielding percentage (defensive-efficiency proxy)
+  k9?: number; // staff strikeouts per 9 innings (as-of-date)
+  whip?: number; // staff walks + hits per inning pitched (as-of-date)
 }
 
 export interface ShapContribution {
@@ -33,7 +37,10 @@ export interface LineupPlayer {
   id: number;
   name: string;
   pos?: string;
-  ops?: number; // season OPS (populated when the player's hitting stats were fetched)
+  ops?: number; // OPS as-of the game date (no lookahead)
+  woba?: number; // wOBA as-of the game date
+  iso?: number; // isolated power as-of the game date
+  recentOps?: number; // OPS over the last 10 games (hot-streak signal)
 }
 
 /** Actual starting 9 + available bench for a game (from the boxscore). */
@@ -44,8 +51,10 @@ export interface LineupData {
 
 /** Aggregated lineup-strength inputs used as model features. */
 export interface LineupStats {
-  home: { known: boolean; ops: number }; // weighted mean OPS of the starting 9
-  away: { known: boolean; ops: number };
+  // Weighted means over the starting 9 (slots 1-4 double-weighted), computed
+  // strictly as-of the game date.
+  home: { known: boolean; ops: number; woba: number; iso: number; recentOps: number };
+  away: { known: boolean; ops: number; woba: number; iso: number; recentOps: number };
 }
 
 /** A parsed schedule game straight from the MLB Stats API. */
@@ -110,14 +119,22 @@ export interface FeatureValues {
   homeField: number; // always 1
   spFipDiff: number; // away SP FIP - home SP FIP (positive favors home)
   spEraDiff: number; // away SP ERA - home SP ERA (positive favors home)
+  spK9Diff: number; // home SP K/9 - away SP K/9 (positive favors home)
+  spWhipDiff: number; // away SP WHIP - home SP WHIP (positive favors home)
+  spRecentDiff: number; // away SP last-3-start ERA - home SP last-3-start ERA (positive favors home)
   opsDiff: number; // home team OPS - away team OPS (positive favors home)
   teamEraDiff: number; // away team ERA - home team ERA (positive favors home)
+  teamK9Diff: number; // home staff K/9 - away staff K/9 (positive favors home)
+  teamWhipDiff: number; // away staff WHIP - home staff WHIP (positive favors home)
   defEffDiff: number; // home fieldingPct - away fieldingPct (positive favors home)
   parkFactor: number; // home ballpark run factor (>1 hitter-friendly)
   tempDev: number; // game temperature deviation from 72°F
   windMph: number; // game wind speed
   lineupKnown: number; // 1 when actual lineup data is available for this game
   lineupOpsDiff: number; // home starting-9 weighted OPS - away (positive favors home)
+  lineupWobaDiff: number; // home starting-9 wOBA - away (positive favors home)
+  lineupIsoDiff: number; // home starting-9 ISO - away (positive favors home)
+  lineupHotDiff: number; // home starting-9 L10 OPS - away (positive favors home)
 }
 
 export const FEATURE_KEYS = [
@@ -129,14 +146,22 @@ export const FEATURE_KEYS = [
   "homeField",
   "spFipDiff",
   "spEraDiff",
+  "spK9Diff",
+  "spWhipDiff",
+  "spRecentDiff",
   "opsDiff",
   "teamEraDiff",
+  "teamK9Diff",
+  "teamWhipDiff",
   "defEffDiff",
   "parkFactor",
   "tempDev",
   "windMph",
   "lineupKnown",
   "lineupOpsDiff",
+  "lineupWobaDiff",
+  "lineupIsoDiff",
+  "lineupHotDiff",
 ] as const;
 
 export type FeatureKey = (typeof FEATURE_KEYS)[number];
@@ -150,14 +175,22 @@ export const FEATURE_LABELS: Record<FeatureKey, string> = {
   homeField: "Home field",
   spFipDiff: "Starting Pitcher FIP / xERA Delta",
   spEraDiff: "Starting Pitcher ERA Delta",
+  spK9Diff: "Starting Pitcher K/9 Delta",
+  spWhipDiff: "Starting Pitcher WHIP Delta",
+  spRecentDiff: "Starting Pitcher last-3-start ERA Delta",
   opsDiff: "Team OPS edge",
   teamEraDiff: "Bullpen / Staff ERA edge",
+  teamK9Diff: "Staff K/9 edge",
+  teamWhipDiff: "Staff WHIP edge",
   defEffDiff: "Defensive efficiency edge",
   parkFactor: "Ballpark factor",
   tempDev: "Weather temperature",
   windMph: "Weather wind",
   lineupKnown: "Lineup data available",
   lineupOpsDiff: "Starting-9 OPS edge",
+  lineupWobaDiff: "Starting-9 wOBA edge",
+  lineupIsoDiff: "Starting-9 ISO edge",
+  lineupHotDiff: "Starting-9 hot streak (L10 OPS)",
 };
 
 /** A training row: features computed strictly as-of the game time. */

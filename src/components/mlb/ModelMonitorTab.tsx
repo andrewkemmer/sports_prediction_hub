@@ -92,6 +92,46 @@ const FEATURE_META: Record<string, { category: string; description: string }> = 
     category: "Weather",
     description: "Game-time wind speed in mph, affecting fly-ball carry and scoring environment.",
   },
+  spK9Diff: {
+    category: "Starting Pitcher",
+    description: "Strikeouts per 9 innings edge between the two projected starters — a raw swing-and-miss / dominance signal computed as-of the game date.",
+  },
+  spWhipDiff: {
+    category: "Starting Pitcher",
+    description: "Walks + hits per inning pitched edge between the projected starters — a control and contact-suppression signal computed as-of the game date.",
+  },
+  spRecentDiff: {
+    category: "Starting Pitcher",
+    description: "ERA over each starter's last 3 starts — a hot/cold form signal that season-long ERA smooths away.",
+  },
+  teamK9Diff: {
+    category: "Pitching Staff",
+    description: "Staff strikeouts per 9 innings edge (rotation + bullpen), computed as-of the game date.",
+  },
+  teamWhipDiff: {
+    category: "Pitching Staff",
+    description: "Staff walks + hits per inning pitched edge (rotation + bullpen), computed as-of the game date.",
+  },
+  lineupKnown: {
+    category: "Lineup",
+    description: "Indicator that actual starting-lineup data is available; the model treats unknown lineups distinctly from known strong/weak ones.",
+  },
+  lineupOpsDiff: {
+    category: "Lineup",
+    description: "Starting-9 weighted OPS edge (slots 1-4 double-weighted), each batter's OPS computed as-of the game date.",
+  },
+  lineupWobaDiff: {
+    category: "Lineup",
+    description: "Starting-9 weighted wOBA edge — quality-of-contact production beyond simple OPS, computed as-of the game date.",
+  },
+  lineupIsoDiff: {
+    category: "Lineup",
+    description: "Starting-9 weighted isolated-power edge — extra-base hit power in the projected lineup, computed as-of the game date.",
+  },
+  lineupHotDiff: {
+    category: "Lineup",
+    description: "Starting-9 weighted OPS over each batter's last 10 games — a lineup-level hot/cold streak signal.",
+  },
 };
 
 function shortDate(ymd: string): string {

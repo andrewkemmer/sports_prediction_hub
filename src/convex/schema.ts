@@ -26,6 +26,8 @@ const teamInfo = v.object({
   ops: v.optional(v.number()),
   era: v.optional(v.number()),
   fieldingPct: v.optional(v.number()),
+  k9: v.optional(v.number()),
+  whip: v.optional(v.number()),
 });
 
 const pitcherInfo = v.object({
@@ -34,6 +36,8 @@ const pitcherInfo = v.object({
   era: v.optional(v.number()),
   k9: v.optional(v.number()),
   fip: v.optional(v.number()),
+  whip: v.optional(v.number()),
+  recentEra: v.optional(v.number()),
 });
 
 const shapContribution = v.object({
@@ -178,9 +182,10 @@ const schema = defineSchema(
       runModel: v.optional(v.any()),
       runLineCalibration: v.optional(v.any()),
       runMarginCalibration: v.optional(v.any()),
-      teamSeasonStats: v.optional(v.any()),
+      pitcherLogs: v.optional(v.any()), // cached as-of pitcher game logs (`id|season` → entries)
+      teamLogs: v.optional(v.any()), // cached as-of team game logs (`id|season` → hitting/pitching/fielding)
+      batterLogs: v.optional(v.any()), // cached as-of batter game logs (`id|season` → entries)
       injurySnapshots: v.optional(v.any()),
-      playerOps: v.optional(v.any()), // cached per-player season OPS (`id|season` → OPS)
       calibrationSummary: v.optional(v.any()),
       todaysRecord: v.any(),
     }).index("by_key", ["key"]),
