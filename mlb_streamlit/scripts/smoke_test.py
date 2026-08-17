@@ -288,14 +288,21 @@ def test_lineups() -> None:
            "home": {"id": 119, "name": "Dodgers", "abbrev": "LAD"},
            "away": {"id": 108, "name": "Angels", "abbrev": "LAA"}}
 
-    def prior(pid, season, h, tb, bb=0):
-        return {f"{pid}|{season}": [{"d": f"{season}-05-01", "ab": 4, "h": h, "bb": bb, "hbp": 0, "sf": 0, "tb": tb}]}
+    def ent(pid, season, h, tb, dbl=0, hr=0, bb=0):
+        return {f"{pid}|{season}": [{"d": f"{season}-05-01", "ab": 4, "h": h, "bb": bb, "ibb": 0,
+                                     "hbp": 0, "sf": 0, "tb": tb, "2b": dbl, "3b": 0, "hr": hr}]}
 
     batter_logs = {}
-    for pid, h, tb in ((1, 1, 2), (2, 1, 2), (3, 1, 2), (4, 1, 1)):  # 2024: home 0.75 vs away 0.625
-        batter_logs.update(prior(pid, "2024", h, tb))
-    for pid, h, tb in ((1, 3, 5), (2, 2, 4), (3, 2, 3), (4, 2, 3)):  # 2026: home 1.75 vs away 1.25
-        batter_logs.update(prior(pid, "2026", h, tb))
+    # 2024: home hits 2/4 w/ a double (OPS 1.25) vs away singles (OPS .50)
+    for pid in (1, 2):
+        batter_logs.update(ent(pid, "2024", 2, 3, dbl=1))
+    for pid in (3, 4):
+        batter_logs.update(ent(pid, "2024", 1, 1))
+    # 2026: home much hotter (HRs) vs away cold singles
+    batter_logs.update(ent(1, "2026", 3, 6, dbl=1, hr=1))
+    batter_logs.update(ent(2, "2026", 2, 4, dbl=1, hr=1))
+    for pid in (3, 4):
+        batter_logs.update(ent(pid, "2026", 1, 1))
     st = new_state()
     f24 = build_features_for_game(attach_lineups_as_of([g24], {1: lineup}, batter_logs)[0], st)
     f26 = build_features_for_game(attach_lineups_as_of([g26], {2: lineup}, batter_logs)[0], st)
@@ -303,17 +310,25 @@ def test_lineups() -> None:
     check("lineupOpsDiff non-zero", f24["lineupOpsDiff"] > 0 and f26["lineupOpsDiff"] > 0)
     check("per-season OPS respected", f26["lineupOpsDiff"] > f24["lineupOpsDiff"],
           f"2024={f24['lineupOpsDiff']:.4f} 2026={f26['lineupOpsDiff']:.4f}")
+    check("lineupWobaDiff non-zero", f24["lineupWobaDiff"] > 0 and f26["lineupWobaDiff"] > 0)
+    check("lineupIsoDiff non-zero", f24["lineupIsoDiff"] > 0 and f26["lineupIsoDiff"] > 0)
+    check("lineupHotDiff non-zero", f24["lineupHotDiff"] > 0 and f26["lineupHotDiff"] > 0)
+    check("per-season wOBA respected", f26["lineupWobaDiff"] > f24["lineupWobaDiff"],
+          f"2024={f24['lineupWobaDiff']:.4f} 2026={f26['lineupWobaDiff']:.4f}")
 
     # No-lookahead: a lineup whose batters ONLY have post-game entries is
-    # unknown (ops stays 0) — future games never count toward a game's stats.
+    # unknown (all lineup features stay 0) — future games never count.
     leaky = {
-        f"{pid}|2024": [{"d": "2024-06-15", "ab": 4, "h": 4, "bb": 0, "hbp": 0, "sf": 0, "tb": 8}]
+        f"{pid}|2024": [{"d": "2024-06-15", "ab": 4, "h": 4, "bb": 0, "ibb": 0, "hbp": 0,
+                          "sf": 0, "tb": 8, "2b": 2, "3b": 0, "hr": 1}]
         for pid in (1, 2, 3, 4)
     }
     f_leak = build_features_for_game(attach_lineups_as_of([g24], {1: lineup}, leaky)[0], st)
     check("no-lookahead lineup (post-game entries excluded)",
-          f_leak["lineupKnown"] == 0 and f_leak["lineupOpsDiff"] == 0.0,
-          f"known={f_leak['lineupKnown']} diff={f_leak['lineupOpsDiff']:.4f}")
+          f_leak["lineupKnown"] == 0 and f_leak["lineupOpsDiff"] == 0.0
+          and f_leak["lineupWobaDiff"] == 0.0 and f_leak["lineupIsoDiff"] == 0.0
+          and f_leak["lineupHotDiff"] == 0.0,
+          f"known={f_leak['lineupKnown']} ops={f_leak['lineupOpsDiff']:.4f} woba={f_leak['lineupWobaDiff']:.4f}")
 
     f_none = build_features_for_game(g24, st)
     check("no lineup -> feature 0", f_none["lineupOpsDiff"] == 0.0 and f_none["lineupKnown"] == 0)
@@ -336,26 +351,43 @@ def test_as_of_stats() -> None:
 
     # pitcher_as_of: only starts strictly before the target date count.
     log = [
-        {"d": "2026-04-05", "ip": 6.0, "er": 2, "so": 5, "bb": 2, "hbp": 0, "hr": 1},
-        {"d": "2026-04-12", "ip": 7.0, "er": 0, "so": 8, "bb": 1, "hbp": 0, "hr": 0},
-        {"d": "2026-04-19", "ip": 5.0, "er": 6, "so": 3, "bb": 4, "hbp": 1, "hr": 2},  # after target
+        {"d": "2026-04-05", "ip": 6.0, "er": 2, "so": 5, "bb": 2, "hbp": 0, "hr": 1, "h": 3},
+        {"d": "2026-04-08", "ip": 5.0, "er": 3, "so": 4, "bb": 1, "hbp": 0, "hr": 1, "h": 5},
+        {"d": "2026-04-12", "ip": 7.0, "er": 0, "so": 8, "bb": 1, "hbp": 0, "hr": 0, "h": 2},
+        {"d": "2026-04-14", "ip": 4.0, "er": 4, "so": 3, "bb": 3, "hbp": 0, "hr": 2, "h": 6},
+        {"d": "2026-04-19", "ip": 5.0, "er": 6, "so": 3, "bb": 4, "hbp": 1, "hr": 2, "h": 4},  # after target
     ]
     a = data.pitcher_as_of(log, "2026-04-15")
-    check("pitcher_as_of ERA", a["era"] == round(2 * 9 / 13, 2), f"{a}")
-    check("pitcher_as_of K9", a["k9"] == round(13 * 9 / 13, 2), f"{a}")
-    exp_fip = (13 * 1 + 3 * (3 + 0) - 2 * 13) / 13 + 3.1
+    ip = 6 + 5 + 7 + 4
+    er = 2 + 3 + 0 + 4
+    so = 5 + 4 + 8 + 3
+    bb = 2 + 1 + 1 + 3
+    h = 3 + 5 + 2 + 6
+    check("pitcher_as_of ERA", a["era"] == round(er * 9 / ip, 2), f"{a}")
+    check("pitcher_as_of K9", a["k9"] == round(so * 9 / ip, 2), f"{a}")
+    exp_fip = (13 * (1 + 1 + 0 + 2) + 3 * bb - 2 * so) / ip + 3.1
     check("pitcher_as_of FIP", a["fip"] == round(exp_fip, 2), f"{a}")
+    check("pitcher_as_of WHIP", a["whip"] == round((bb + h) / ip, 2), f"{a}")
+    # recentEra covers only the last 3 starts before the target (04-08/12/14).
+    r_ip = 5 + 7 + 4
+    r_er = 3 + 0 + 4
+    check("pitcher_as_of recentEra (last 3 starts)", a["recentEra"] == round(r_er * 9 / r_ip, 2), f"{a}")
     check("pitcher_as_of empty", data.pitcher_as_of([], "2026-04-15") == {})
     check("pitcher_as_of no prior games", data.pitcher_as_of(log, "2026-04-01") == {})
 
     # batter_ops_as_of: OPS from OBP/SLG components, strictly before the date.
     blog = [
-        {"d": "2026-04-05", "ab": 4, "h": 1, "bb": 0, "hbp": 0, "sf": 0, "tb": 2},
-        {"d": "2026-04-06", "ab": 4, "h": 2, "bb": 0, "hbp": 0, "sf": 0, "tb": 3},
-        {"d": "2026-04-20", "ab": 4, "h": 4, "bb": 0, "hbp": 0, "sf": 0, "tb": 8},  # after
+        {"d": "2026-04-05", "ab": 4, "h": 1, "bb": 0, "ibb": 0, "hbp": 0, "sf": 0, "tb": 2, "2b": 1, "3b": 0, "hr": 0},
+        {"d": "2026-04-06", "ab": 4, "h": 2, "bb": 1, "ibb": 0, "hbp": 0, "sf": 0, "tb": 3, "2b": 1, "3b": 0, "hr": 0},
+        {"d": "2026-04-20", "ab": 4, "h": 4, "bb": 0, "ibb": 0, "hbp": 0, "sf": 0, "tb": 8, "2b": 2, "3b": 0, "hr": 0},  # after
     ]
     ops = data.batter_ops_as_of(blog, "2026-04-20")
-    check("batter_ops_as_of excludes post-date games", ops is not None and abs(ops - 1.0) < 1e-9, f"{ops}")
+    # Both prior games: 8 AB, 3 H, 1 BB, 5 TB -> OBP 4/9, SLG 5/8.
+    check("batter_ops_as_of excludes post-date games", ops is not None and ops == round(0.625 + 4 / 9, 3), f"{ops}")
+    # wOBA: game 1 is a double (1.27/4); game 2 is a single + walk ((0.69+0.89+1.27)/5).
+    check("batter_woba_as_of", data.batter_woba_as_of(blog, "2026-04-20") == round((1.27 + 2.85) / 9, 3))
+    check("batter_iso_as_of", data.batter_iso_as_of(blog, "2026-04-20") == 0.25)
+    check("batter_recent_ops_as_of (window)", data.batter_recent_ops_as_of(blog, "2026-04-20") == round(0.625 + 4 / 9, 3))
     check("batter_ops_as_of none without prior games", data.batter_ops_as_of(blog, "2026-03-01") is None)
 
     # team_as_of: ops/era/fielding accumulated per group, strictly before date.
@@ -366,8 +398,8 @@ def test_as_of_stats() -> None:
             {"d": "2026-05-01", "ab": 40, "h": 16, "bb": 2, "hbp": 0, "sf": 0, "tb": 28},  # after
         ],
         "pitching": [
-            {"d": "2026-04-05", "ip": 9.0, "er": 3, "so": 8, "bb": 2, "hbp": 0, "hr": 1},
-            {"d": "2026-05-01", "ip": 9.0, "er": 9, "so": 8, "bb": 2, "hbp": 0, "hr": 3},  # after
+            {"d": "2026-04-05", "ip": 9.0, "er": 3, "so": 8, "bb": 2, "hbp": 0, "hr": 1, "h": 5},
+            {"d": "2026-05-01", "ip": 9.0, "er": 9, "so": 8, "bb": 2, "hbp": 0, "hr": 3, "h": 9},  # after
         ],
         "fielding": [
             {"d": "2026-04-05", "po": 27, "a": 9, "e": 0},
@@ -379,6 +411,8 @@ def test_as_of_stats() -> None:
     exp_ops = (22 + 6 + 1) / (76 + 6 + 1 + 1) + 36 / 76
     check("team_as_of ops", t["ops"] == round(exp_ops, 3), f"{t}")
     check("team_as_of era", t["era"] == round(3 * 9 / 9, 2), f"{t}")
+    check("team_as_of k9", t["k9"] == 8.0, f"{t}")
+    check("team_as_of whip", t["whip"] == round((2 + 5) / 9, 2), f"{t}")
     check("team_as_of fieldingPct", t["fieldingPct"] == 1.0, f"{t}")
     check("team_as_of empty", data.team_as_of(None, "2026-04-10") == {})
 

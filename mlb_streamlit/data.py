@@ -378,6 +378,7 @@ def _compact_pitcher_entry(split: dict) -> dict | None:
         "d": split.get("date") or "",
         "ip": round(ip, 3),
         "er": _num(st.get("earnedRuns")),
+        "h": _num(st.get("hits")),
         "so": _num(st.get("strikeOuts")),
         "bb": _num(st.get("baseOnBalls")),
         "hbp": _num(st.get("hitByPitch")),
@@ -416,11 +417,17 @@ def fetch_pitcher_game_logs(pairs: list[dict], cached: dict | None = None) -> di
     return out
 
 
-def pitcher_as_of(entries: list[dict] | None, ymd: str) -> dict:
-    """Season ERA / K9 / FIP accumulated strictly before `ymd` (no lookahead)."""
+def pitcher_as_of(entries: list[dict] | None, ymd: str, recent_starts: int = 3) -> dict:
+    """Season ERA / K9 / FIP / WHIP + recent-form ERA, strictly before `ymd`.
+
+    No lookahead: only games with date < ymd count. `recentEra` covers the
+    pitcher's last `recent_starts` starts before the target date (hot/cold
+    starter signal).
+    """
     if not entries:
         return {}
-    ip = er = so = bb = hbp = hr = 0.0
+    ip = er = so = bb = hbp = hr = h = 0.0
+    recent: list[dict] = []
     for e in entries:  # date-sorted; stop at the first game on/after the target date
         if e["d"] >= ymd:
             break
@@ -430,13 +437,23 @@ def pitcher_as_of(entries: list[dict] | None, ymd: str) -> dict:
         bb += e["bb"]
         hbp += e["hbp"]
         hr += e["hr"]
+        h += e.get("h", 0.0)
+        recent.append(e)
+        if len(recent) > recent_starts:
+            recent.pop(0)
     if ip <= 0:
         return {}
-    return {
+    out = {
         "era": round(er * 9 / ip, 2),
         "k9": round(so * 9 / ip, 2),
         "fip": round((13 * hr + 3 * (bb + hbp) - 2 * so) / ip + FIP_CONSTANT, 2),
+        "whip": round((bb + h) / ip, 2),
     }
+    r_ip = sum(r["ip"] for r in recent)
+    r_er = sum(r["er"] for r in recent)
+    if r_ip > 0:
+        out["recentEra"] = round(r_er * 9 / r_ip, 2)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -510,9 +527,13 @@ def _compact_hitting_entry(split: dict) -> dict | None:
         "ab": _num(st.get("atBats")),
         "h": _num(st.get("hits")),
         "bb": _num(st.get("baseOnBalls")),
+        "ibb": _num(st.get("intentionalWalks")),
         "hbp": _num(st.get("hitByPitch")),
         "sf": _num(st.get("sacFlies")),
         "tb": _num(st.get("totalBases")),
+        "2b": _num(st.get("doubles")),
+        "3b": _num(st.get("triples")),
+        "hr": _num(st.get("homeRuns")),
     }
 
 
@@ -571,6 +592,39 @@ def _ops_from_hitting(ab: float, h: float, bb: float, hbp: float, sf: float, tb:
     return obp + slg
 
 
+# FanGraphs-style wOBA weights (2019+ scale). Higher is better for hitters.
+WOBA_UBB = 0.69
+WOBA_HBP = 0.72
+WOBA_1B = 0.89
+WOBA_2B = 1.27
+WOBA_3B = 1.62
+WOBA_HR = 2.10
+
+
+def _woba_from_hitting(ab: float, h: float, bb: float, ibb: float, hbp: float, sf: float, dbl: float, tpl: float, hr: float) -> float | None:
+    ubb = max(0.0, bb - ibb)
+    den = ab + ubb + sf + hbp
+    if den <= 0:
+        return None
+    singles = max(0.0, h - dbl - tpl - hr)
+    num = (
+        WOBA_UBB * ubb
+        + WOBA_HBP * hbp
+        + WOBA_1B * singles
+        + WOBA_2B * dbl
+        + WOBA_3B * tpl
+        + WOBA_HR * hr
+    )
+    return num / den
+
+
+def _iso_from_hitting(h: float, tb: float, ab: float) -> float | None:
+    """Isolated power: SLG - AVG = (TB - H) / AB."""
+    if ab <= 0:
+        return None
+    return (tb - h) / ab
+
+
 def team_as_of(log: dict | None, ymd: str) -> dict:
     """Team OPS / staff ERA / fielding pct accumulated strictly before `ymd`."""
     if not log:
@@ -591,14 +645,19 @@ def team_as_of(log: dict | None, ymd: str) -> dict:
     if ops is not None:
         out["ops"] = round(ops, 3)
 
-    ip = er = 0.0
+    ip = er = so = bb = h = 0.0
     for e in log.get("pitching") or []:
         if e["d"] >= ymd:
             break
         ip += e["ip"]
         er += e["er"]
+        so += e["so"]
+        bb += e["bb"]
+        h += e.get("h", 0.0)
     if ip > 0:
         out["era"] = round(er * 9 / ip, 2)
+        out["k9"] = round(so * 9 / ip, 2)
+        out["whip"] = round((bb + h) / ip, 2)
 
     po = a = err = 0.0
     for e in log.get("fielding") or []:
@@ -778,19 +837,24 @@ def fetch_lineups_for_games(games: list[dict], concurrency: int = 16) -> dict:
     return out
 
 
-def lineup_ops(lineup: list[dict] | None) -> float:
+def _lineup_weighted(lineup: list[dict] | None, key: str) -> float:
+    """Weighted-mean of `key` over the starting order (slots 1-4 get 2x weight)."""
     if not lineup:
         return 0.0
     total = 0.0
     w = 0
     for i, p in enumerate(lineup):
-        ops = p.get("ops")
-        if not isinstance(ops, (int, float)):
+        v = p.get(key)
+        if not isinstance(v, (int, float)):
             continue
         weight = 2 if i < 4 else 1
-        total += ops * weight
+        total += v * weight
         w += weight
     return total / w if w > 0 else 0.0
+
+
+def lineup_ops(lineup: list[dict] | None) -> float:
+    return _lineup_weighted(lineup, "ops")
 
 
 def attach_lineups(games: list[dict], lineups: dict, player_ops: dict) -> list[dict]:
@@ -890,6 +954,55 @@ def batter_ops_as_of(entries: list[dict] | None, ymd: str) -> float | None:
     return round(ops, 3) if ops is not None else None
 
 
+def _hitting_totals(entries: list[dict], ymd: str) -> dict:
+    """Aggregate hitting components strictly before `ymd` (no lookahead)."""
+    ab = h = bb = ibb = hbp = sf = tb = dbl = tpl = hr = 0.0
+    for e in entries:
+        if e["d"] >= ymd:
+            break
+        ab += e["ab"]
+        h += e["h"]
+        bb += e["bb"]
+        ibb += e.get("ibb", 0.0)
+        hbp += e["hbp"]
+        sf += e["sf"]
+        tb += e["tb"]
+        dbl += e.get("2b", 0.0)
+        tpl += e.get("3b", 0.0)
+        hr += e.get("hr", 0.0)
+    return {"ab": ab, "h": h, "bb": bb, "ibb": ibb, "hbp": hbp, "sf": sf, "tb": tb, "2b": dbl, "3b": tpl, "hr": hr}
+
+
+def batter_woba_as_of(entries: list[dict] | None, ymd: str) -> float | None:
+    """Batter wOBA accumulated strictly before `ymd`; None with no prior games."""
+    if not entries:
+        return None
+    t = _hitting_totals(entries, ymd)
+    v = _woba_from_hitting(t["ab"], t["h"], t["bb"], t["ibb"], t["hbp"], t["sf"], t["2b"], t["3b"], t["hr"])
+    return round(v, 3) if v is not None else None
+
+
+def batter_iso_as_of(entries: list[dict] | None, ymd: str) -> float | None:
+    """Batter isolated power accumulated strictly before `ymd`; None with no prior games."""
+    if not entries:
+        return None
+    t = _hitting_totals(entries, ymd)
+    v = _iso_from_hitting(t["h"], t["tb"], t["ab"])
+    return round(v, 3) if v is not None else None
+
+
+def batter_recent_ops_as_of(entries: list[dict] | None, ymd: str, window: int = 10) -> float | None:
+    """OPS over the batter's last `window` games before `ymd` (hot-streak signal)."""
+    if not entries:
+        return None
+    recent = [e for e in entries if e["d"] < ymd][-window:]
+    if not recent:
+        return None
+    t = _hitting_totals(recent, "9999-12-31")
+    v = _ops_from_hitting(t["ab"], t["h"], t["bb"], t["hbp"], t["sf"], t["tb"])
+    return round(v, 3) if v is not None else None
+
+
 def attach_lineups_as_of(games: list[dict], lineups: dict, batter_logs: dict) -> list[dict]:
     """Attach lineups with each batter's OPS as-of the game's own date (no lookahead)."""
     out = []
@@ -901,30 +1014,52 @@ def attach_lineups_as_of(games: list[dict], lineups: dict, batter_logs: dict) ->
         season = g.get("season")
         ymd = g["date"]
 
+        def batter(p):
+            log = batter_logs.get(f"{p['id']}|{season}")
+            ops = batter_ops_as_of(log, ymd)
+            recent = batter_recent_ops_as_of(log, ymd)
+            if recent is None:
+                recent = ops  # fall back to season OPS so hot-streak stays populated
+            return {
+                **p,
+                "ops": ops,
+                "woba": batter_woba_as_of(log, ymd),
+                "iso": batter_iso_as_of(log, ymd),
+                "recentOps": recent,
+            }
+
         def with_ops(side):
             if not side:
                 return side
             return {
-                "battingOrder": [
-                    {**p, "ops": batter_ops_as_of(batter_logs.get(f"{p['id']}|{season}"), ymd)}
-                    for p in side["battingOrder"]
-                ],
-                "bench": [
-                    {**p, "ops": batter_ops_as_of(batter_logs.get(f"{p['id']}|{season}"), ymd)}
-                    for p in side["bench"]
-                ],
+                "battingOrder": [batter(p) for p in side["battingOrder"]],
+                "bench": [batter(p) for p in side["bench"]],
             }
 
         home = with_ops(lu.get("home"))
         away = with_ops(lu.get("away"))
         home_ops = lineup_ops(home["battingOrder"]) if home else 0.0
         away_ops = lineup_ops(away["battingOrder"]) if away else 0.0
+        home_known = home_ops > 0
+        away_known = away_ops > 0
         out.append({
             **g,
             "lineups": {"home": home, "away": away},
             "lineupStats": {
-                "home": {"known": home_ops > 0, "ops": home_ops},
-                "away": {"known": away_ops > 0, "ops": away_ops},
+                "home": {
+                    "known": home_known,
+                    "ops": home_ops,
+                    "woba": _lineup_weighted(home["battingOrder"], "woba") if home_known else 0.0,
+                    "iso": _lineup_weighted(home["battingOrder"], "iso") if home_known else 0.0,
+                    "recentOps": _lineup_weighted(home["battingOrder"], "recentOps") if home_known else 0.0,
+                },
+                "away": {
+                    "known": away_known,
+                    "ops": away_ops,
+                    "woba": _lineup_weighted(away["battingOrder"], "woba") if away_known else 0.0,
+                    "iso": _lineup_weighted(away["battingOrder"], "iso") if away_known else 0.0,
+                    "recentOps": _lineup_weighted(away["battingOrder"], "recentOps") if away_known else 0.0,
+                },
             },
         })
     return out

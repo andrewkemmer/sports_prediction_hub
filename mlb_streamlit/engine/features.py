@@ -14,7 +14,9 @@ from .metrics import clamp
 ELO_INIT = 1500.0
 ELO_HFA_UPDATE = 30.0  # home advantage baked into Elo updates only
 
-# Canonical feature order (16 features).
+# Canonical feature order (24 features). Every feature is computed as-of the
+# game's own date (no lookahead) and flows into the ML candidate set; greedy
+# backward elimination decides which ones the final model actually uses.
 FEATURE_KEYS = [
     "eloDiff",
     "winPctDiff",
@@ -32,6 +34,14 @@ FEATURE_KEYS = [
     "windMph",
     "lineupKnown",
     "lineupOpsDiff",
+    "lineupWobaDiff",
+    "lineupIsoDiff",
+    "lineupHotDiff",
+    "spK9Diff",
+    "spWhipDiff",
+    "spRecentDiff",
+    "teamK9Diff",
+    "teamWhipDiff",
 ]
 
 FEATURE_LABELS = {
@@ -51,6 +61,14 @@ FEATURE_LABELS = {
     "windMph": "Weather wind",
     "lineupKnown": "Lineup data available",
     "lineupOpsDiff": "Starting-9 OPS edge",
+    "lineupWobaDiff": "Starting-9 wOBA edge",
+    "lineupIsoDiff": "Starting-9 ISO edge",
+    "lineupHotDiff": "Starting-9 hot streak (L10 OPS)",
+    "spK9Diff": "Starting Pitcher K/9 Delta",
+    "spWhipDiff": "Starting Pitcher WHIP Delta",
+    "spRecentDiff": "Starting Pitcher last-3-start ERA Delta",
+    "teamK9Diff": "Staff K/9 edge",
+    "teamWhipDiff": "Staff WHIP edge",
 }
 
 
@@ -105,6 +123,13 @@ def starter_delta(home_pitcher, away_pitcher, key: str) -> float:
     return away - home
 
 
+def _edge(home, away, lower_better: bool = False) -> float:
+    """Signed edge so positive values favor home (0 when either side is missing)."""
+    if not isinstance(home, (int, float)) or not isinstance(away, (int, float)):
+        return 0.0
+    return (away - home) if lower_better else (home - away)
+
+
 def build_features(game: dict, state: dict) -> dict:
     home_elo = state["elo"].get(game["home"]["id"], ELO_INIT)
     away_elo = state["elo"].get(game["away"]["id"], ELO_INIT)
@@ -127,6 +152,10 @@ def build_features(game: dict, state: dict) -> dict:
     away_team_era = game["away"].get("era")
     home_fielding = game["home"].get("fieldingPct")
     away_fielding = game["away"].get("fieldingPct")
+    home_k9 = game["home"].get("k9")
+    away_k9 = game["away"].get("k9")
+    home_whip = game["home"].get("whip")
+    away_whip = game["away"].get("whip")
     temp_f = (game.get("weather") or {}).get("tempF")
     wind = (game.get("weather") or {}).get("windMph")
 
@@ -159,6 +188,14 @@ def build_features(game: dict, state: dict) -> dict:
         "windMph": wind if isinstance(wind, (int, float)) else 0.0,
         "lineupKnown": lineup_known,
         "lineupOpsDiff": lineup_ops_diff,
+        "lineupWobaDiff": _edge((lineup_home or {}).get("woba"), (lineup_away or {}).get("woba")),
+        "lineupIsoDiff": _edge((lineup_home or {}).get("iso"), (lineup_away or {}).get("iso")),
+        "lineupHotDiff": _edge((lineup_home or {}).get("recentOps"), (lineup_away or {}).get("recentOps")),
+        "spK9Diff": _edge((game.get("homePitcher") or {}).get("k9"), (game.get("awayPitcher") or {}).get("k9")),
+        "spWhipDiff": _edge((game.get("homePitcher") or {}).get("whip"), (game.get("awayPitcher") or {}).get("whip"), True),
+        "spRecentDiff": _edge((game.get("homePitcher") or {}).get("recentEra"), (game.get("awayPitcher") or {}).get("recentEra"), True),
+        "teamK9Diff": _edge(home_k9, away_k9),
+        "teamWhipDiff": _edge(home_whip, away_whip, True),
     }
 
 
