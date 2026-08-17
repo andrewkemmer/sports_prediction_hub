@@ -9,6 +9,7 @@ tested headlessly (`python3 mlb_streamlit/scripts/smoke_test.py`).
 from __future__ import annotations
 
 import datetime as _dt
+from concurrent.futures import ThreadPoolExecutor
 
 from . import cache
 from .data import (
@@ -408,11 +409,16 @@ def run_refresh(
             f"Only {len(completed)} completed regular-season games found. Cannot train yet."
         )
 
-    # 3. Pitcher game logs — one fetch per {SP, season}; every game's SP stats
-    #    are then accumulated as-of that game's own date below, so a June game
-    #    never sees stats from the pitcher's July/August starts (no lookahead).
-    rep("Fetching pitcher game logs", 24, "Loading per-game pitching history…")
+    # 3-6. Fetch the independent families concurrently. Pitcher game logs, team
+    #    game logs, boxscore lineups and injury snapshots depend only on the
+    #    schedule, so they run in one I/O-bound wave (each family keeps its own
+    #    internal thread pool). Batter game logs depend on the lineups, so they
+    #    run in a second wave once the lineups are in.
+    rep("Fetching game data", 24, "Loading pitcher/team logs, lineups & injuries…")
     pitcher_log_cache = cache.load_pitcher_logs()
+    team_log_cache = cache.load_team_logs()
+    lineup_cache = cache.load_lineups()
+
     pitcher_pairs = []
     seen_p = set()
     for g in all_games:
@@ -423,53 +429,61 @@ def run_refresh(
                 if key not in seen_p:
                     seen_p.add(key)
                     pitcher_pairs.append({"id": p["id"], "season": s})
-    to_fetch = [p for p in pitcher_pairs if f"{p['id']}|{p['season']}" not in pitcher_log_cache]
-    fresh_pitcher_logs = fetch_pitcher_game_logs(to_fetch, pitcher_log_cache)
-    pitcher_log_cache.update(fresh_pitcher_logs)
-    rep("Pitcher game logs loaded", 30, f"Cached {len(pitcher_log_cache)} pitcher-season logs.")
+    to_fetch_pitcher = [p for p in pitcher_pairs if f"{p['id']}|{p['season']}" not in pitcher_log_cache]
 
-    # 4. Team game logs (hitting / pitching / fielding), same as-of-date logic.
-    rep("Fetching team game logs", 34, "Loading per-game team hitting / pitching / fielding…")
-    team_log_cache = cache.load_team_logs()
     team_pairs = {}
     for g in all_games:
         s = g.get("season") or season
         team_pairs.setdefault(f"{g['home']['id']}|{s}", {"id": g["home"]["id"], "season": s})
         team_pairs.setdefault(f"{g['away']['id']}|{s}", {"id": g["away"]["id"], "season": s})
-    to_fetch = [p for p in team_pairs.values() if f"{p['id']}|{p['season']}" not in team_log_cache]
-    fresh_team_logs = fetch_team_game_logs(to_fetch, team_log_cache)
+    to_fetch_team = [p for p in team_pairs.values() if f"{p['id']}|{p['season']}" not in team_log_cache]
+
+    lineup_targets = [g for g in all_games if g["gamePk"] not in lineup_cache]
+    team_ids = sorted({tid for g in completed for tid in (g["home"]["id"], g["away"]["id"]) if tid > 0})
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        f_pitcher = pool.submit(fetch_pitcher_game_logs, to_fetch_pitcher, pitcher_log_cache)
+        f_team = pool.submit(fetch_team_game_logs, to_fetch_team, team_log_cache)
+        f_lineups = pool.submit(fetch_lineups_for_games, lineup_targets, 16)
+        f_injuries = pool.submit(
+            fetch_injury_snapshots, team_ids, season, f"{season}-{SEASON_START_MD}", today, injury_cache
+        )
+        f_current_injury = pool.submit(fetch_current_injury_snapshot, team_ids, today, season)
+        fresh_pitcher_logs = f_pitcher.result()
+        fresh_team_logs = f_team.result()
+        fetched_lineups = f_lineups.result()
+        injury_snapshots = f_injuries.result()
+        current_injury = f_current_injury.result()
+
+    pitcher_log_cache.update(fresh_pitcher_logs)
     team_log_cache.update(fresh_team_logs)
-    rep("Team game logs loaded", 40, f"Cached {len(team_log_cache)} team-season logs.")
+    for g in lineup_targets:
+        lu = fetched_lineups.get(g["gamePk"])
+        if lu:
+            lineup_cache[g["gamePk"]] = lu
+        elif g.get("winner") in ("home", "away"):
+            # Completed game with no posted lineups — final, never refetch.
+            lineup_cache[g["gamePk"]] = None
+    lineups = {pk: lu for pk, lu in lineup_cache.items() if lu}
+    for tid, count in current_injury.items():
+        lst = injury_snapshots.setdefault(str(tid), [])
+        if not lst or lst[-1]["date"] != today:
+            lst.append({"date": today, "count": count})
+    injury_cache.update(injury_snapshots)
+    rep(
+        "Game data loaded",
+        40,
+        f"Pitcher {len(pitcher_log_cache)} · team {len(team_log_cache)} · "
+        f"lineups {sum(1 for v in lineups.values() if v)} · IL {len(team_ids)} teams",
+    )
 
     enriched = attach_as_of_stats(all_games, pitcher_log_cache, team_log_cache)
 
-    # 5. Lineups (ALL games; incremental via disk cache) + per-season player OPS.
-    #    Historical lineups matter: lineupOpsDiff is a model feature, and it is
-    #    only non-zero when a game has lineup data. Lineups used to be fetched
-    #    for the recent window only, so training history saw a constant 0 and
-    #    the ML feature selection rightly dropped the feature. Fetching the
-    #    boxscore lineup for every completed game (it is final data, cached per
-    #    gamePk) gives the model a real batter-level signal to weigh.
-    rep("Fetching lineups", 44, "Loading starting lineups (historical + upcoming)…")
-    lineup_cache = cache.load_lineups()
-    to_fetch = [g for g in enriched if g["gamePk"] not in lineup_cache]
-    if to_fetch:
-        fetched = fetch_lineups_for_games(to_fetch, 16)
-        for g in to_fetch:
-            lu = fetched.get(g["gamePk"])
-            if lu:
-                lineup_cache[g["gamePk"]] = lu
-            elif g.get("winner") in ("home", "away"):
-                # Completed game with no posted lineups — final, never refetch.
-                lineup_cache[g["gamePk"]] = None
-        cached_count = sum(1 for v in lineup_cache.values() if v)
-        rep("Lineups loaded", 46, f"Cached lineups for {cached_count} games.")
-    lineups = {pk: lu for pk, lu in lineup_cache.items() if lu}
-
-    # Batter game logs: one fetch per {batter, season}. Each batter's OPS is
-    # then accumulated as-of the game's own date, so neither a batter's future
-    # games nor a later season's numbers ever leak into a training row.
-    rep("Fetching batter game logs", 48, "Loading per-game batting history…")
+    # 6b. Batter game logs: one fetch per {batter, season}. Each batter's OPS is
+    #    then accumulated as-of the game's own date, so neither a batter's future
+    #    games nor a later season's numbers ever leak into a training row. This
+    #    depends on the lineups just fetched, hence the second wave.
+    rep("Fetching batter game logs", 44, "Loading per-game batting history…")
     batter_log_cache = cache.load_batter_logs()
     batter_ids_by_season: dict[str, set[int]] = {}
     for g in enriched:
@@ -485,26 +499,8 @@ def run_refresh(
     for s, ids in batter_ids_by_season.items():
         fresh_logs = fetch_batter_game_logs(sorted(ids), s, batter_log_cache)
         batter_log_cache.update(fresh_logs)
-    rep("Batter game logs loaded", 52, f"Cached {len(batter_log_cache)} batter-season logs.")
+    rep("Batter game logs loaded", 48, f"Cached {len(batter_log_cache)} batter-season logs.")
     enriched = attach_lineups_as_of(enriched, lineups, batter_log_cache)
-
-    # 6. Injury snapshots (current season; only new dates) + current-day counts.
-    rep("Fetching injury data", 54, "Loading injured-list snapshots…")
-    team_ids = sorted({tid for g in completed for tid in (g["home"]["id"], g["away"]["id"]) if tid > 0})
-    injury_snapshots = fetch_injury_snapshots(
-        team_ids,
-        season,
-        f"{season}-{SEASON_START_MD}",
-        today,
-        injury_cache,
-    )
-    current_injury = fetch_current_injury_snapshot(team_ids, today, season)
-    for tid, count in current_injury.items():
-        lst = injury_snapshots.setdefault(str(tid), [])
-        if not lst or lst[-1]["date"] != today:
-            lst.append({"date": today, "count": count})
-    injury_cache.update(injury_snapshots)
-    rep("Injury data loaded", 58, f"Loaded IL snapshots for {len(team_ids)} teams.")
 
     completed_enriched = [g for g in enriched if g.get("winner") in ("home", "away")]
 
@@ -684,30 +680,35 @@ def predict_date(date: str, state: dict | None = None) -> int:
     raw = fetch_schedule_range(date, date)
 
     # As-of-date stats for the requested day: game logs cached per {entity, season}.
+    # Pitcher logs, team logs and boxscore lineups are independent — fetch them
+    # concurrently; batter game logs follow once the lineups are known.
     pitcher_log_cache = cache.load_pitcher_logs()
+    team_log_cache = cache.load_team_logs()
     pitcher_pairs = []
     for g in raw:
         s = g.get("season") or season
         for p in (g.get("awayPitcher"), g.get("homePitcher")):
             if p and p.get("id"):
                 pitcher_pairs.append({"id": p["id"], "season": s})
-    to_fetch = [p for p in pitcher_pairs if f"{p['id']}|{p['season']}" not in pitcher_log_cache]
-    fresh_pitcher_logs = fetch_pitcher_game_logs(to_fetch, pitcher_log_cache)
-    pitcher_log_cache.update(fresh_pitcher_logs)
-
-    team_log_cache = cache.load_team_logs()
     team_pairs = {}
     for g in raw:
         s = g.get("season") or season
         for tid in (g["home"]["id"], g["away"]["id"]):
             team_pairs.setdefault(f"{tid}|{s}", {"id": tid, "season": s})
-    to_fetch = [p for p in team_pairs.values() if f"{p['id']}|{p['season']}" not in team_log_cache]
-    fresh_team_logs = fetch_team_game_logs(to_fetch, team_log_cache)
+    to_fetch_pitcher = [p for p in pitcher_pairs if f"{p['id']}|{p['season']}" not in pitcher_log_cache]
+    to_fetch_team = [p for p in team_pairs.values() if f"{p['id']}|{p['season']}" not in team_log_cache]
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        f_pitcher = pool.submit(fetch_pitcher_game_logs, to_fetch_pitcher, pitcher_log_cache)
+        f_team = pool.submit(fetch_team_game_logs, to_fetch_team, team_log_cache)
+        f_lineups = pool.submit(fetch_lineups_for_games, raw, 16)
+        fresh_pitcher_logs = f_pitcher.result()
+        fresh_team_logs = f_team.result()
+        lineups = f_lineups.result()
+    pitcher_log_cache.update(fresh_pitcher_logs)
     team_log_cache.update(fresh_team_logs)
 
     enriched = attach_as_of_stats(raw, pitcher_log_cache, team_log_cache)
 
-    lineups = fetch_lineups_for_games(enriched, 16)
     batter_ids = []
     for lu in lineups.values():
         for side in (lu.get("home"), lu.get("away")):

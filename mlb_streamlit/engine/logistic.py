@@ -17,6 +17,17 @@ from .metrics import (
     std,
 )
 
+try:  # numpy is optional; only used as an accelerator for the IRLS fits
+    import numpy as _np
+except Exception:  # pragma: no cover - fallback path
+    _np = None
+
+
+def _np_sigmoid(x):
+    """Numerically stable sigmoid matching engine.metrics.sigmoid, vectorized."""
+    z = _np.exp(-_np.abs(x))
+    return _np.where(x >= 0, 1.0 / (1.0 + z), z / (1.0 + z))
+
 
 def solve_linear_system(A: list[list[float]], b: list[float]) -> list[float]:
     """Solve a small dense linear system A·x = b with partial pivoting."""
@@ -44,8 +55,70 @@ def solve_linear_system(A: list[list[float]], b: list[float]) -> list[float]:
     return [row[n] for row in aug]
 
 
+def _train_logistic_vectorized(rows: list[dict], feature_names: list[str], iterations: int) -> dict | None:
+    """numpy IRLS — identical math to the pure-Python path below, ~50-100x faster.
+
+    Returns None (so the caller falls back to the reference implementation) when
+    the linear solve fails, e.g. on a singular system.
+    """
+    np = _np
+    n = len(rows)
+    m = len(feature_names)
+    feature_stats = {}
+    for f in feature_names:
+        vals = np.array([r["features"][f] for r in rows], dtype=float)
+        s = float(vals.std())
+        if not s or not math.isfinite(s):
+            s = 1.0
+        feature_stats[f] = {"mean": float(vals.mean()), "std": s}
+    means = np.array([feature_stats[f]["mean"] for f in feature_names])
+    stds = np.array([feature_stats[f]["std"] for f in feature_names])
+    X = np.array([[r["features"][f] for f in feature_names] for r in rows], dtype=float)
+    X = (X - means) / stds
+    Xaug = np.column_stack([X, np.ones(n)])
+    y = np.array([r["label"] for r in rows], dtype=float)
+    d = m + 1  # feature columns + intercept column
+    pos = float(y.sum())
+    w = np.zeros(d)
+    w[m] = math.log((pos + 1) / (n - pos + 1))
+    lambda_ = 0.001
+
+    for _ in range(iterations):
+        eta = Xaug @ w
+        p = np.clip(_np_sigmoid(eta), 1e-6, 1 - 1e-6)
+        weight = np.maximum(p * (1 - p), 1e-6)
+        z = eta + (y - p) / weight
+        wz = weight * z
+        rhs = Xaug.T @ wz
+        A = Xaug.T @ (Xaug * weight[:, None])
+        if m > 0:
+            A[np.arange(m), np.arange(m)] += lambda_  # ridge the features, not the intercept
+        try:
+            nxt = np.linalg.solve(A, rhs)
+        except np.linalg.LinAlgError:
+            return None
+        if not np.all(np.isfinite(nxt)):
+            break
+        w = nxt
+
+    return {
+        "featureNames": feature_names,
+        "weights": [float(v) for v in w[:m]],
+        "bias": float(w[m]),
+        "featureStats": feature_stats,
+    }
+
+
 def train_logistic(rows: list[dict], feature_names: list[str], iterations: int = 20) -> dict:
     """Newton-Raphson / IRLS ridge logistic regression (standardized features)."""
+    if _np is not None:
+        try:
+            m = _train_logistic_vectorized(rows, feature_names, iterations)
+            if m is not None:
+                return m
+        except Exception:  # pragma: no cover - fall back to the reference on any edge case
+            pass
+
     feature_stats = {}
     for f in feature_names:
         vals = [r["features"][f] for r in rows]
