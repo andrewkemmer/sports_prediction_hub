@@ -1,0 +1,18 @@
+services:
+  mlb-streamlit:
+    build: .
+    image: mlb-streamlit:latest
+    container_name: mlb-streamlit
+    ports:
+      - "8501:8501"
+    environment:
+      # Optional — real market odds (moneyline / totals / run lines) from The
+      # Odds API. Without it the dashboard shows fair odds derived from the model.
+      - THE_ODDS_API_KEY=${THE_ODDS_API_KEY:-}
+    # Persist the JSON cache so refreshes stay incremental across restarts.
+    volumes:
+      - mlb_cache:/app/cache
+    restart: unless-stopped
+
+volumes:
+  mlb_cache:

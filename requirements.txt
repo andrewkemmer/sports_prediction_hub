@@ -1,0 +1,3 @@
+# Streamlit Community Cloud installs the requirements.txt found at the repo
+# root. This file redirects it to the dashboard's own pinned requirements.
+-r mlb_streamlit/requirements.txt

@@ -1,0 +1,14 @@
+# Local caches / state — rebuilt at runtime by the app
+cache/
+
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+
+# VCS / editor noise
+.git/
+.gitignore
+.DS_Store
+.venv/
+venv/

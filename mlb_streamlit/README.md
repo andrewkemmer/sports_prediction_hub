@@ -33,6 +33,20 @@ market odds, then runs the full Auto-ML pipeline and generates win
 probabilities for the rest of the season. Later refreshes are incremental —
 only new dates are re-fetched.
 
+## Deploy
+
+See [`DEPLOYMENT.md`](DEPLOYMENT.md) for two supported paths:
+
+- **Streamlit Community Cloud** — point it at `mlb_streamlit/app.py`; the
+  repo-root `requirements.txt` installs dependencies, no API keys needed (the
+  MLB Stats API is public).
+- **Docker** — `docker build -t mlb-streamlit . && docker run -p 8501:8501 mlb-streamlit`
+  (plus a `docker-compose.yml` with a persistent cache volume).
+
+An optional `THE_ODDS_API_KEY` (The Odds API) enables live sportsbook
+moneyline/total/run-line prices; without it the app shows model-derived fair
+odds.
+
 ## The refresh button
 
 The single **Refresh & train** button (header) and the **Run Auto-ML
