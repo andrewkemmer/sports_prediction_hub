@@ -17,6 +17,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
 
+from . import cache
 from .engine.teams import team_meta
 
 MLB_BASE = "https://statsapi.mlb.com"
@@ -594,6 +595,12 @@ def fetch_player_season_ops(ids: list[int], season: str, cached: dict | None = N
 # ---------------------------------------------------------------------------
 
 ODDS_BASE = "https://api.the-odds-api.com/v4/sports/baseball_mlb/odds"
+ODDS_TTL_SECONDS = 3600  # reuse cached market odds within an hour
+
+
+def market_odds_enabled() -> bool:
+    """True when THE_ODDS_API_KEY is configured (live market prices)."""
+    return bool(os.environ.get("THE_ODDS_API_KEY"))
 
 
 def odds_num(v) -> float | None:
@@ -659,11 +666,21 @@ def odds_from_event(event: dict) -> dict | None:
 
 
 def fetch_market_odds() -> dict:
-    """"date|homeFullName|awayFullName" -> MarketOdds (best-effort, empty w/o key)."""
+    """"date|homeFullName|awayFullName" -> MarketOdds (best-effort, empty w/o key).
+
+    Reads THE_ODDS_API_KEY from the environment. Without the key the map is
+    empty and the UI shows model-derived fair odds. Results are cached on disk
+    for ODDS_TTL_SECONDS so on-demand date lookups don't burn the free-tier
+    request budget; a failed fetch falls back to the last good snapshot.
+    """
+    if not market_odds_enabled():
+        return {}
+    cached = cache.load_market_odds()
+    fetched_at = cached.get("fetchedAt") or 0
+    if cached.get("odds") and time.time() * 1000 - fetched_at < ODDS_TTL_SECONDS * 1000:
+        return cached["odds"]
     out: dict = {}
-    api_key = os.environ.get("THE_ODDS_API_KEY")
-    if not api_key:
-        return out
+    api_key = os.environ["THE_ODDS_API_KEY"]
     try:
         url = (
             f"{ODDS_BASE}/?apiKey={urllib.parse.quote(api_key)}"
@@ -675,7 +692,9 @@ def fetch_market_odds() -> dict:
             if parsed and parsed["date"]:
                 out[f"{parsed['date']}|{parsed['home']}|{parsed['away']}"] = parsed["odds"]
     except Exception:  # noqa: BLE001 — market odds are best-effort
-        pass
+        return cached.get("odds") or {}
+    if out:
+        cache.save_market_odds({"fetchedAt": int(time.time() * 1000), "odds": out})
     return out
 
 

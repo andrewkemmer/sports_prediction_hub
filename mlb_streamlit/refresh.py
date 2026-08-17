@@ -26,6 +26,7 @@ from .data import (
     fetch_lineups_for_games,
     fetch_market_odds,
     fetch_pitcher_stats,
+    market_odds_enabled,
     fetch_player_season_ops,
     fetch_schedule_range,
     fetch_team_season_stats,
@@ -514,6 +515,11 @@ def run_refresh(
     # 8. Market odds (best-effort).
     rep("Fetching market odds", 68, "Loading market odds (best-effort)…")
     market_odds = fetch_market_odds()
+    market_odds_status = {
+        "enabled": market_odds_enabled(),
+        "count": len(market_odds),
+        "fetchedAt": int(now.timestamp() * 1000),
+    }
 
     # 9. Calibration rows for every completed game (as-of-time predictions).
     rep("Scoring games", 74, "Generating predictions & run simulations…")
@@ -623,6 +629,7 @@ def run_refresh(
         "spearmanRho": spearman,
         "topDecileWinRate": top_decile,
         "todaysRecord": todays_record,
+        "marketOddsStatus": market_odds_status,
     }
     cache.save_model_state(state)
     cache.save_games(all_games)

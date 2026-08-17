@@ -21,6 +21,7 @@ _TEAM_STATS = "team_stats.json"
 _PLAYER_OPS = "player_ops.json"
 _INJURIES = "injury_snapshots.json"
 _DOCS_BY_DATE = "docs_by_date.json"
+_MARKET_ODDS = "market_odds.json"
 
 
 def _path(name: str) -> Path:
@@ -116,6 +117,14 @@ def load_docs_by_date() -> dict:
 
 def save_docs_by_date(docs: dict) -> None:
     save_json(_DOCS_BY_DATE, docs)
+
+
+def load_market_odds() -> dict:
+    return load_json(_MARKET_ODDS, {}) or {}
+
+
+def save_market_odds(payload: dict) -> None:
+    save_json(_MARKET_ODDS, payload)
 
 
 def cache_size_bytes() -> int:

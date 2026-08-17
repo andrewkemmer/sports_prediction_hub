@@ -33,6 +33,13 @@ market odds, then runs the full Auto-ML pipeline and generates win
 probabilities for the rest of the season. Later refreshes are incremental —
 only new dates are re-fetched.
 
+**Market odds (optional):** set the `THE_ODDS_API_KEY` env var to show live
+sportsbook prices (moneyline / totals / run lines) on the game cards. Without
+it the dashboard uses model-derived fair odds and shows an amber status chip in
+the header. Odds snapshots are cached on disk for an hour, so on-demand date
+lookups stay inside The Odds API free-tier limits; a failed fetch falls back to
+the last good snapshot.
+
 ## Deploy
 
 See [`DEPLOYMENT.md`](DEPLOYMENT.md) for two supported paths:

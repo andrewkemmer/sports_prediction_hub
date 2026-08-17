@@ -25,6 +25,7 @@ import math
 import os
 import random
 import sys
+import time
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -330,6 +331,107 @@ def test_automl_pipeline() -> None:
     check("apply_model probability", 0 <= applied["homeWinProb"] <= 1)
 
 
+def test_market_odds() -> None:
+    print("market odds")
+    import mlb_streamlit.data as data
+
+    calls = {"n": 0}
+    original_fetch = data.fetch_json
+
+    def fake_fetch(url: str, attempt: int = 0) -> dict:
+        calls["n"] += 1
+        return [
+            {
+                "home_team": "Los Angeles Dodgers",
+                "away_team": "Los Angeles Angels",
+                "commence_time": "2026-08-20T23:10:00Z",
+                "bookmakers": [
+                    {
+                        "key": "fanduel",
+                        "markets": [
+                            {"key": "h2h", "outcomes": [
+                                {"name": "Los Angeles Dodgers", "price": -190},
+                                {"name": "Los Angeles Angels", "price": 165},
+                            ]},
+                        ],
+                    },
+                    {
+                        "key": "pinnacle",
+                        "markets": [
+                            {"key": "h2h", "outcomes": [
+                                {"name": "Los Angeles Dodgers", "price": -180},
+                                {"name": "Los Angeles Angels", "price": 155},
+                            ]},
+                            {"key": "totals", "outcomes": [
+                                {"name": "Over", "price": -110, "point": 8.5},
+                                {"name": "Under", "price": -110, "point": 8.5},
+                            ]},
+                            {"key": "spreads", "outcomes": [
+                                {"name": "Los Angeles Dodgers", "price": -115, "point": -1.5},
+                                {"name": "Los Angeles Angels", "price": -105, "point": 1.5},
+                            ]},
+                        ],
+                    },
+                ],
+            }
+        ]
+
+    old_key = os.environ.get("THE_ODDS_API_KEY")
+    old_cached = cache.load_market_odds()
+    try:
+        os.environ.pop("THE_ODDS_API_KEY", None)
+        data.fetch_json = fake_fetch
+        check("no key -> empty odds", data.fetch_market_odds() == {})
+        check("no key -> no HTTP call", calls["n"] == 0)
+
+        os.environ["THE_ODDS_API_KEY"] = "test-key"
+        odds = data.fetch_market_odds()
+        key = "2026-08-20|Los Angeles Dodgers|Los Angeles Angels"
+        check("odds parsed", len(odds) == 1 and key in odds)
+        entry = odds[key]
+        for k in ("homeMoneyline", "awayMoneyline", "total", "overPrice",
+                  "underPrice", "runLine", "homeRunLinePrice", "awayRunLinePrice"):
+            check(f"odds entry has {k}", k in entry and entry[k] is not None)
+        check("odds values sane", entry["homeMoneyline"] == -180 and entry["runLine"] == 1.5)
+
+        calls["n"] = 0
+        check("cached within TTL", data.fetch_market_odds() == odds and calls["n"] == 0)
+
+        cache.save_market_odds({"fetchedAt": int(time.time() * 1000) - 7200_000, "odds": odds})
+        calls["n"] = 0
+        check("stale cache refetches", data.fetch_market_odds() == odds and calls["n"] == 1)
+
+        def boom(url: str, attempt: int = 0) -> dict:
+            raise RuntimeError("network down")
+
+        data.fetch_json = boom
+        check("failed fetch falls back to cache", data.fetch_market_odds() == odds)
+        data.fetch_json = fake_fetch
+
+        bm = data.pick_bookmaker([
+            {"key": "fanduel", "markets": []},
+            {"key": "pinnacle", "markets": []},
+        ])
+        check("pick_bookmaker prefers pinnacle", bm["key"] == "pinnacle")
+
+        game = {"date": "2026-08-20", "home": {"id": 119}, "away": {"id": 108}}
+        matched = data.market_odds_for_game(odds, game)
+        check("market_odds_for_game resolves full names",
+              matched is not None and matched.get("homeMoneyline") == -180)
+    finally:
+        data.fetch_json = original_fetch
+        if old_key is None:
+            os.environ.pop("THE_ODDS_API_KEY", None)
+        else:
+            os.environ["THE_ODDS_API_KEY"] = old_key
+        if old_cached:
+            cache.save_market_odds(old_cached)
+        else:
+            p = cache._path("market_odds.json")
+            if p.exists():
+                os.remove(p)
+
+
 def test_cache_roundtrip() -> None:
     print("cache")
     marker = "_smoke_test.json"
@@ -350,6 +452,7 @@ def main() -> int:
     test_logistic()
     test_features_and_elo()
     test_runs_model()
+    test_market_odds()
     test_automl_pipeline()
     test_cache_roundtrip()
     print(f"\nAll {_CHECKS} checks passed.")

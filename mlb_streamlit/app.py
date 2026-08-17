@@ -28,7 +28,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from mlb_streamlit import cache, ui
-from mlb_streamlit.data import et_date_string
+from mlb_streamlit.data import et_date_string, market_odds_enabled
 from mlb_streamlit.engine.metrics import (
     calibration_curve_points,
     compute_auc,
@@ -276,12 +276,25 @@ def render_header(bundle) -> None:
     with mid:
         if bundle:
             ms = bundle["model_state"]
+            odds_status = ms.get("marketOddsStatus") or {}
+            odds_enabled = odds_status.get("enabled", market_odds_enabled())
+            if odds_enabled:
+                odds_chip = ui.pill(
+                    f"📈 Market odds live · {odds_status.get('count', 0)} games",
+                    ui.EMERALD, "rgba(52,211,153,0.15)",
+                )
+            else:
+                odds_chip = ui.pill(
+                    "Fair odds — set THE_ODDS_API_KEY",
+                    ui.AMBER, "rgba(252,211,77,0.15)",
+                )
             st.markdown(
                 f"<div style='font-size:12px;color:{ui.MUTED};line-height:1.6'>"
                 f"As of <b style='color:{ui.TEXT}'>{fmt_date_long(ms['asOfDate'])}</b> · "
                 f"Trained {fmt_trained_at(ms['trainedAt'])} · "
                 f"{fmt_number(ms['gamesTrained'])} games trained · "
-                f"Model: <b style='color:{ui.TEXT}'>{ms['selectedModel']}</b></div>",
+                f"Model: <b style='color:{ui.TEXT}'>{ms['selectedModel']}</b></div>"
+                f"<div style='margin-top:6px;'>{odds_chip}</div>",
                 unsafe_allow_html=True,
             )
         else:
