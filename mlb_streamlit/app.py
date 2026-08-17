@@ -859,7 +859,7 @@ def rankings_tab(bundle) -> None:
             f"<b style='color:{elo_color};font-variant-numeric:tabular-nums;'>{round(r['elo'])}</b>",
             f"<span style='color:{ui.TEXT};font-variant-numeric:tabular-nums;'>{r['wins']}-{r['losses']}</span>",
             f"<span style='color:{ui.TEXT};font-variant-numeric:tabular-nums;'>{r['winPct']:.3f}".replace("0.", ".") + "</span>",
-            f"<span style='color:{rd_color};font-variant-numeric:tabular-nums;'{('+' if run_diff > 0 else '') + str(run_diff)}</span>",
+            f"<span style='color:{rd_color};font-variant-numeric:tabular-nums;'>{('+' if run_diff > 0 else '')}{run_diff}</span>",
             f"<span style='color:{ui.MUTED};font-variant-numeric:tabular-nums;'>{l10_wins}-{10 - l10_wins}</span>",
             f"<span style='color:{ui.MUTED};font-variant-numeric:tabular-nums;'>{r['homeWinPct']:.3f}".replace("0.", ".") + "</span>",
             f"<span style='color:{ui.MUTED};font-variant-numeric:tabular-nums;'>{r['awayWinPct']:.3f}".replace("0.", ".") + "</span>",

@@ -428,6 +428,9 @@ joined = "\n".join(_MARKDOWN)
 assert "Power Rankings" in joined, "rankings header rendered"
 assert "LAD" in joined and "SF" in joined, "ranking rows rendered"
 assert "Run Diff" in joined, "rankings table columns rendered"
+# Regression: the run-diff cell used to carry a stray quote that closed the
+# style attribute before the value, so +128/-54 never displayed.
+assert "+128" in joined, "run-diff value renders inside its span"
 check("rankings_tab renders Elo power rankings table (no crash)")
 
 print(f"\nAll {len(CHECKS)} UI render checks passed.")

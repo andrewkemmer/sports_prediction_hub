@@ -3,7 +3,7 @@
 # The entire data + ML engine runs on the Python standard library; only the
 # UI layer needs these packages.
 
-streamlit>=1.39.0      # st.segmented_control / st.container(border=True) / st.toast
+streamlit>=1.42.0      # st.segmented_control (1.42+) / st.container(border=True) / st.toast
 plotly>=5.20.0         # calibration & rolling-Brier charts
 
 # Optional accelerator used by engine/model.py; the engine falls back to
