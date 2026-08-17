@@ -58,9 +58,80 @@ _CSS = """
 div[data-testid="stExpander"] details { border: 1px solid rgba(255,255,255,0.09); border-radius: 12px; background: #12161c; }
 div[data-testid="stVerticalBlockBorderWrapper"] { border-color: rgba(255,255,255,0.09) !important; border-radius: 16px; }
 .stButton > button[kind="primary"] { background: #427ff7; border-radius: 8px; font-weight: 600; }
-/* Header nav links (React-style hover) */
-.mlb-nav a { transition: color .15s; }
-.mlb-nav a:hover { color: #e5e8ec !important; }
+/* Sticky app header — the first row of columns (React-style sticky nav) */
+[data-testid="stHorizontalBlock"]:first-of-type {
+  position: sticky !important;
+  top: 0;
+  z-index: 100;
+  background: rgba(10,13,18,0.85);
+  backdrop-filter: blur(8px);
+  border-bottom: 1px solid rgba(255,255,255,0.07);
+  padding: 10px 2px;
+  margin-bottom: 16px;
+}
+/* Header nav tabs render as text links with an underline bar when active (React-style) */
+div[class*="st-key-nav_"] { display: flex; justify-content: center; }
+div[class*="st-key-nav_"] button {
+  background: transparent !important;
+  border: none !important;
+  border-radius: 8px;
+  color: #8b939f;
+  font-size: 14px;
+  font-weight: 500;
+  padding: 6px 10px;
+  box-shadow: none !important;
+}
+div[class*="st-key-nav_"] button:hover { color: #e5e8ec !important; background: rgba(255,255,255,0.04) !important; }
+div[class*="st-key-nav_active_"] button {
+  color: #e5e8ec !important;
+  border-bottom: 2px solid #427ff7 !important;
+  border-radius: 0 !important;
+}
+/* Header refresh button (React-style bordered pill) */
+div[class*="st-key-header_refresh"] { display: flex; justify-content: flex-end; }
+div[class*="st-key-header_refresh"] button {
+  border: 1px solid rgba(255,255,255,0.09) !important;
+  background: #12161c !important;
+  border-radius: 8px;
+  color: #e5e8ec;
+  font-size: 12px;
+  font-weight: 500;
+  padding: 6px 12px;
+  box-shadow: none !important;
+}
+div[class*="st-key-header_refresh"] button:hover { border-color: rgba(255,255,255,0.18) !important; }
+/* Prev / next day square buttons (React-style) */
+div[class*="st-key-date_prev"], div[class*="st-key-date_next"] { display: flex; justify-content: center; }
+div[class*="st-key-date_prev"] button, div[class*="st-key-date_next"] button {
+  width: 32px !important;
+  min-width: 32px !important;
+  height: 32px !important;
+  min-height: 32px !important;
+  padding: 0 !important;
+  border: 1px solid rgba(255,255,255,0.09) !important;
+  background: #12161c !important;
+  border-radius: 8px !important;
+  color: #8b939f !important;
+  font-size: 16px !important;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: none !important;
+}
+div[class*="st-key-date_prev"] button:hover, div[class*="st-key-date_next"] button:hover { color: #e5e8ec !important; border-color: rgba(255,255,255,0.2) !important; }
+/* Date pill opens a calendar popover (React-style blue-tinted rounded pill) */
+button[data-testid="stPopoverButton"] {
+  border-radius: 999px;
+  border: 1px solid rgba(59,130,246,0.30);
+  background: rgba(59,130,246,0.10);
+  color: #e5e8ec;
+  font-weight: 500;
+  font-size: 14px;
+  padding: 8px 20px;
+  white-space: nowrap;
+  box-shadow: none !important;
+}
+button[data-testid="stPopoverButton"]:hover { border-color: rgba(59,130,246,0.50) !important; }
 /* Date inputs render as rounded pills (React-style, blue-tinted like the calendar trigger) */
 div[data-testid="stDateInput"] > label { display: none; }
 div[data-testid="stDateInput"] [data-baseweb="input"] { border-radius: 9999px; }
@@ -296,62 +367,36 @@ TAB_IDS: list[tuple[str, str]] = [
     ("monitor", "Model Monitor"),
 ]
 
-_VALID_TABS = {t for t, _ in TAB_IDS}
-
-
-def _nav_href(tab_id: str) -> str:
-    """Href for a header nav link, preserving the app's current URL state."""
-    params = {"tab": tab_id}
-    d = st.session_state.get("games_date")
-    if d is not None:
-        params["date"] = d.isoformat()
-    f = st.session_state.get("games_filter")
-    if f:
-        params["filter"] = str(f).split(" (")[0]
-    if tab_id == "calibration":
-        v = st.session_state.get("cal_view")
-        if v:
-            params["cal_view"] = v
-    if tab_id == "monitor":
-        s = st.session_state.get("mon_sub")
-        if s:
-            params["mon_sub"] = s
-    return "?" + "&".join(f"{k}={v}" for k, v in params.items())
-
-
-def _nav_link(tab_id: str, label: str, active: bool) -> str:
-    """One header nav tab — text + primary underline bar when active (React-style)."""
-    color = ui.TEXT if active else ui.MUTED
-    underline = (
-        "<span style='display:block;height:2px;width:100%;background:#427ff7;border-radius:999px;'></span>"
-        if active else ""
-    )
-    return (
-        f"<a href='{_nav_href(tab_id)}' style='display:inline-flex;flex-direction:column;align-items:center;"
-        f"gap:2px;padding:6px 12px;border-radius:8px;font-size:14px;font-weight:500;color:{color};"
-        f"text-decoration:none;white-space:nowrap;'>{label}{underline}</a>"
-    )
-
-
 def render_header(active_tab: str) -> None:
-    """Sticky header matching the React dashboard: mark + title, nav tabs, refresh."""
-    nav = "".join(_nav_link(t, label, t == active_tab) for t, label in TAB_IDS)
-    refresh = (
-        f"<a href='{_nav_href(active_tab)}&refresh=1' style='display:inline-flex;align-items:center;gap:6px;"
-        f"border:1px solid {ui.BORDER};background:{ui._card_bg()};border-radius:8px;padding:6px 12px;"
-        f"font-size:12px;font-weight:500;color:{ui.TEXT};text-decoration:none;white-space:nowrap;'>"
-        f"⟳ Refresh</a>"
-    )
-    st.markdown(
-        f"<div style='position:sticky;top:0;z-index:100;background:rgba(10,13,18,0.85);backdrop-filter:blur(8px);"
-        f"border-bottom:1px solid rgba(255,255,255,0.07);padding:10px 2px;margin-bottom:16px;'>"
-        f"<div style='display:flex;align-items:center;gap:14px;flex-wrap:wrap;'>"
-        f"<div style='display:flex;align-items:center;gap:10px;'>{ui.baseball_mark()}"
-        f"<span style='font-size:16px;font-weight:700;color:{ui.TEXT};letter-spacing:-.01em;white-space:nowrap;'>MLB Predictions</span></div>"
-        f"<nav class='mlb-nav' style='display:flex;align-items:center;gap:2px;flex:1;justify-content:center;flex-wrap:wrap;'>{nav}</nav>"
-        f"<div style='margin-left:auto;'>{refresh}</div></div></div>",
-        unsafe_allow_html=True,
-    )
+    """Sticky header matching the React dashboard: mark + title, nav tabs, refresh.
+
+    Navigation uses in-app buttons + session state. Streamlit rewrites every
+    markdown anchor so it opens in a new tab, so the React-style nav cannot use
+    <a> links — clicking a header must switch tabs in place.
+    """
+    cols = st.columns([2.2, 1.7, 1.6, 1.25, 1.6, 1.15], vertical_alignment="center")
+    with cols[0]:
+        st.markdown(
+            f"<div style='display:flex;align-items:center;gap:10px;'>"
+            f"{ui.baseball_mark()}"
+            f"<span style='font-size:16px;font-weight:700;color:{ui.TEXT};letter-spacing:-.01em;white-space:nowrap;'>MLB Predictions</span></div>",
+            unsafe_allow_html=True,
+        )
+    for col, tid, label in (
+        (cols[1], "games", "Today's Games"),
+        (cols[2], "rankings", "Power Rankings"),
+        (cols[3], "calibration", "Calibration"),
+        (cols[4], "monitor", "Model Monitor"),
+    ):
+        with col:
+            key = f"nav_active_{tid}" if tid == active_tab else f"nav_{tid}"
+            if st.button(label, key=key):
+                st.session_state.active_tab = tid
+                st.rerun()
+    with cols[5]:
+        if st.button("⟳ Refresh", key="header_refresh"):
+            st.session_state.refresh_requested = True
+            st.rerun()
 
 
 def render_empty_state() -> None:
@@ -756,35 +801,34 @@ def games_tab(bundle) -> None:
     )
 
     # Row 2: centered date selector (prev square / date pill / next square)
-    def _square_nav(href: str, glyph: str) -> str:
-        return (
-            f"<a href='{href}' style='display:inline-flex;width:32px;height:32px;align-items:center;"
-            f"justify-content:center;border:1px solid {ui.BORDER};background:{ui._card_bg()};"
-            f"border-radius:8px;color:{ui.MUTED};text-decoration:none;font-size:16px;'>"
-            f"{glyph}</a>"
-        )
-
-    prev_ymd = (st.session_state.games_date - _dt.timedelta(days=1)).isoformat()
-    next_ymd = (st.session_state.games_date + _dt.timedelta(days=1)).isoformat()
+    lo, hi = _dt.date(season, 2, 1), _dt.date(season, 11, 15)
     c_l, c_mid, c_r = st.columns([1, 2, 1], vertical_alignment="center")
     with c_l:
         st.markdown("")
     with c_mid:
         c_prev, c_pill, c_next = st.columns([1, 6, 1], vertical_alignment="center")
         with c_prev:
-            st.markdown(_square_nav(f"?tab=games&date={prev_ymd}", "‹"), unsafe_allow_html=True)
+            if st.button("‹", key="date_prev", help="Previous day"):
+                st.session_state.games_date = max(lo, min(hi, st.session_state.games_date - _dt.timedelta(days=1)))
+                st.rerun()
         with c_pill:
-            st.date_input(
-                "Game date",
-                key="games_date",
-                min_value=_dt.date(season, 2, 1),
-                max_value=_dt.date(season, 11, 15),
-                format="ddd, MMM D, YYYY",
-                label_visibility="collapsed",
-            )
-            st.query_params["date"] = st.session_state.games_date.isoformat()
+            # React-style pill: long date label + calendar in a popover. The
+            # date_input `format` is restricted by Streamlit to YYYY/MM/DD-style
+            # patterns — the old "ddd, MMM D, YYYY" string crashed the app with
+            # StreamlitAPIException on every render of this tab.
+            with st.popover(fmt_date_long(ymd)):
+                st.date_input(
+                    "Game date",
+                    key="games_date",
+                    min_value=lo,
+                    max_value=hi,
+                    format="YYYY-MM-DD",
+                    label_visibility="collapsed",
+                )
         with c_next:
-            st.markdown(_square_nav(f"?tab=games&date={next_ymd}", "›"), unsafe_allow_html=True)
+            if st.button("›", key="date_next", help="Next day"):
+                st.session_state.games_date = max(lo, min(hi, st.session_state.games_date + _dt.timedelta(days=1)))
+                st.rerun()
     with c_r:
         st.markdown("")
 
@@ -806,7 +850,6 @@ def games_tab(bundle) -> None:
     st.session_state.games_filter = display_cur
     selected = st.segmented_control("Filter", options, key="games_filter")
     raw_filter = selected.split(" (")[0] if isinstance(selected, str) else "All Games"
-    st.query_params["filter"] = raw_filter
     filtered = _filter_games(games, raw_filter)
 
     # Content
@@ -1064,7 +1107,6 @@ def calibration_tab(bundle) -> None:
         default="Moneyline",
     )
     view = st.session_state.cal_view
-    st.query_params["cal_view"] = view
 
     # Range selector card (Range label + start → end + counts, matches React)
     prev_start = st.session_state.cal_start
@@ -1722,30 +1764,6 @@ def monitor_tab(bundle) -> None:
 # Main
 # ---------------------------------------------------------------------------
 
-def _apply_url_state() -> str:
-    """Read tab + per-tab state from the URL (nav is HTML links) into session."""
-    raw_tab = st.query_params.get("tab")
-    if isinstance(raw_tab, list):
-        raw_tab = raw_tab[0] if raw_tab else "games"
-    active_tab = raw_tab if raw_tab in _VALID_TABS else "games"
-
-    d = st.query_params.get("date")
-    if isinstance(d, str):
-        try:
-            st.session_state.games_date = _dt.date.fromisoformat(d)
-        except ValueError:
-            pass
-    f = st.query_params.get("filter")
-    if isinstance(f, str):
-        st.session_state.games_filter = f
-    cv = st.query_params.get("cal_view")
-    if isinstance(cv, str):
-        st.session_state.cal_view = cv
-    ms_ = st.query_params.get("mon_sub")
-    if isinstance(ms_, str):
-        st.session_state.mon_sub = ms_
-    return active_tab
-
 
 def main() -> None:
     if "bundle" not in st.session_state:
@@ -1758,13 +1776,13 @@ def main() -> None:
         do_refresh()
         return
 
-    # Header Refresh link (?refresh=1) — same flow as the Auto-ML flag.
-    if st.query_params.get("refresh") is not None:
-        del st.query_params["refresh"]
+    # Header Refresh button — same flow as the Auto-ML flag.
+    if st.session_state.get("refresh_requested", False):
+        del st.session_state["refresh_requested"]
         do_refresh()
         return
 
-    active_tab = _apply_url_state()
+    active_tab = st.session_state.get("active_tab", "games")
     bundle = st.session_state.bundle
 
     render_header(active_tab)

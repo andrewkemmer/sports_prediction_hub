@@ -23,6 +23,7 @@ Run:  python3 mlb_streamlit/scripts/ui_render_test.py
 from __future__ import annotations
 
 import datetime as _dt
+import re
 import sys
 import types
 from pathlib import Path
@@ -36,6 +37,21 @@ CHECKS: list[str] = []
 def check(name: str) -> None:
     CHECKS.append(name)
     print(f"  ok: {name}")
+
+
+# Streamlit only accepts these date_input `format` patterns since the free-form
+# date-fns formats were dropped; anything else raises StreamlitAPIException at
+# runtime (this crashed the deployed app on the games tab).
+_ALLOWED_DATE_FORMATS = re.compile(r"^(YYYY[/.\-]MM[/.\-]DD|DD[/.\-]MM[/.\-]YYYY|MM[/.\-]DD[/.\-]YYYY)$")
+
+
+def _assert_date_input_formats_valid() -> None:
+    for label, key, kw in _DATE_INPUTS:
+        fmt = kw.get("format")
+        assert fmt is None or _ALLOWED_DATE_FORMATS.match(fmt), (
+            f"st.date_input format {fmt!r} is not allowed by Streamlit "
+            "(raises StreamlitAPIException)"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -75,6 +91,8 @@ class _Progress:
 
 _SS = SessionState()
 _MARKDOWN: list[str] = []
+_BUTTONS: list[tuple[str | None, str]] = []
+_DATE_INPUTS: list[tuple[str, str | None, dict]] = []
 
 
 def _segmented_control(label, options, key=None, default=None):
@@ -97,12 +115,18 @@ def _columns(spec, **kw):
 
 
 def _date_input(label, key=None, **kw):
+    _DATE_INPUTS.append((label, key, kw))
     if key is not None and key in _SS:
         return _SS[key]
     val = _dt.date.today()
     if key is not None:
         _SS[key] = val
     return val
+
+
+def _button(label, key=None, **kw):
+    _BUTTONS.append((key, label))
+    return False
 
 
 def _text_input(label, key=None, **kw):
@@ -125,7 +149,8 @@ _st.columns = _columns
 _st.tabs = lambda labels: [_Ctx() for _ in labels]
 _st.date_input = _date_input
 _st.text_input = _text_input
-_st.button = lambda *a, **k: False
+_st.button = _button
+_st.popover = lambda *a, **k: _Ctx()
 _st.progress = lambda *a, **k: _Progress()
 _st.info = lambda *a, **k: None
 _st.caption = lambda *a, **k: None
@@ -389,11 +414,13 @@ check("monitor_tab renders on fresh session (no crash, correct default panel)")
 
 _MARKDOWN.clear()
 _SS.clear()
+_DATE_INPUTS.clear()
 app.calibration_tab(BUNDLE)
 assert _SS.get("cal_view") == "Moneyline", "cal_view should default to Moneyline"
 assert any("Model Calibration Dashboard" in h for h in _MARKDOWN), "calibration header rendered"
 assert any("Calibration Curve" in h for h in _MARKDOWN), "calibration curve section rendered"
-check("calibration_tab renders Moneyline view on fresh session (no crash)")
+_assert_date_input_formats_valid()
+check("calibration_tab renders Moneyline view on fresh session (no crash, valid date format)")
 
 # ---------------------------------------------------------------------------
 # Regression 3: layout parity — header nav, games tab, power rankings
@@ -401,14 +428,19 @@ check("calibration_tab renders Moneyline view on fresh session (no crash)")
 
 _MARKDOWN.clear()
 _SS.clear()
+_BUTTONS.clear()
 app.render_header("games")
 joined = "\n".join(_MARKDOWN)
-for label in ("MLB Predictions", "Today's Games", "Power Rankings", "Calibration", "Model Monitor", "Refresh"):
-    assert label in joined, f"header missing {label!r}"
-check("render_header renders sticky nav + refresh link (no crash)")
+assert "MLB Predictions" in joined, "header title rendered"
+assert "<a " not in joined, "header must not render <a> links (Streamlit opens them in new tabs)"
+btn_labels = [label for _, label in _BUTTONS]
+for label in ("Today's Games", "Power Rankings", "Calibration", "Model Monitor", "⟳ Refresh"):
+    assert label in btn_labels, f"header nav button missing {label!r}"
+check("render_header renders sticky nav + refresh as in-app buttons (no <a> links)")
 
 _MARKDOWN.clear()
 _SS.clear()
+_DATE_INPUTS.clear()
 _SS["games_date"] = _dt.date(2026, 8, 16)
 _SS["games_filter"] = "All Games (2)"
 _SS["bundle"] = BUNDLE
@@ -419,7 +451,8 @@ assert "2 of 2 games shown" in joined, "summary chips row rendered"
 assert "Predicted score" in joined, "game card run projection rendered"
 assert "Final" in joined, "final-status pill rendered on completed game"
 assert "LAD" in joined and "NYM" in joined, "both game cards rendered"
-check("games_tab renders summary row + date selector + game cards (no crash)")
+_assert_date_input_formats_valid()
+check("games_tab renders summary row + date selector + game cards (no crash, valid date format)")
 
 _MARKDOWN.clear()
 _SS.clear()
