@@ -8,16 +8,16 @@ from __future__ import annotations
 
 import html as _html
 
-ACCENT = "#4d7fff"
+ACCENT = "#427ff7"
 CYAN = "#22d3ee"
 EMERALD = "#34d399"
 AMBER = "#fcd34d"
 ROSE = "#fb7185"
 PURPLE = "#e879f9"
 ORANGE = "#fb923c"
-MUTED = "#8b93a7"
-TEXT = "#e6e8ee"
-BORDER = "rgba(255,255,255,0.08)"
+MUTED = "#8b939f"
+TEXT = "#e5e8ec"
+BORDER = "rgba(255,255,255,0.09)"
 
 
 def esc(value) -> str:
@@ -106,7 +106,7 @@ def legend(color: str, label: str, dashed: bool = False) -> str:
 
 
 def _card_bg() -> str:
-    return "#141922"
+    return "#12161c"
 
 
 def section(title: str, subtitle: str = "") -> None:

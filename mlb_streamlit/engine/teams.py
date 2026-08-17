@@ -44,7 +44,7 @@ def team_meta(team_id: int) -> dict:
         "abbrev": "TBD",
         "name": f"Team {team_id}",
         "fullName": f"Team {team_id}",
-        "color": "#8b93a7",
+        "color": "#8b939f",
     }
 
 

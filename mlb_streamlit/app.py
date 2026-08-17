@@ -51,16 +51,16 @@ st.set_page_config(page_title="MLB Predictions — 2026", page_icon="⚾", layou
 
 _CSS = """
 <style>
-.stApp { background: #0b0e14; }
-[data-testid="stHeader"] { background: rgba(11,14,20,0.85); backdrop-filter: blur(8px); border-bottom: 1px solid rgba(255,255,255,0.07); }
+.stApp { background: #0a0d12; }
+[data-testid="stHeader"] { background: rgba(10,13,18,0.8); backdrop-filter: blur(8px); border-bottom: 1px solid rgba(255,255,255,0.07); }
 [data-testid="stMetricValue"] { font-variant-numeric: tabular-nums; }
 [data-testid="stTabs"] [data-baseweb="tab-list"] { gap: 4px; border-bottom: 1px solid rgba(255,255,255,0.07); }
 [data-testid="stTabs"] [data-baseweb="tab"] { border-radius: 8px; padding: 6px 14px; font-weight: 500; }
-[data-testid="stTabs"] [aria-selected="true"] { color: #4d7fff !important; }
+[data-testid="stTabs"] [aria-selected="true"] { color: #427ff7 !important; }
 .block-container { padding-top: 1.2rem; padding-bottom: 3rem; max-width: 1200px; }
-div[data-testid="stExpander"] details { border: 1px solid rgba(255,255,255,0.08); border-radius: 12px; background: #141922; }
-div[data-testid="stVerticalBlockBorderWrapper"] { border-color: rgba(255,255,255,0.08) !important; border-radius: 16px; }
-.stButton > button[kind="primary"] { background: #4d7fff; }
+div[data-testid="stExpander"] details { border: 1px solid rgba(255,255,255,0.09); border-radius: 12px; background: #12161c; }
+div[data-testid="stVerticalBlockBorderWrapper"] { border-color: rgba(255,255,255,0.09) !important; border-radius: 16px; }
+.stButton > button[kind="primary"] { background: #427ff7; }
 </style>
 """
 st.markdown(_CSS, unsafe_allow_html=True)
@@ -1062,7 +1062,7 @@ def calibration_tab(bundle) -> None:
         st.markdown(
             f"<div style='background:{ui._card_bg()};border:1px solid {ui.BORDER};border-radius:16px;padding:16px;margin-top:14px;'>"
             f"<h3 style='margin:0 0 12px;font-size:14px;font-weight:600;color:{ui.TEXT}'>Reliability Diagram — Binned Data</h3>"
-            + (_reliability_rows(ev["bins"]) if ev["bins"] else "<div style='color:#8b93a7;font-size:13px;padding:20px 0;text-align:center'>No binned data for this range.</div>")
+            + (_reliability_rows(ev["bins"]) if ev["bins"] else "<div style='color:#8b939f;font-size:13px;padding:20px 0;text-align:center'>No binned data for this range.</div>")
             + "</div>",
             unsafe_allow_html=True,
         )
@@ -1416,7 +1416,7 @@ def _ensemble_panel(ms: dict) -> None:
     ]
     steps_html = " ".join(
         f"<span style='background:rgba(255,255,255,0.02);border:1px solid {ui.BORDER};border-radius:10px;padding:6px 12px;font-size:12px;font-weight:500;color:{ui.TEXT}'>{s}</span>"
-        + ("<span style='color:#8b93a7'> → </span>" if i < len(steps) - 1 else "")
+        + ("<span style='color:#8b939f'> → </span>" if i < len(steps) - 1 else "")
         for i, s in enumerate(steps)
     )
     st.markdown(
@@ -1429,7 +1429,7 @@ def _ensemble_panel(ms: dict) -> None:
 
     cand_rows = []
     for c in candidates:
-        status = ui.pill("Selected", ui.EMERALD, "rgba(52,211,153,0.15)") if c.get("selected") else "<span style='color:#8b93a7;font-size:12px'>—</span>"
+        status = ui.pill("Selected", ui.EMERALD, "rgba(52,211,153,0.15)") if c.get("selected") else "<span style='color:#8b939f;font-size:12px'>—</span>"
         cand_rows.append([
             f"<b style='color:{ui.TEXT}'>{c['name']}</b>",
             f"<span style='color:{ui.TEXT};font-variant-numeric:tabular-nums'>{c['auc']:.3f}</span>",
@@ -1546,7 +1546,7 @@ def monitor_tab(bundle) -> None:
         f"<h3 style='margin:0 0 12px;font-size:14px;font-weight:600;color:{ui.TEXT}'>Feature Drift Analysis (PSI Scores)</h3>"
         + (ui.html_table(["Feature", "Current Mean", "Baseline Mean", "PSI", "Status"], drift_rows,
                           align=["left", "right", "right", "right", "right"]) if drift_rows
-           else "<div style='color:#8b93a7;font-size:13px;padding:20px 0;text-align:center'>No drift data yet.</div>")
+           else "<div style='color:#8b939f;font-size:13px;padding:20px 0;text-align:center'>No drift data yet.</div>")
         + "</div>",
         unsafe_allow_html=True,
     )
@@ -1583,7 +1583,7 @@ def monitor_tab(bundle) -> None:
         f"<h3 style='margin:0 0 12px;font-size:14px;font-weight:600;color:{ui.TEXT}'>Model Version History</h3>"
         + (ui.html_table(["Version", "Date", "AUC", "Brier", "Notes"], version_rows,
                           align=["left", "left", "right", "right", "left"]) if version_rows
-           else "<div style='color:#8b93a7;font-size:13px;padding:20px 0;text-align:center'>No version history yet.</div>")
+           else "<div style='color:#8b939f;font-size:13px;padding:20px 0;text-align:center'>No version history yet.</div>")
         + "</div>",
         unsafe_allow_html=True,
     )
