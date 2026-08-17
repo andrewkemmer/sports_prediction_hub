@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 import urllib.error
 import urllib.parse
@@ -48,17 +49,27 @@ def fetch_json(url: str, attempt: int = 0) -> dict:
 
 
 def map_limit(items: list, limit: int, fn):
-    """Run `fn` over items with bounded concurrency, preserving order."""
+    """Run `fn` over items with bounded concurrency, preserving order.
+
+    Worker exceptions are NOT silently swallowed: after all workers finish,
+    the first exception is re-raised so callers never see None placeholders.
+    """
     results = [None] * len(items)
+    errors: list[BaseException] = []
     if not items:
         return results
 
     def worker(idx):
-        results[idx] = fn(items[idx])
+        try:
+            results[idx] = fn(items[idx])
+        except BaseException as e:  # noqa: BLE001
+            errors.append(e)
 
     with ThreadPoolExecutor(max_workers=max(1, min(limit, len(items)))) as ex:
         for i in range(len(items)):
             ex.submit(worker, i)
+    if errors:
+        raise errors[0]
     return results
 
 
@@ -105,27 +116,44 @@ def schedule_url(start: str, end: str) -> str:
 # Schedule parsing
 # ---------------------------------------------------------------------------
 
+def _first_float(value) -> float | None:
+    """First float from a scalar or string like '72' or '6 mph' (or None)."""
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        m = re.search(r"-?\d+(?:\.\d+)?", value)
+        return float(m.group()) if m else None
+    return None
+
+
 def parse_weather(w) -> dict | None:
+    """Normalize the MLB API weather blob.
+
+    The API returns `temp`/`wind` as strings ("72", "6 mph, Out To CF") on
+    some games and structured objects ({"speed": 6}) on others; both shapes
+    are handled so a single bad game never breaks the whole refresh.
+    """
     if not w:
         return None
     out: dict = {}
-    try:
-        temp = float(w["temp"]) if isinstance(w.get("temp"), str) else w.get("temp")
-        wind = float(w["wind"]["speed"]) if isinstance(w.get("wind", {}).get("speed"), str) else (w.get("wind") or {}).get("speed")
-    except (TypeError, ValueError):
-        temp = wind = None
+    wind_val = w.get("wind")
+    if isinstance(wind_val, dict):
+        wind = _first_float(wind_val.get("speed"))
+    else:
+        wind = _first_float(wind_val)
+    temp = _first_float(w.get("temp"))
     if isinstance(w.get("condition"), str):
         out["condition"] = w["condition"]
-    if isinstance(temp, (int, float)):
+    if temp is not None:
         out["tempF"] = temp
-    if isinstance(wind, (int, float)):
+    if wind is not None:
         out["windMph"] = wind
     return out if out else None
 
 
 def parse_game(g: dict) -> dict | None:
-    away = g.get("teams", {}).get("away")
-    home = g.get("teams", {}).get("home")
+    away = (g.get("teams") or {}).get("away")
+    home = (g.get("teams") or {}).get("home")
     if not away or not home or not away.get("team", {}).get("id") or not home.get("team", {}).get("id"):
         return None
     away_meta = team_meta(away["team"]["id"])
@@ -197,13 +225,22 @@ def fetch_schedule_range(start: str, end: str) -> list[dict]:
     return parse_schedule(fetch_json(schedule_url(start, end)))
 
 
+def _schedule_chunk(start: str, end: str) -> list[dict]:
+    """Fetch one schedule window; return [] on failure so a bad window is
+    skipped instead of killing the whole refresh."""
+    try:
+        return fetch_schedule_range(start, end)
+    except Exception:  # noqa: BLE001 — transient API errors degrade gracefully
+        return []
+
+
 def fetch_season(season: str, through_date: str) -> list[dict]:
     start = f"{season}-{SEASON_START_MD}"
     ranges = date_ranges(start, through_date, 30)
     seen: dict[int, dict] = {}
-    results = map_limit(ranges, 8, lambda r: fetch_schedule_range(r["start"], r["end"]))
+    results = map_limit(ranges, 8, lambda r: _schedule_chunk(r["start"], r["end"]))
     for games in results:
-        for g in games:
+        for g in games or []:
             seen[g["gamePk"]] = g
     return sorted(seen.values(), key=lambda g: g["gameDate"])
 

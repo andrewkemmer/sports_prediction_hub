@@ -331,6 +331,63 @@ def test_automl_pipeline() -> None:
     check("apply_model probability", 0 <= applied["homeWinProb"] <= 1)
 
 
+def test_data_layer() -> None:
+    print("data layer")
+    import mlb_streamlit.data as data
+
+    # parse_weather must handle string temp/wind AND structured wind objects
+    ws = data.parse_weather({"condition": "Partly Cloudy", "temp": "72", "wind": "6 mph"})
+    check("weather string wind", ws == {"condition": "Partly Cloudy", "tempF": 72.0, "windMph": 6.0}, f"{ws}")
+    wo = data.parse_weather({"condition": "Dome", "temp": 72, "wind": {"speed": 9}})
+    check("weather object wind", wo == {"condition": "Dome", "tempF": 72.0, "windMph": 9.0}, f"{wo}")
+    check("weather none", data.parse_weather(None) is None)
+
+    # parse_game survives a game whose weather has a string wind field
+    raw = {
+        "gamePk": 999001,
+        "officialDate": "2024-04-14",
+        "gameDate": "2024-04-14T18:00:00Z",
+        "dayNight": "day",
+        "gameType": "R",
+        "status": {"abstractGameState": "Final", "detailedState": "Final"},
+        "teams": {
+            "away": {"team": {"id": 108}, "score": 3, "isWinner": False,
+                     "leagueRecord": {"wins": 5, "losses": 2}},
+            "home": {"team": {"id": 119}, "score": 5, "isWinner": True,
+                     "leagueRecord": {"wins": 6, "losses": 1}},
+        },
+        "weather": {"condition": "Clear", "temp": "75", "wind": "8 mph, Out To CF"},
+        "venue": {"name": "Dodger Stadium"},
+    }
+    p = data.parse_game(raw)
+    check("parse_game handles string weather", p is not None and p["weather"]["windMph"] == 8.0, f"{p}")
+
+    # map_limit must propagate worker exceptions (never leave None slots)
+    try:
+        data.map_limit([1, 2, 3], 2, lambda x: 1 / 0)
+        check("map_limit propagates", False, "exception was swallowed")
+    except ZeroDivisionError:
+        check("map_limit propagates", True)
+
+    # fetch_season skips a failed chunk instead of crashing the refresh
+    calls = {"n": 0}
+
+    def fake_schedule(start, end):
+        calls["n"] += 1
+        if start == "2024-04-14":
+            raise RuntimeError("simulated statsapi 500")
+        return [{"gamePk": calls["n"] * 1000 + i, "gameDate": f"{start}T18:00:00Z"} for i in range(3)]
+
+    original = data.fetch_schedule_range
+    data.fetch_schedule_range = fake_schedule
+    try:
+        games = data.fetch_season("2024", "2024-06-30")
+    finally:
+        data.fetch_schedule_range = original
+    check("fetch_season skips failed chunk", len(games) == 9 and calls["n"] == 4,
+          f"{len(games)} games from {calls['n']} chunks")
+
+
 def test_market_odds() -> None:
     print("market odds")
     import mlb_streamlit.data as data
@@ -378,6 +435,11 @@ def test_market_odds() -> None:
 
     old_key = os.environ.get("THE_ODDS_API_KEY")
     old_cached = cache.load_market_odds()
+    # Isolate the test from any real odds snapshot already in the disk cache
+    # (e.g. one fetched live with the user's key), so the mocked path is exercised.
+    cache_p = cache._path("market_odds.json")
+    if cache_p.exists():
+        cache_p.unlink()
     try:
         os.environ.pop("THE_ODDS_API_KEY", None)
         data.fetch_json = fake_fetch
@@ -426,10 +488,8 @@ def test_market_odds() -> None:
             os.environ["THE_ODDS_API_KEY"] = old_key
         if old_cached:
             cache.save_market_odds(old_cached)
-        else:
-            p = cache._path("market_odds.json")
-            if p.exists():
-                os.remove(p)
+        elif cache_p.exists():
+            cache_p.unlink()
 
 
 def test_cache_roundtrip() -> None:
@@ -452,6 +512,7 @@ def main() -> int:
     test_logistic()
     test_features_and_elo()
     test_runs_model()
+    test_data_layer()
     test_market_odds()
     test_automl_pipeline()
     test_cache_roundtrip()
