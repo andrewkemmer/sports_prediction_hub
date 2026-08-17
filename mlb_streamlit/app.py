@@ -155,8 +155,9 @@ def _base_layout(height: int = 300) -> dict:
         plot_bgcolor="rgba(0,0,0,0)",
         font=dict(color=ui.TEXT, size=12),
         margin=dict(l=10, r=14, t=10, b=10),
-        xaxis=dict(gridcolor="rgba(255,255,255,0.06)", zerolinecolor="rgba(255,255,255,0.08)", tickfont=dict(color=ui.MUTED)),
-        yaxis=dict(gridcolor="rgba(255,255,255,0.06)", zerolinecolor="rgba(255,255,255,0.08)", tickfont=dict(color=ui.MUTED)),
+        # NOTE: do not add xaxis/yaxis here — callers always pass their own
+        # axis config, and `update_layout(**_base_layout(...), xaxis=...)`
+        # would raise TypeError: got multiple values for keyword argument.
         hoverlabel=dict(bgcolor="#161b22", bordercolor="rgba(255,255,255,0.1)", font=dict(color=ui.TEXT)),
     )
 
