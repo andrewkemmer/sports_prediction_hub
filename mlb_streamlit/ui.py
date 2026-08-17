@@ -24,6 +24,20 @@ def esc(value) -> str:
     return _html.escape(str(value if value is not None else ""))
 
 
+def baseball_mark() -> str:
+    """The React dashboard's rose-gradient baseball mark, as inline HTML."""
+    return (
+        "<span style='display:inline-flex;width:36px;height:36px;border-radius:9999px;align-items:center;"
+        "justify-content:center;background:linear-gradient(135deg, rgba(244,63,94,0.30), rgba(220,38,38,0.20));"
+        "border:1px solid rgba(244,63,94,0.30);'>"
+        "<svg viewBox='0 0 24 24' width='20' height='20' aria-hidden='true'>"
+        "<circle cx='12' cy='12' r='9' fill='#f8fafc'/>"
+        "<path d='M4.5 7.5c2.6-1.6 5.8-1.7 8.4-.2M19.5 16.5c-2.6 1.6-5.8 1.7-8.4.2' fill='none' stroke='#e11d48' stroke-width='1.4' stroke-linecap='round'/>"
+        "<path d='M4.5 16.5c2.6 1.6 5.8 1.7 8.4.2M19.5 7.5c-2.6-1.6-5.8-1.7-8.4-.2' fill='none' stroke='#e11d48' stroke-width='1.4' stroke-linecap='round'/>"
+        "</svg></span>"
+    )
+
+
 def pill(text: str, color: str, bg: str, icon: str = "") -> str:
     icon_html = f"<span style='font-size:10px'>{icon}</span>&nbsp;" if icon else ""
     return (

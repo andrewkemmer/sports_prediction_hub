@@ -54,13 +54,23 @@ _CSS = """
 .stApp { background: #0a0d12; }
 [data-testid="stHeader"] { background: rgba(10,13,18,0.8); backdrop-filter: blur(8px); border-bottom: 1px solid rgba(255,255,255,0.07); }
 [data-testid="stMetricValue"] { font-variant-numeric: tabular-nums; }
-[data-testid="stTabs"] [data-baseweb="tab-list"] { gap: 4px; border-bottom: 1px solid rgba(255,255,255,0.07); }
-[data-testid="stTabs"] [data-baseweb="tab"] { border-radius: 8px; padding: 6px 14px; font-weight: 500; }
-[data-testid="stTabs"] [aria-selected="true"] { color: #427ff7 !important; }
-.block-container { padding-top: 1.2rem; padding-bottom: 3rem; max-width: 1200px; }
+.block-container { padding-top: 1rem; padding-bottom: 3rem; max-width: 1280px; }
 div[data-testid="stExpander"] details { border: 1px solid rgba(255,255,255,0.09); border-radius: 12px; background: #12161c; }
 div[data-testid="stVerticalBlockBorderWrapper"] { border-color: rgba(255,255,255,0.09) !important; border-radius: 16px; }
-.stButton > button[kind="primary"] { background: #427ff7; }
+.stButton > button[kind="primary"] { background: #427ff7; border-radius: 8px; font-weight: 600; }
+/* Header nav links (React-style hover) */
+.mlb-nav a { transition: color .15s; }
+.mlb-nav a:hover { color: #e5e8ec !important; }
+/* Date inputs render as rounded pills (React-style) */
+div[data-testid="stDateInput"] > label { display: none; }
+div[data-testid="stDateInput"] [data-baseweb="input"] { border-radius: 9999px; }
+div[data-testid="stDateInput"] input { border-radius: 9999px; border: 1px solid rgba(255,255,255,0.14); background: rgba(255,255,255,0.04); color: #e5e8ec; font-weight: 500; font-size: 14px; }
+/* Segmented controls render as pill toggles (React-style) */
+div[data-testid="stSegmentedControl"] > label { display: none; }
+div[data-testid="stSegmentedControl"] { gap: 6px; }
+div[data-testid="stSegmentedControl"] button { border-radius: 9999px; font-size: 12px; font-weight: 600; border: 1px solid rgba(255,255,255,0.09); background: #12161c; color: #8b939f; }
+div[data-testid="stSegmentedControl"] button:hover { color: #e5e8ec; }
+div[data-testid="stSegmentedControl"] button[aria-checked="true"], div[data-testid="stSegmentedControl"] button[aria-selected="true"] { background: #427ff7 !important; border-color: #427ff7 !important; color: #fff !important; }
 </style>
 """
 st.markdown(_CSS, unsafe_allow_html=True)
@@ -110,6 +120,13 @@ def fmt_signed(v, digits=2) -> str:
 def short_date(ymd: str) -> str:
     try:
         return _dt.date.fromisoformat(ymd).strftime("%b %d")
+    except ValueError:
+        return ymd
+
+
+def fmt_date_short(ymd: str) -> str:
+    try:
+        return _dt.date.fromisoformat(ymd).strftime("%a, %b %d")
     except ValueError:
         return ymd
 
@@ -264,54 +281,69 @@ def do_refresh() -> None:
 # Header + empty state
 # ---------------------------------------------------------------------------
 
-def render_header(bundle) -> None:
-    left, mid, right = st.columns([1.1, 2.2, 1.2], vertical_alignment="center")
-    with left:
-        st.markdown(
-            "<div style='display:flex;align-items:center;gap:10px;'>"
-            "<span style='font-size:28px;'>⚾</span>"
-            "<div><div style='font-size:17px;font-weight:700;color:" + ui.TEXT + ";letter-spacing:-.01em;'>MLB Predictions</div>"
-            "<div style='font-size:11px;color:" + ui.MUTED + "'>2026 season · statsapi.mlb.com</div></div></div>",
-            unsafe_allow_html=True,
-        )
-    with mid:
-        if bundle:
-            ms = bundle["model_state"]
-            odds_status = ms.get("marketOddsStatus") or {}
-            odds_enabled = odds_status.get("enabled", market_odds_enabled())
-            if odds_enabled:
-                odds_chip = ui.pill(
-                    f"📈 Market odds live · {odds_status.get('count', 0)} games",
-                    ui.EMERALD, "rgba(52,211,153,0.15)",
-                )
-            else:
-                odds_chip = ui.pill(
-                    "Fair odds — set THE_ODDS_API_KEY",
-                    ui.AMBER, "rgba(252,211,77,0.15)",
-                )
-            st.markdown(
-                f"<div style='font-size:12px;color:{ui.MUTED};line-height:1.6'>"
-                f"As of <b style='color:{ui.TEXT}'>{fmt_date_long(ms['asOfDate'])}</b> · "
-                f"Trained {fmt_trained_at(ms['trainedAt'])} · "
-                f"{fmt_number(ms['gamesTrained'])} games trained · "
-                f"Model: <b style='color:{ui.TEXT}'>{ms['selectedModel']}</b></div>"
-                f"<div style='margin-top:6px;'>{odds_chip}</div>",
-                unsafe_allow_html=True,
-            )
-        else:
-            st.markdown(
-                f"<div style='font-size:12px;color:{ui.MUTED}'>No trained model yet — "
-                "click <b>Refresh & train</b> to pull every 2026 game from the MLB Stats API, "
-                "fit and calibrate the model, and generate win probabilities for the rest of the season.</div>",
-                unsafe_allow_html=True,
-            )
-    with right:
-        c1, c2 = st.columns([1, 1])
-        with c1:
-            st.markdown("")
-        with c2:
-            if st.button("🔄 Refresh & train", type="primary", use_container_width=True, key="refresh_btn"):
-                do_refresh()
+TAB_IDS: list[tuple[str, str]] = [
+    ("games", "Today's Games"),
+    ("rankings", "Power Rankings"),
+    ("calibration", "Calibration"),
+    ("monitor", "Model Monitor"),
+]
+
+_VALID_TABS = {t for t, _ in TAB_IDS}
+
+
+def _nav_href(tab_id: str) -> str:
+    """Href for a header nav link, preserving the app's current URL state."""
+    params = {"tab": tab_id}
+    d = st.session_state.get("games_date")
+    if d is not None:
+        params["date"] = d.isoformat()
+    f = st.session_state.get("games_filter")
+    if f:
+        params["filter"] = str(f).split(" (")[0]
+    if tab_id == "calibration":
+        v = st.session_state.get("cal_view")
+        if v:
+            params["cal_view"] = v
+    if tab_id == "monitor":
+        s = st.session_state.get("mon_sub")
+        if s:
+            params["mon_sub"] = s
+    return "?" + "&".join(f"{k}={v}" for k, v in params.items())
+
+
+def _nav_link(tab_id: str, label: str, active: bool) -> str:
+    """One header nav tab — text + primary underline bar when active (React-style)."""
+    color = ui.TEXT if active else ui.MUTED
+    underline = (
+        "<span style='display:block;height:2px;width:100%;background:#427ff7;border-radius:999px;'></span>"
+        if active else ""
+    )
+    return (
+        f"<a href='{_nav_href(tab_id)}' style='display:inline-flex;flex-direction:column;align-items:center;"
+        f"gap:2px;padding:6px 12px;border-radius:8px;font-size:14px;font-weight:500;color:{color};"
+        f"text-decoration:none;white-space:nowrap;'>{label}{underline}</a>"
+    )
+
+
+def render_header(active_tab: str) -> None:
+    """Sticky header matching the React dashboard: mark + title, nav tabs, refresh."""
+    nav = "".join(_nav_link(t, label, t == active_tab) for t, label in TAB_IDS)
+    refresh = (
+        f"<a href='{_nav_href(active_tab)}&refresh=1' style='display:inline-flex;align-items:center;gap:6px;"
+        f"border:1px solid {ui.BORDER};background:{ui._card_bg()};border-radius:8px;padding:6px 12px;"
+        f"font-size:12px;font-weight:500;color:{ui.TEXT};text-decoration:none;white-space:nowrap;'>"
+        f"⟳ Refresh</a>"
+    )
+    st.markdown(
+        f"<div style='position:sticky;top:0;z-index:100;background:rgba(10,13,18,0.85);backdrop-filter:blur(8px);"
+        f"border-bottom:1px solid rgba(255,255,255,0.07);padding:10px 2px;margin-bottom:16px;'>"
+        f"<div style='display:flex;align-items:center;gap:14px;flex-wrap:wrap;'>"
+        f"<div style='display:flex;align-items:center;gap:10px;'>{ui.baseball_mark()}"
+        f"<span style='font-size:16px;font-weight:700;color:{ui.TEXT};letter-spacing:-.01em;white-space:nowrap;'>MLB Predictions</span></div>"
+        f"<nav class='mlb-nav' style='display:flex;align-items:center;gap:2px;flex:1;justify-content:center;flex-wrap:wrap;'>{nav}</nav>"
+        f"<div style='margin-left:auto;'>{refresh}</div></div></div>",
+        unsafe_allow_html=True,
+    )
 
 
 def render_empty_state() -> None:
@@ -687,56 +719,87 @@ def games_tab(bundle) -> None:
 
     ymd = st.session_state.games_date.isoformat()
     games = _games_for_date(bundle, ymd)
-    filtered = _filter_games(games, st.session_state.games_filter)
+    filtered = _filter_games(games, str(st.session_state.games_filter).split(" (")[0])
     night_count = sum(1 for g in games if g["dayNight"] == "night")
     record = ms.get("todaysRecord") or {}
 
-    # Row 1: summary chips
-    chips = []
+    # Row 1: summary chips (mirrors the React games-tab header row)
+    row1 = [f"<span style='font-size:14px;font-weight:600;color:{ui.TEXT};'>{fmt_date_short(ymd)}</span>"]
     if games:
-        chips.append(f"{len(filtered)} of {len(games)} games shown")
+        row1.append(
+            f"<span style='font-size:14px;color:{ui.MUTED};'>{len(filtered)} of {len(games)} games shown</span>"
+        )
     if night_count > 0:
-        chips.append(f"🌙 {night_count} evening games begin 7 PM ET+")
+        row1.append(
+            f"<span style='background:rgba(59,130,246,0.15);color:#93c5fd;border-radius:999px;"
+            f"padding:4px 10px;font-size:12px;font-weight:500;'>{night_count} evening games begin 7 PM ET+</span>"
+        )
     if ymd == today and record.get("total", 0) > 0:
-        chips.append(f"✅ {record['wins']}-{record['losses']} Today · {fmt_pct(record['accuracy'], 1)} accuracy")
-    chips_html = " · ".join(
-        f"<span style='background:rgba(255,255,255,0.05);border:1px solid {ui.BORDER};border-radius:999px;"
-        f"padding:3px 10px;font-size:11px;color:{ui.TEXT};'>{c}</span>" for c in chips
-    )
+        row1.append(
+            f"<span style='background:rgba(52,211,153,0.15);color:#6ee7b7;border-radius:999px;"
+            f"padding:4px 10px;font-size:12px;font-weight:600;'>✓ {record['wins']}-{record['losses']} Today</span>"
+        )
+        row1.append(
+            f"<span style='font-size:12px;color:{ui.MUTED};'>{fmt_pct(record['accuracy'], 1)} accuracy</span>"
+        )
     st.markdown(
-        f"<div style='display:flex;flex-wrap:wrap;gap:6px;align-items:center;'>"
-        f"<span style='font-size:13px;font-weight:600;color:{ui.TEXT};'>{fmt_date_long(ymd)}</span>{chips_html}</div>",
+        f"<div style='display:flex;flex-wrap:wrap;align-items:center;gap:8px;'>{''.join(row1)}</div>",
         unsafe_allow_html=True,
     )
 
-    # Row 2: date selector
-    c_prev, c_mid, c_next = st.columns([1, 4, 1], vertical_alignment="center")
-    with c_prev:
-        if st.button("← Prev", key="prev_day", use_container_width=True):
-            st.session_state.games_date = st.session_state.games_date - _dt.timedelta(days=1)
-            st.rerun()
-    with c_mid:
-        st.date_input(
-            "Game date",
-            key="games_date",
-            min_value=_dt.date(season, 2, 1),
-            max_value=_dt.date(season, 11, 15),
-            format="DD/MM/YYYY",
+    # Row 2: centered date selector (prev square / date pill / next square)
+    def _square_nav(href: str, glyph: str) -> str:
+        return (
+            f"<a href='{href}' style='display:inline-flex;width:32px;height:32px;align-items:center;"
+            f"justify-content:center;border:1px solid {ui.BORDER};background:{ui._card_bg()};"
+            f"border-radius:8px;color:{ui.MUTED};text-decoration:none;font-size:16px;'>"
+            f"{glyph}</a>"
         )
-    with c_next:
-        if st.button("Next →", key="next_day", use_container_width=True):
-            st.session_state.games_date = st.session_state.games_date + _dt.timedelta(days=1)
-            st.rerun()
 
-    # Row 3: filter pills
+    prev_ymd = (st.session_state.games_date - _dt.timedelta(days=1)).isoformat()
+    next_ymd = (st.session_state.games_date + _dt.timedelta(days=1)).isoformat()
+    c_l, c_mid, c_r = st.columns([1, 2, 1], vertical_alignment="center")
+    with c_l:
+        st.markdown("")
+    with c_mid:
+        c_prev, c_pill, c_next = st.columns([1, 6, 1], vertical_alignment="center")
+        with c_prev:
+            st.markdown(_square_nav(f"?tab=games&date={prev_ymd}", "‹"), unsafe_allow_html=True)
+        with c_pill:
+            st.date_input(
+                "Game date",
+                key="games_date",
+                min_value=_dt.date(season, 2, 1),
+                max_value=_dt.date(season, 11, 15),
+                format="ddd, MMM D, YYYY",
+                label_visibility="collapsed",
+            )
+            st.query_params["date"] = st.session_state.games_date.isoformat()
+        with c_next:
+            st.markdown(_square_nav(f"?tab=games&date={next_ymd}", "›"), unsafe_allow_html=True)
+    with c_r:
+        st.markdown("")
+
+    # Row 3: filter pills with counts
     counts = {
         "All Games": len(games),
         "Final": sum(1 for g in games if g["status"] == "Final"),
         "Live": sum(1 for g in games if g["status"] == "Live"),
         "Upcoming": sum(1 for g in games if g["status"] in ("Preview", "Scheduled")),
     }
-    options = [k for k in counts if k == "All Games" or counts[k] > 0]
-    st.segmented_control("Filter", options, key="games_filter")
+    options = [f"{k} ({counts[k]})" for k in counts if k == "All Games" or counts[k] > 0]
+    stored = st.session_state.get("games_filter")
+    raw_cur = stored.split(" (")[0] if isinstance(stored, str) else "All Games"
+    if raw_cur != "All Games" and counts.get(raw_cur, 0) == 0:
+        raw_cur = "All Games"
+    display_cur = f"{raw_cur} ({counts[raw_cur]})"
+    if not any(display_cur == o for o in options):
+        display_cur = options[0]
+    st.session_state.games_filter = display_cur
+    selected = st.segmented_control("Filter", options, key="games_filter")
+    raw_filter = selected.split(" (")[0] if isinstance(selected, str) else "All Games"
+    st.query_params["filter"] = raw_filter
+    filtered = _filter_games(games, raw_filter)
 
     # Content
     if not games:
@@ -788,7 +851,7 @@ def rankings_tab(bundle) -> None:
             f"<b style='color:{elo_color};font-variant-numeric:tabular-nums;'>{round(r['elo'])}</b>",
             f"<span style='color:{ui.TEXT};font-variant-numeric:tabular-nums;'>{r['wins']}-{r['losses']}</span>",
             f"<span style='color:{ui.TEXT};font-variant-numeric:tabular-nums;'>{r['winPct']:.3f}".replace("0.", ".") + "</span>",
-            f"<span style='color:{rd_color};font-variant-numeric:tabular-nums;'>{('+' if run_diff > 0 else '') + str(run_diff)}</span>",
+            f"<span style='color:{rd_color};font-variant-numeric:tabular-nums;'{('+' if run_diff > 0 else '') + str(run_diff)}</span>",
             f"<span style='color:{ui.MUTED};font-variant-numeric:tabular-nums;'>{l10_wins}-{10 - l10_wins}</span>",
             f"<span style='color:{ui.MUTED};font-variant-numeric:tabular-nums;'>{r['homeWinPct']:.3f}".replace("0.", ".") + "</span>",
             f"<span style='color:{ui.MUTED};font-variant-numeric:tabular-nums;'>{r['awayWinPct']:.3f}".replace("0.", ".") + "</span>",
@@ -956,13 +1019,21 @@ def calibration_tab(bundle) -> None:
     min_date, max_date = _calibration_range(bundle)
     total_games = len(rows)
 
-    ui.section(
-        "Model Calibration Dashboard",
-        "Assessing prediction reliability and accuracy for moneyline, game totals, and run lines — computed on one side per game.",
-    )
+    # Header: title → n pill → subtitle (mirrors the React calibration header)
     trained_at = fmt_trained_at(ms.get("trainedAt", 0))
     st.markdown(
-        f"<div style='margin-top:6px;'>{ui.pill(f'n = {fmt_number(total_games)} games · Trained {trained_at} ET', ui.MUTED, 'rgba(255,255,255,0.05)')}</div>",
+        f"<h2 style='margin:0;font-size:20px;font-weight:700;letter-spacing:-.01em;color:{ui.TEXT}'>"
+        f"Model Calibration Dashboard</h2>",
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        f"<div style='margin-top:10px;'>{ui.pill(f'n = {fmt_number(total_games)} games in range · Trained {trained_at} ET', ui.MUTED, 'rgba(255,255,255,0.05)')}</div>",
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        f"<p style='margin:10px 0 0;font-size:13px;color:{ui.MUTED};line-height:1.5'>"
+        "Assessing prediction reliability and accuracy for moneyline, game totals, and run lines — "
+        "computed on one side per game.</p>",
         unsafe_allow_html=True,
     )
 
@@ -977,22 +1048,59 @@ def calibration_tab(bundle) -> None:
     if "cal_pages" not in st.session_state:
         st.session_state.cal_pages = 1
 
+    # View toggle (pill style, matches React)
     st.segmented_control(
         "View",
         ["Moneyline", "Game Totals", "Run Lines (-1.5 / +1.5)"],
         key="cal_view",
+        default="Moneyline",
     )
     view = st.session_state.cal_view
+    st.query_params["cal_view"] = view
 
-    c1, arrow, c2, info = st.columns([2.4, 0.4, 2.4, 3], vertical_alignment="center")
-    with c1:
-        st.date_input("Start", key="cal_start", min_value=_dt.date.fromisoformat(SEASON_START), max_value=st.session_state.cal_end)
-    with arrow:
-        st.markdown(f"<div style='text-align:center;color:{ui.MUTED};padding-top:18px;'>→</div>", unsafe_allow_html=True)
-    with c2:
-        st.date_input("End", key="cal_end", min_value=st.session_state.cal_start, max_value=max_date)
-    with info:
-        pass
+    # Range selector card (Range label + start → end + counts, matches React)
+    prev_start = st.session_state.cal_start
+    prev_end = st.session_state.cal_end
+    if prev_start > prev_end:
+        prev_start, prev_end = prev_end, prev_start
+    preview = [r for r in rows if prev_start.isoformat() <= r["date"] <= prev_end.isoformat()]
+    preview_acc = sum(1 for r in preview if r["isCorrect"]) / len(preview) if preview else 0
+    with st.container(border=True):
+        c_label, c_start, c_arrow, c_end, c_info = st.columns([0.6, 1.7, 0.3, 1.7, 3.6], vertical_alignment="center")
+        with c_label:
+            st.markdown(
+                f"<span style='font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.08em;"
+                f"color:{ui.MUTED}'>Range</span>",
+                unsafe_allow_html=True,
+            )
+        with c_start:
+            st.date_input(
+                "Start",
+                key="cal_start",
+                min_value=_dt.date.fromisoformat(SEASON_START),
+                max_value=st.session_state.cal_end,
+                label_visibility="collapsed",
+            )
+        with c_arrow:
+            st.markdown(
+                f"<div style='text-align:center;color:{ui.MUTED};'>→</div>",
+                unsafe_allow_html=True,
+            )
+        with c_end:
+            st.date_input(
+                "End",
+                key="cal_end",
+                min_value=st.session_state.cal_start,
+                max_value=max_date,
+                label_visibility="collapsed",
+            )
+        with c_info:
+            st.markdown(
+                f"<span style='font-size:12px;color:{ui.MUTED}'>"
+                f"{fmt_number(len(preview))} completed game{'s' if len(preview) != 1 else ''} · "
+                f"{fmt_pct(preview_acc, 1)} accuracy</span>",
+                unsafe_allow_html=True,
+            )
 
     if st.session_state.cal_start > st.session_state.cal_end:
         st.session_state.cal_start, st.session_state.cal_end = st.session_state.cal_end, st.session_state.cal_start
@@ -1604,32 +1712,64 @@ def monitor_tab(bundle) -> None:
 # Main
 # ---------------------------------------------------------------------------
 
+def _apply_url_state() -> str:
+    """Read tab + per-tab state from the URL (nav is HTML links) into session."""
+    raw_tab = st.query_params.get("tab")
+    if isinstance(raw_tab, list):
+        raw_tab = raw_tab[0] if raw_tab else "games"
+    active_tab = raw_tab if raw_tab in _VALID_TABS else "games"
+
+    d = st.query_params.get("date")
+    if isinstance(d, str):
+        try:
+            st.session_state.games_date = _dt.date.fromisoformat(d)
+        except ValueError:
+            pass
+    f = st.query_params.get("filter")
+    if isinstance(f, str):
+        st.session_state.games_filter = f
+    cv = st.query_params.get("cal_view")
+    if isinstance(cv, str):
+        st.session_state.cal_view = cv
+    ms_ = st.query_params.get("mon_sub")
+    if isinstance(ms_, str):
+        st.session_state.mon_sub = ms_
+    return active_tab
+
+
 def main() -> None:
     if "bundle" not in st.session_state:
         st.session_state.bundle = load_bundle()
+
     # Auto-ML button sets this flag (callbacks cannot render a progress bar);
     # run the pipeline here in the main flow, then rerun to show fresh results.
     if st.session_state.get("run_automl", False):
         st.session_state["run_automl"] = False
         do_refresh()
+        return
+
+    # Header Refresh link (?refresh=1) — same flow as the Auto-ML flag.
+    if st.query_params.get("refresh") is not None:
+        del st.query_params["refresh"]
+        do_refresh()
+        return
+
+    active_tab = _apply_url_state()
     bundle = st.session_state.bundle
 
-    render_header(bundle)
+    render_header(active_tab)
 
     if bundle is None:
         render_empty_state()
         return
 
-    t_games, t_rank, t_cal, t_mon = st.tabs(
-        ["Today's Games", "Power Rankings", "Calibration", "Model Monitor"]
-    )
-    with t_games:
+    if active_tab == "games":
         games_tab(bundle)
-    with t_rank:
+    elif active_tab == "rankings":
         rankings_tab(bundle)
-    with t_cal:
+    elif active_tab == "calibration":
         calibration_tab(bundle)
-    with t_mon:
+    else:
         monitor_tab(bundle)
 
 
