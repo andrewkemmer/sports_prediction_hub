@@ -15,6 +15,13 @@ dist-ssr
 # Streamlit dashboard runtime state (rebuilt by the app)
 mlb_streamlit/cache/
 
+# Vly platform build artifact
+isolate/
+
+# Python
+__pycache__/
+*.pyc
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
