@@ -133,6 +133,9 @@ _st.error = lambda *a, **k: None
 _st.toast = lambda *a, **k: None
 _st.plotly_chart = lambda *a, **k: None
 _st.rerun = lambda: None
+_st.spinner = lambda *a, **k: _Ctx()
+_st.warning = lambda *a, **k: None
+_st.expander = lambda *a, **k: _Ctx()
 sys.modules["streamlit"] = _st
 
 # ---------------------------------------------------------------------------
@@ -252,6 +255,7 @@ def _cal_rows(n: int = 36) -> list[dict]:
 
 MS = {
     "asOfDate": "2026-08-16",
+    "season": 2026,
     "trainedAt": 1784470800000,  # Aug 16, 2026 11:20 PM ET
     "gamesTrained": 2400,
     "selectedModel": "Logistic regression",
@@ -308,9 +312,61 @@ MS = {
     ],
     "todaysRecord": {"upsets": [], "date": "2026-08-16", "wins": 5, "losses": 2},
     "featureNames": ["Power ranking gap", "Home-field edge", "Pitcher ERA", "Rest days", "Recent form"],
+    "powerRankings": [
+        {"teamId": 119, "name": "Los Angeles", "abbrev": "LAD", "elo": 1580, "wins": 72, "losses": 44, "winPct": 0.621, "runDiff": 128, "last10WinPct": 0.7, "homeWinPct": 0.655, "awayWinPct": 0.588},
+        {"teamId": 137, "name": "San Francisco", "abbrev": "SF", "elo": 1542, "wins": 68, "losses": 48, "winPct": 0.586, "runDiff": 54, "last10WinPct": 0.6, "homeWinPct": 0.619, "awayWinPct": 0.553},
+        {"teamId": 147, "name": "New York", "abbrev": "NYY", "elo": 1521, "wins": 65, "losses": 51, "winPct": 0.560, "runDiff": 39, "last10WinPct": 0.5, "homeWinPct": 0.593, "awayWinPct": 0.528},
+    ],
 }
 
-BUNDLE = {"model_state": MS, "calibration_rows": _cal_rows()}
+
+def _game_docs() -> dict[str, list[dict]]:
+    """Two synthetic game docs (one final, one preview) for the games tab."""
+    return {
+        "2026-08-16": [
+            {
+                "gamePk": 750001,
+                "status": "Final",
+                "dayNight": "night",
+                "gameDate": "2026-08-16T19:05:00Z",
+                "innings": 9,
+                "away": {"id": 119, "abbrev": "LAD", "name": "Los Angeles", "score": 5, "wins": 72, "losses": 44},
+                "home": {"id": 137, "abbrev": "SF", "name": "San Francisco", "score": 3, "wins": 68, "losses": 48},
+                "awayWinProb": 0.39, "homeWinProb": 0.61, "pickProb": 0.61,
+                "pickTeam": "home", "winner": "home", "isCorrect": True, "isUpset": False,
+                "homePitcher": {"name": "Logan Webb", "era": 3.21, "k9": 8.4},
+                "awayPitcher": {"name": "Yoshinobu Yamamoto", "era": 2.98, "k9": 10.1},
+                "runProjection": {"homeScore": 4.6, "awayScore": 3.9, "total": 8.5, "overProb": 0.48, "underProb": 0.52, "homeRunLineProb": 0.44, "awayRunLineProb": 0.56},
+                "venue": "Oracle Park", "weather": {"tempF": 68, "windMph": 9},
+                "homeInjuries": 1, "awayInjuries": 0,
+                "fairHomeOdds": -156, "fairAwayOdds": 136, "edge": 0.02,
+                "marketOdds": {"homeMoneyline": -165, "awayMoneyline": 145, "total": 8.0, "overPrice": -110, "underPrice": -110, "runLine": 1.5, "homeRunLinePrice": 120, "awayRunLinePrice": -140},
+                "lineups": {"home": {"battingOrder": [{"name": "Posey", "pos": "C"}], "bench": []}, "away": {"battingOrder": [{"name": "Ohtani", "pos": "DH"}], "bench": []}},
+                "shap": [{"feature": "eloDiff", "label": "Power ranking gap", "value": 0.4, "contribution": 0.12}],
+            },
+            {
+                "gamePk": 750002,
+                "status": "Preview",
+                "dayNight": "day",
+                "gameDate": "2026-08-17T13:05:00Z",
+                "away": {"id": 121, "abbrev": "NYM", "name": "New York", "wins": 60, "losses": 56},
+                "home": {"id": 147, "abbrev": "NYY", "name": "New York", "wins": 65, "losses": 51},
+                "awayWinProb": 0.53, "homeWinProb": 0.47, "pickProb": 0.53,
+                "pickTeam": "away",
+                "homePitcher": {"name": "Carlos Rodón", "era": 3.55, "k9": 9.2},
+                "awayPitcher": {"name": "Kodai Senga", "era": 3.31, "k9": 10.8},
+                "runProjection": {"homeScore": 4.1, "awayScore": 4.4, "total": 8.5, "overProb": 0.51, "underProb": 0.49, "homeRunLineProb": 0.46, "awayRunLineProb": 0.54},
+                "venue": "Yankee Stadium", "weather": {"tempF": 82, "windMph": 6},
+                "homeInjuries": 2, "awayInjuries": 1,
+                "fairHomeOdds": 112, "fairAwayOdds": -132, "edge": -0.01,
+                "lineups": {},
+                "shap": [],
+            },
+        ]
+    }
+
+
+BUNDLE = {"model_state": MS, "calibration_rows": _cal_rows(), "docs_by_date": _game_docs()}
 
 # ---------------------------------------------------------------------------
 # Regression 2: panels with segmented_control returning None (fresh session)
@@ -338,5 +394,40 @@ assert _SS.get("cal_view") == "Moneyline", "cal_view should default to Moneyline
 assert any("Model Calibration Dashboard" in h for h in _MARKDOWN), "calibration header rendered"
 assert any("Calibration Curve" in h for h in _MARKDOWN), "calibration curve section rendered"
 check("calibration_tab renders Moneyline view on fresh session (no crash)")
+
+# ---------------------------------------------------------------------------
+# Regression 3: layout parity — header nav, games tab, power rankings
+# ---------------------------------------------------------------------------
+
+_MARKDOWN.clear()
+_SS.clear()
+app.render_header("games")
+joined = "\n".join(_MARKDOWN)
+for label in ("MLB Predictions", "Today's Games", "Power Rankings", "Calibration", "Model Monitor", "Refresh"):
+    assert label in joined, f"header missing {label!r}"
+check("render_header renders sticky nav + refresh link (no crash)")
+
+_MARKDOWN.clear()
+_SS.clear()
+_SS["games_date"] = _dt.date(2026, 8, 16)
+_SS["games_filter"] = "All Games (2)"
+_SS["bundle"] = BUNDLE
+app.games_tab(BUNDLE)
+joined = "\n".join(_MARKDOWN)
+assert _SS.get("games_filter", "").startswith("All Games"), "games filter should default to All Games"
+assert "2 of 2 games shown" in joined, "summary chips row rendered"
+assert "Predicted score" in joined, "game card run projection rendered"
+assert "Final" in joined, "final-status pill rendered on completed game"
+assert "LAD" in joined and "NYM" in joined, "both game cards rendered"
+check("games_tab renders summary row + date selector + game cards (no crash)")
+
+_MARKDOWN.clear()
+_SS.clear()
+app.rankings_tab(BUNDLE)
+joined = "\n".join(_MARKDOWN)
+assert "Power Rankings" in joined, "rankings header rendered"
+assert "LAD" in joined and "SF" in joined, "ranking rows rendered"
+assert "Run Diff" in joined, "rankings table columns rendered"
+check("rankings_tab renders Elo power rankings table (no crash)")
 
 print(f"\nAll {len(CHECKS)} UI render checks passed.")

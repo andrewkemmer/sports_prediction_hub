@@ -61,16 +61,24 @@ div[data-testid="stVerticalBlockBorderWrapper"] { border-color: rgba(255,255,255
 /* Header nav links (React-style hover) */
 .mlb-nav a { transition: color .15s; }
 .mlb-nav a:hover { color: #e5e8ec !important; }
-/* Date inputs render as rounded pills (React-style) */
+/* Date inputs render as rounded pills (React-style, blue-tinted like the calendar trigger) */
 div[data-testid="stDateInput"] > label { display: none; }
 div[data-testid="stDateInput"] [data-baseweb="input"] { border-radius: 9999px; }
-div[data-testid="stDateInput"] input { border-radius: 9999px; border: 1px solid rgba(255,255,255,0.14); background: rgba(255,255,255,0.04); color: #e5e8ec; font-weight: 500; font-size: 14px; }
+div[data-testid="stDateInput"] input { border-radius: 9999px; border: 1px solid rgba(59,130,246,0.30); background: rgba(59,130,246,0.10); color: #e5e8ec; font-weight: 500; font-size: 14px; }
+div[data-testid="stDateInput"] input:hover { border-color: rgba(59,130,246,0.50); }
 /* Segmented controls render as pill toggles (React-style) */
 div[data-testid="stSegmentedControl"] > label { display: none; }
 div[data-testid="stSegmentedControl"] { gap: 6px; }
 div[data-testid="stSegmentedControl"] button { border-radius: 9999px; font-size: 12px; font-weight: 600; border: 1px solid rgba(255,255,255,0.09); background: #12161c; color: #8b939f; }
 div[data-testid="stSegmentedControl"] button:hover { color: #e5e8ec; }
 div[data-testid="stSegmentedControl"] button[aria-checked="true"], div[data-testid="stSegmentedControl"] button[aria-selected="true"] { background: #427ff7 !important; border-color: #427ff7 !important; color: #fff !important; }
+/* Model Monitor tab uses cyan accents in the React app (Run Auto-ML button + sub-tab toggles) */
+div[class*="st-key-mon_sub"] [data-testid="stSegmentedControl"] button[aria-checked="true"],
+div[class*="st-key-mon_sub"] [data-testid="stSegmentedControl"] button[aria-selected="true"],
+div[class*="st-key-automl_sub"] [data-testid="stSegmentedControl"] button[aria-checked="true"],
+div[class*="st-key-automl_sub"] [data-testid="stSegmentedControl"] button[aria-selected="true"] { background: #22d3ee !important; border-color: #22d3ee !important; color: #083344 !important; }
+div[class*="st-key-automl_btn"] button[kind="primary"] { background: #22d3ee; border-color: #22d3ee; color: #083344; }
+div[class*="st-key-automl_btn"] button[kind="primary"]:hover { background: #22d3ee; color: #083344; opacity: .9; }
 </style>
 """
 st.markdown(_CSS, unsafe_allow_html=True)
@@ -1225,11 +1233,13 @@ def calibration_tab(bundle) -> None:
     search = st.text_input("Filter by team…", key="cal_search", placeholder="Filter by team…")
     q = search.strip().lower()
     if q:
-        history_rows = [
-            r for r in history_rows
-            if q in f"{in_range[i]['away']['name']} {in_range[i]['away']['abbrev']} {in_range[i]['home']['name']} {in_range[i]['home']['abbrev']}".lower()
-            for i in [history_rows.index(r)]
+        # Filter the source rows (not the rendered HTML) so the search stays
+        # correct even when two games render identical cells.
+        in_range = [
+            r for r in in_range
+            if q in f"{r['away']['name']} {r['away']['abbrev']} {r['home']['name']} {r['home']['abbrev']}".lower()
         ]
+        headers, history_rows, align = _game_history_rows(view, in_range)
     page_size = 100
     pages = st.session_state.cal_pages
     visible = history_rows[: page_size * pages]
