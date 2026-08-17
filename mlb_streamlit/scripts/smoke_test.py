@@ -33,7 +33,7 @@ ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(ROOT))
 
 from mlb_streamlit import cache  # noqa: E402
-from mlb_streamlit.data import attach_lineups, lineup_ops  # noqa: E402
+from mlb_streamlit.data import attach_lineups_as_of, lineup_ops  # noqa: E402
 from mlb_streamlit.engine.features import (  # noqa: E402
     FEATURE_KEYS,
     build_features_for_game,
@@ -274,8 +274,9 @@ def test_lineups() -> None:
     check("lineup_ops empty = 0", lineup_ops([]) == 0.0)
     check("lineup_ops skips missing ops", lineup_ops([{"ops": 0.800}, {}]) == 0.8)
 
-    # Per-season attach: a batter's OPS must come from the game's own season,
-    # otherwise 2026 numbers would leak into 2024 training rows.
+    # As-of-date attach: a batter's OPS must come from the game's OWN season
+    # (2024 rows never see 2026 numbers) and only from games STRICTLY BEFORE
+    # the game's date (a June game never sees the batter's July games).
     lineup = {
         "home": {"battingOrder": [{"id": 1, "name": "A"}, {"id": 2, "name": "B"}], "bench": []},
         "away": {"battingOrder": [{"id": 3, "name": "C"}, {"id": 4, "name": "D"}], "bench": []},
@@ -286,15 +287,34 @@ def test_lineups() -> None:
     g26 = {"gamePk": 2, "date": "2026-06-01", "season": "2026",
            "home": {"id": 119, "name": "Dodgers", "abbrev": "LAD"},
            "away": {"id": 108, "name": "Angels", "abbrev": "LAA"}}
-    ops24 = {1: 0.720, 2: 0.680, 3: 0.700, 4: 0.640}
-    ops26 = {1: 0.910, 2: 0.870, 3: 0.850, 4: 0.820}
+
+    def prior(pid, season, h, tb, bb=0):
+        return {f"{pid}|{season}": [{"d": f"{season}-05-01", "ab": 4, "h": h, "bb": bb, "hbp": 0, "sf": 0, "tb": tb}]}
+
+    batter_logs = {}
+    for pid, h, tb in ((1, 1, 2), (2, 1, 2), (3, 1, 2), (4, 1, 1)):  # 2024: home 0.75 vs away 0.625
+        batter_logs.update(prior(pid, "2024", h, tb))
+    for pid, h, tb in ((1, 3, 5), (2, 2, 4), (3, 2, 3), (4, 2, 3)):  # 2026: home 1.75 vs away 1.25
+        batter_logs.update(prior(pid, "2026", h, tb))
     st = new_state()
-    f24 = build_features_for_game(attach_lineups([g24], {1: lineup}, ops24)[0], st)
-    f26 = build_features_for_game(attach_lineups([g26], {2: lineup}, ops26)[0], st)
+    f24 = build_features_for_game(attach_lineups_as_of([g24], {1: lineup}, batter_logs)[0], st)
+    f26 = build_features_for_game(attach_lineups_as_of([g26], {2: lineup}, batter_logs)[0], st)
     check("lineupKnown=1 with lineups", f24["lineupKnown"] == 1 and f26["lineupKnown"] == 1)
     check("lineupOpsDiff non-zero", f24["lineupOpsDiff"] > 0 and f26["lineupOpsDiff"] > 0)
     check("per-season OPS respected", f26["lineupOpsDiff"] > f24["lineupOpsDiff"],
           f"2024={f24['lineupOpsDiff']:.4f} 2026={f26['lineupOpsDiff']:.4f}")
+
+    # No-lookahead: a lineup whose batters ONLY have post-game entries is
+    # unknown (ops stays 0) — future games never count toward a game's stats.
+    leaky = {
+        f"{pid}|2024": [{"d": "2024-06-15", "ab": 4, "h": 4, "bb": 0, "hbp": 0, "sf": 0, "tb": 8}]
+        for pid in (1, 2, 3, 4)
+    }
+    f_leak = build_features_for_game(attach_lineups_as_of([g24], {1: lineup}, leaky)[0], st)
+    check("no-lookahead lineup (post-game entries excluded)",
+          f_leak["lineupKnown"] == 0 and f_leak["lineupOpsDiff"] == 0.0,
+          f"known={f_leak['lineupKnown']} diff={f_leak['lineupOpsDiff']:.4f}")
+
     f_none = build_features_for_game(g24, st)
     check("no lineup -> feature 0", f_none["lineupOpsDiff"] == 0.0 and f_none["lineupKnown"] == 0)
 
@@ -308,6 +328,84 @@ def test_lineups() -> None:
         p = cache._path(marker)
         if p.exists():
             os.remove(p)
+
+
+def test_as_of_stats() -> None:
+    print("as-of-date stats")
+    import mlb_streamlit.data as data
+
+    # pitcher_as_of: only starts strictly before the target date count.
+    log = [
+        {"d": "2026-04-05", "ip": 6.0, "er": 2, "so": 5, "bb": 2, "hbp": 0, "hr": 1},
+        {"d": "2026-04-12", "ip": 7.0, "er": 0, "so": 8, "bb": 1, "hbp": 0, "hr": 0},
+        {"d": "2026-04-19", "ip": 5.0, "er": 6, "so": 3, "bb": 4, "hbp": 1, "hr": 2},  # after target
+    ]
+    a = data.pitcher_as_of(log, "2026-04-15")
+    check("pitcher_as_of ERA", a["era"] == round(2 * 9 / 13, 2), f"{a}")
+    check("pitcher_as_of K9", a["k9"] == round(13 * 9 / 13, 2), f"{a}")
+    exp_fip = (13 * 1 + 3 * (3 + 0) - 2 * 13) / 13 + 3.1
+    check("pitcher_as_of FIP", a["fip"] == round(exp_fip, 2), f"{a}")
+    check("pitcher_as_of empty", data.pitcher_as_of([], "2026-04-15") == {})
+    check("pitcher_as_of no prior games", data.pitcher_as_of(log, "2026-04-01") == {})
+
+    # batter_ops_as_of: OPS from OBP/SLG components, strictly before the date.
+    blog = [
+        {"d": "2026-04-05", "ab": 4, "h": 1, "bb": 0, "hbp": 0, "sf": 0, "tb": 2},
+        {"d": "2026-04-06", "ab": 4, "h": 2, "bb": 0, "hbp": 0, "sf": 0, "tb": 3},
+        {"d": "2026-04-20", "ab": 4, "h": 4, "bb": 0, "hbp": 0, "sf": 0, "tb": 8},  # after
+    ]
+    ops = data.batter_ops_as_of(blog, "2026-04-20")
+    check("batter_ops_as_of excludes post-date games", ops is not None and abs(ops - 1.0) < 1e-9, f"{ops}")
+    check("batter_ops_as_of none without prior games", data.batter_ops_as_of(blog, "2026-03-01") is None)
+
+    # team_as_of: ops/era/fielding accumulated per group, strictly before date.
+    tlog = {
+        "hitting": [
+            {"d": "2026-04-05", "ab": 40, "h": 10, "bb": 4, "hbp": 1, "sf": 1, "tb": 16},
+            {"d": "2026-04-06", "ab": 36, "h": 12, "bb": 2, "hbp": 0, "sf": 0, "tb": 20},
+            {"d": "2026-05-01", "ab": 40, "h": 16, "bb": 2, "hbp": 0, "sf": 0, "tb": 28},  # after
+        ],
+        "pitching": [
+            {"d": "2026-04-05", "ip": 9.0, "er": 3, "so": 8, "bb": 2, "hbp": 0, "hr": 1},
+            {"d": "2026-05-01", "ip": 9.0, "er": 9, "so": 8, "bb": 2, "hbp": 0, "hr": 3},  # after
+        ],
+        "fielding": [
+            {"d": "2026-04-05", "po": 27, "a": 9, "e": 0},
+            {"d": "2026-05-01", "po": 27, "a": 9, "e": 3},  # after
+        ],
+    }
+    t = data.team_as_of(tlog, "2026-04-10")
+    # Both 04-05 and 04-06 hitting games are before the target date; 05-01 is not.
+    exp_ops = (22 + 6 + 1) / (76 + 6 + 1 + 1) + 36 / 76
+    check("team_as_of ops", t["ops"] == round(exp_ops, 3), f"{t}")
+    check("team_as_of era", t["era"] == round(3 * 9 / 9, 2), f"{t}")
+    check("team_as_of fieldingPct", t["fieldingPct"] == 1.0, f"{t}")
+    check("team_as_of empty", data.team_as_of(None, "2026-04-10") == {})
+
+    # attach_as_of_stats: a game's stats reflect its OWN date, not today's.
+    games = [
+        {"gamePk": 1, "date": "2026-04-10", "season": "2026",
+         "home": {"id": 119, "name": "Dodgers", "abbrev": "LAD"},
+         "away": {"id": 108, "name": "Angels", "abbrev": "LAA"},
+         "homePitcher": {"id": 1, "name": "A"}, "awayPitcher": {"id": 2, "name": "B"}},
+        {"gamePk": 2, "date": "2026-05-10", "season": "2026",
+         "home": {"id": 119, "name": "Dodgers", "abbrev": "LAD"},
+         "away": {"id": 108, "name": "Angels", "abbrev": "LAA"},
+         "homePitcher": {"id": 1, "name": "A"}, "awayPitcher": {"id": 2, "name": "B"}},
+    ]
+    p_logs = {
+        "1|2026": [{"d": "2026-04-01", "ip": 6.0, "er": 2, "so": 5, "bb": 2, "hbp": 0, "hr": 1},
+                    {"d": "2026-05-01", "ip": 7.0, "er": 7, "so": 8, "bb": 2, "hbp": 0, "hr": 3}],
+        "2|2026": [{"d": "2026-04-01", "ip": 6.0, "er": 2, "so": 5, "bb": 2, "hbp": 0, "hr": 1},
+                    {"d": "2026-05-01", "ip": 7.0, "er": 7, "so": 8, "bb": 2, "hbp": 0, "hr": 3}],
+    }
+    t_logs = {"119|2026": tlog, "108|2026": tlog}
+    g1, g2 = data.attach_as_of_stats(games, p_logs, t_logs)
+    check("attach as-of pitcher (early game)", g1["homePitcher"]["era"] == 3.0, f"{g1['homePitcher']}")
+    check("attach as-of pitcher (later game)", g2["homePitcher"]["era"] == round(9 * 9 / 13, 2), f"{g2['homePitcher']}")
+    check("attach as-of team ops differs by date", g1["home"]["ops"] != g2["home"]["ops"],
+          f"{g1['home'].get('ops')} vs {g2['home'].get('ops')}")
+    check("attach as-of keeps team ids", g1["home"]["id"] == 119 and g1["away"]["id"] == 108)
 
 
 def test_runs_model() -> None:
@@ -563,6 +661,7 @@ def main() -> int:
     test_logistic()
     test_features_and_elo()
     test_lineups()
+    test_as_of_stats()
     test_runs_model()
     test_data_layer()
     test_market_odds()

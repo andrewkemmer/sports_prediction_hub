@@ -19,6 +19,9 @@ _CALIBRATION = "calibration_rows.json"
 _PITCHER_STATS = "pitcher_stats.json"
 _TEAM_STATS = "team_stats.json"
 _PLAYER_OPS = "player_ops.json"
+_PITCHER_LOGS = "pitcher_game_logs.json"
+_TEAM_LOGS = "team_game_logs.json"
+_BATTER_LOGS = "batter_game_logs.json"
 _LINEUPS = "lineups.json"
 _INJURIES = "injury_snapshots.json"
 _DOCS_BY_DATE = "docs_by_date.json"
@@ -102,6 +105,33 @@ def load_player_ops() -> dict:
 
 def save_player_ops(stats: dict) -> None:
     save_json(_PLAYER_OPS, stats)
+
+
+def load_pitcher_logs() -> dict:
+    """{id|season} -> sorted per-game pitching entries (as-of-date accumulation)."""
+    return load_json(_PITCHER_LOGS, {}) or {}
+
+
+def save_pitcher_logs(stats: dict) -> None:
+    save_json(_PITCHER_LOGS, stats)
+
+
+def load_team_logs() -> dict:
+    """{id|season} -> {"hitting": [...], "pitching": [...], "fielding": [...]}."""
+    return load_json(_TEAM_LOGS, {}) or {}
+
+
+def save_team_logs(stats: dict) -> None:
+    save_json(_TEAM_LOGS, stats)
+
+
+def load_batter_logs() -> dict:
+    """{id|season} -> sorted per-game hitting entries (as-of-date accumulation)."""
+    return load_json(_BATTER_LOGS, {}) or {}
+
+
+def save_batter_logs(stats: dict) -> None:
+    save_json(_BATTER_LOGS, stats)
 
 
 def load_lineups() -> dict:

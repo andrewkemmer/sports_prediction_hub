@@ -16,20 +16,19 @@ from .data import (
     SEASON_START_MD,
     UPCOMING_WINDOW_DAYS,
     add_days,
-    attach_lineups,
-    attach_pitcher_stats,
-    attach_team_season_stats,
+    attach_as_of_stats,
+    attach_lineups_as_of,
     et_date_string,
     fetch_all_seasons,
+    fetch_batter_game_logs,
     fetch_current_injury_snapshot,
     fetch_injury_snapshots,
     fetch_lineups_for_games,
     fetch_market_odds,
-    fetch_pitcher_stats,
-    market_odds_enabled,
-    fetch_player_season_ops,
+    fetch_pitcher_game_logs,
     fetch_schedule_range,
-    fetch_team_season_stats,
+    fetch_team_game_logs,
+    market_odds_enabled,
     market_odds_for_game,
 )
 from .engine.features import build_features_for_game
@@ -248,17 +247,13 @@ def build_todays_record(rows_today: list[dict], today: str) -> dict:
 def build_game_doc(
     game: dict,
     pred: dict,
-    pitcher_stats: dict,
     injuries: dict | None,
     run_projection: dict | None,
     market_odds: dict | None,
 ) -> dict:
+    # Pitcher/team stats are already attached as-of the game's own date by
+    # attach_as_of_stats — never override them with a flat full-season dict.
     season = game.get("season")
-
-    def pitcher_with_stats(p):
-        if not p:
-            return p
-        return {**p, **pitcher_stats.get(f"{p['id']}|{season}", {})}
 
     doc = {
         "gamePk": game["gamePk"],
@@ -271,8 +266,8 @@ def build_game_doc(
         "venue": game.get("venue"),
         "away": game["away"],
         "home": game["home"],
-        "awayPitcher": pitcher_with_stats(game.get("awayPitcher")),
-        "homePitcher": pitcher_with_stats(game.get("homePitcher")),
+        "awayPitcher": game.get("awayPitcher"),
+        "homePitcher": game.get("homePitcher"),
         "winner": game.get("winner"),
         "homeWinProb": pred["homeWinProb"],
         "awayWinProb": pred["awayWinProb"],
@@ -386,9 +381,6 @@ def run_refresh(
     rep("Reading cached data", 4, "Loading previously stored games…")
     cached_games = cache.load_games()
     cached_state = cache.load_model_state()
-    pitcher_cache = cache.load_pitcher_stats()
-    team_cache = cache.load_team_stats()
-    player_ops_cache = cache.load_player_ops()
     injury_cache = cache.load_injury_snapshots()
 
     completed_cached = [g for g in cached_games if g.get("winner") in ("home", "away")]
@@ -416,28 +408,14 @@ def run_refresh(
             f"Only {len(completed)} completed regular-season games found. Cannot train yet."
         )
 
-    # 3. Pitcher stats (current + previous season; all seasons on a cold start).
-    rep("Fetching pitcher stats", 26, "Loading starting-pitcher ERA / FIP…")
-    prev_season = str(int(season) - 1)
-    if has_history and not force_full:
-        stat_seasons = {season, prev_season}
-        needs_stats = [
-            g for g in all_games
-            if (g.get("season") in stat_seasons)
-            and (
-                (g.get("awayPitcher") and g["awayPitcher"].get("era") is None)
-                or (g.get("homePitcher") and g["homePitcher"].get("era") is None)
-            )
-        ]
-    else:
-        needs_stats = [
-            g for g in all_games
-            if (g.get("awayPitcher") and g["awayPitcher"].get("era") is None)
-            or (g.get("homePitcher") and g["homePitcher"].get("era") is None)
-        ]
+    # 3. Pitcher game logs — one fetch per {SP, season}; every game's SP stats
+    #    are then accumulated as-of that game's own date below, so a June game
+    #    never sees stats from the pitcher's July/August starts (no lookahead).
+    rep("Fetching pitcher game logs", 24, "Loading per-game pitching history…")
+    pitcher_log_cache = cache.load_pitcher_logs()
     pitcher_pairs = []
     seen_p = set()
-    for g in needs_stats:
+    for g in all_games:
         s = g.get("season") or season
         for p in (g.get("awayPitcher"), g.get("homePitcher")):
             if p and p.get("id"):
@@ -445,23 +423,25 @@ def run_refresh(
                 if key not in seen_p:
                     seen_p.add(key)
                     pitcher_pairs.append({"id": p["id"], "season": s})
-    pitcher_stats = fetch_pitcher_stats(pitcher_pairs, pitcher_cache)
-    pitcher_cache.update(pitcher_stats)
-    rep("Pitcher stats loaded", 32, f"Loaded {len(pitcher_stats)} pitcher seasons.")
+    to_fetch = [p for p in pitcher_pairs if f"{p['id']}|{p['season']}" not in pitcher_log_cache]
+    fresh_pitcher_logs = fetch_pitcher_game_logs(to_fetch, pitcher_log_cache)
+    pitcher_log_cache.update(fresh_pitcher_logs)
+    rep("Pitcher game logs loaded", 30, f"Cached {len(pitcher_log_cache)} pitcher-season logs.")
 
-    # 4. Team season stats.
-    rep("Fetching team stats", 36, "Loading team OPS / ERA / fielding…")
+    # 4. Team game logs (hitting / pitching / fielding), same as-of-date logic.
+    rep("Fetching team game logs", 34, "Loading per-game team hitting / pitching / fielding…")
+    team_log_cache = cache.load_team_logs()
     team_pairs = {}
     for g in all_games:
         s = g.get("season") or season
         team_pairs.setdefault(f"{g['home']['id']}|{s}", {"id": g["home"]["id"], "season": s})
         team_pairs.setdefault(f"{g['away']['id']}|{s}", {"id": g["away"]["id"], "season": s})
-    to_fetch = [p for p in team_pairs.values() if f"{p['id']}|{p['season']}" not in team_cache]
-    fresh_team_stats = fetch_team_season_stats(to_fetch, team_cache)
-    team_cache.update(fresh_team_stats)
-    rep("Team stats loaded", 42, f"Loaded {len(fresh_team_stats)} team-season stat blocks.")
+    to_fetch = [p for p in team_pairs.values() if f"{p['id']}|{p['season']}" not in team_log_cache]
+    fresh_team_logs = fetch_team_game_logs(to_fetch, team_log_cache)
+    team_log_cache.update(fresh_team_logs)
+    rep("Team game logs loaded", 40, f"Cached {len(team_log_cache)} team-season logs.")
 
-    enriched = attach_team_season_stats(attach_pitcher_stats(all_games, pitcher_stats), team_cache)
+    enriched = attach_as_of_stats(all_games, pitcher_log_cache, team_log_cache)
 
     # 5. Lineups (ALL games; incremental via disk cache) + per-season player OPS.
     #    Historical lineups matter: lineupOpsDiff is a model feature, and it is
@@ -470,7 +450,7 @@ def run_refresh(
     #    the ML feature selection rightly dropped the feature. Fetching the
     #    boxscore lineup for every completed game (it is final data, cached per
     #    gamePk) gives the model a real batter-level signal to weigh.
-    rep("Fetching lineups", 46, "Loading starting lineups (historical + upcoming)…")
+    rep("Fetching lineups", 44, "Loading starting lineups (historical + upcoming)…")
     lineup_cache = cache.load_lineups()
     to_fetch = [g for g in enriched if g["gamePk"] not in lineup_cache]
     if to_fetch:
@@ -483,9 +463,14 @@ def run_refresh(
                 # Completed game with no posted lineups — final, never refetch.
                 lineup_cache[g["gamePk"]] = None
         cached_count = sum(1 for v in lineup_cache.values() if v)
-        rep("Lineups loaded", 48, f"Cached lineups for {cached_count} games.")
+        rep("Lineups loaded", 46, f"Cached lineups for {cached_count} games.")
     lineups = {pk: lu for pk, lu in lineup_cache.items() if lu}
 
+    # Batter game logs: one fetch per {batter, season}. Each batter's OPS is
+    # then accumulated as-of the game's own date, so neither a batter's future
+    # games nor a later season's numbers ever leak into a training row.
+    rep("Fetching batter game logs", 48, "Loading per-game batting history…")
+    batter_log_cache = cache.load_batter_logs()
     batter_ids_by_season: dict[str, set[int]] = {}
     for g in enriched:
         lu = lineups.get(g["gamePk"])
@@ -497,23 +482,11 @@ def run_refresh(
                 continue
             for p in side["battingOrder"] + side["bench"]:
                 batter_ids_by_season.setdefault(s, set()).add(p["id"])
-
-    # Batter OPS must come from the game's own season (2024 games get 2024
-    # stats), otherwise a batter's 2026 numbers would leak into 2024 rows.
-    season_ops: dict[str, dict] = {}
     for s, ids in batter_ids_by_season.items():
-        ops = fetch_player_season_ops(sorted(ids), s, player_ops_cache)
-        player_ops_cache.update({f"{pid}|{s}": ops for pid, ops in ops.items()})
-        season_ops[s] = ops
-
-    if season_ops:
-        reattached = []
-        for s, ops in season_ops.items():
-            group = [g for g in enriched if (g.get("season") or season) == s]
-            reattached.extend(attach_lineups(group, lineups, ops))
-        enriched = reattached
-    else:
-        enriched = attach_lineups(enriched, lineups, {})
+        fresh_logs = fetch_batter_game_logs(sorted(ids), s, batter_log_cache)
+        batter_log_cache.update(fresh_logs)
+    rep("Batter game logs loaded", 52, f"Cached {len(batter_log_cache)} batter-season logs.")
+    enriched = attach_lineups_as_of(enriched, lineups, batter_log_cache)
 
     # 6. Injury snapshots (current season; only new dates) + current-day counts.
     rep("Fetching injury data", 54, "Loading injured-list snapshots…")
@@ -584,7 +557,6 @@ def run_refresh(
                 build_game_doc(
                     g,
                     pred,
-                    pitcher_stats,
                     None,
                     build_run_projection(run_model_state, run_line_iso, g, None, None, RUN_CALIB_TRIALS, pred["homeWinProb"], run_margin_cal),
                     None,
@@ -597,7 +569,6 @@ def run_refresh(
                 build_game_doc(
                     g,
                     pred,
-                    pitcher_stats,
                     {"home": team_state["injuries"].get(g["home"]["id"], 0), "away": team_state["injuries"].get(g["away"]["id"], 0)},
                     build_run_projection(
                         run_model_state,
@@ -656,9 +627,10 @@ def run_refresh(
         "runModel": result["runModel"],
         "runLineCalibration": result["runLineCalibration"],
         "runMarginCalibration": result["runMarginCalibration"],
-        "teamSeasonStats": team_cache,
+        "pitcherLogs": pitcher_log_cache,
+        "teamLogs": team_log_cache,
+        "batterLogs": batter_log_cache,
         "injurySnapshots": injury_cache,
-        "playerOps": player_ops_cache,
         "calibrationSummary": calibration_summary,
         "spearmanRho": spearman,
         "topDecileWinRate": top_decile,
@@ -668,9 +640,9 @@ def run_refresh(
     cache.save_model_state(state)
     cache.save_games(all_games)
     cache.save_calibration_rows(calibration_rows)
-    cache.save_pitcher_stats(pitcher_cache)
-    cache.save_team_stats(team_cache)
-    cache.save_player_ops(player_ops_cache)
+    cache.save_pitcher_logs(pitcher_log_cache)
+    cache.save_team_logs(team_log_cache)
+    cache.save_batter_logs(batter_log_cache)
     cache.save_lineups(lineup_cache)
     cache.save_injury_snapshots(injury_cache)
 
@@ -710,24 +682,30 @@ def predict_date(date: str, state: dict | None = None) -> int:
     season = state["season"]
 
     raw = fetch_schedule_range(date, date)
+
+    # As-of-date stats for the requested day: game logs cached per {entity, season}.
+    pitcher_log_cache = cache.load_pitcher_logs()
     pitcher_pairs = []
     for g in raw:
         s = g.get("season") or season
         for p in (g.get("awayPitcher"), g.get("homePitcher")):
             if p and p.get("id"):
                 pitcher_pairs.append({"id": p["id"], "season": s})
-    pitcher_stats = fetch_pitcher_stats(pitcher_pairs, cache.load_pitcher_stats())
+    to_fetch = [p for p in pitcher_pairs if f"{p['id']}|{p['season']}" not in pitcher_log_cache]
+    fresh_pitcher_logs = fetch_pitcher_game_logs(to_fetch, pitcher_log_cache)
+    pitcher_log_cache.update(fresh_pitcher_logs)
 
-    stored_team_stats = state.get("teamSeasonStats") or {}
+    team_log_cache = cache.load_team_logs()
     team_pairs = {}
     for g in raw:
         s = g.get("season") or season
         for tid in (g["home"]["id"], g["away"]["id"]):
             team_pairs.setdefault(f"{tid}|{s}", {"id": tid, "season": s})
-    missing = [p for p in team_pairs.values() if f"{p['id']}|{p['season']}" not in stored_team_stats]
-    fresh_team_stats = fetch_team_season_stats(missing, stored_team_stats)
-    team_stats = {**stored_team_stats, **fresh_team_stats}
-    enriched = attach_team_season_stats(attach_pitcher_stats(raw, pitcher_stats), team_stats)
+    to_fetch = [p for p in team_pairs.values() if f"{p['id']}|{p['season']}" not in team_log_cache]
+    fresh_team_logs = fetch_team_game_logs(to_fetch, team_log_cache)
+    team_log_cache.update(fresh_team_logs)
+
+    enriched = attach_as_of_stats(raw, pitcher_log_cache, team_log_cache)
 
     lineups = fetch_lineups_for_games(enriched, 16)
     batter_ids = []
@@ -737,8 +715,12 @@ def predict_date(date: str, state: dict | None = None) -> int:
                 continue
             for p in side["battingOrder"] + side["bench"]:
                 batter_ids.append(p["id"])
-    player_ops = fetch_player_season_ops(batter_ids, season, state.get("playerOps") or {})
-    enriched = attach_lineups(enriched, lineups, player_ops)
+    batter_log_cache = cache.load_batter_logs()
+    to_fetch = sorted({pid for pid in batter_ids if f"{pid}|{season}" not in batter_log_cache})
+    if to_fetch:
+        fresh_batter_logs = fetch_batter_game_logs(to_fetch, season, batter_log_cache)
+        batter_log_cache.update(fresh_batter_logs)
+    enriched = attach_lineups_as_of(enriched, lineups, batter_log_cache)
 
     market_odds = fetch_market_odds()
 
@@ -750,7 +732,6 @@ def predict_date(date: str, state: dict | None = None) -> int:
             build_game_doc(
                 g,
                 pred,
-                pitcher_stats,
                 {"home": team_state["injuries"].get(g["home"]["id"], 0), "away": team_state["injuries"].get(g["away"]["id"], 0)},
                 build_run_projection(
                     run_model_state,
@@ -765,6 +746,10 @@ def predict_date(date: str, state: dict | None = None) -> int:
                 odds,
             )
         )
+    # Persist the (possibly grown) log caches so the next refresh is incremental.
+    cache.save_pitcher_logs(pitcher_log_cache)
+    cache.save_team_logs(team_log_cache)
+    cache.save_batter_logs(batter_log_cache)
     docs_by_date = cache.load_docs_by_date()
     docs_by_date[date] = docs
     cache.save_docs_by_date(docs_by_date)

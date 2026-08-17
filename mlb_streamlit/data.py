@@ -352,6 +352,94 @@ def attach_pitcher_stats(games: list[dict], stats: dict) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# As-of-date stats (per-game game logs, accumulated with no lookahead)
+#
+# The season endpoints above return full-season totals that leak information
+# from AFTER a game's date into that game's features (a July game would see
+# August stats). For honest training the pipeline accumulates each entity's
+# per-game game log strictly BEFORE the target game's date. Logs are cached
+# once per {id|season}, so any as-of date is a cheap local sum.
+# ---------------------------------------------------------------------------
+
+def _num(value) -> float:
+    """Best-effort float conversion (0 on junk) for compact log entries."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _compact_pitcher_entry(split: dict) -> dict | None:
+    st = split.get("stat") or {}
+    ip = innings_pitched_value(st.get("inningsPitched"))
+    if ip <= 0:
+        return None
+    return {
+        "d": split.get("date") or "",
+        "ip": round(ip, 3),
+        "er": _num(st.get("earnedRuns")),
+        "so": _num(st.get("strikeOuts")),
+        "bb": _num(st.get("baseOnBalls")),
+        "hbp": _num(st.get("hitByPitch")),
+        "hr": _num(st.get("homeRuns")),
+    }
+
+
+def fetch_pitcher_game_logs(pairs: list[dict], cached: dict | None = None) -> dict:
+    """{id|season} -> sorted compact per-game pitching entries (gameLog)."""
+    cached = cached or {}
+    seen = set()
+    unique = []
+    for p in pairs:
+        key = f"{p['id']}|{p['season']}"
+        if p["id"] <= 0 or key in seen or key in cached:
+            continue
+        seen.add(key)
+        unique.append(p)
+    out: dict = {}
+
+    def fetch(p):
+        key = f"{p['id']}|{p['season']}"
+        try:
+            data = fetch_json(
+                f"{MLB_BASE}/api/v1/people/{p['id']}/stats?stats=gameLog&group=pitching&season={p['season']}&gameType=R"
+            )
+            splits = (data.get("stats") or [{}])[0].get("splits") or []
+            entries = [e for e in (_compact_pitcher_entry(s) for s in splits) if e and e["d"]]
+            entries.sort(key=lambda e: e["d"])
+            if entries:
+                out[key] = entries
+        except Exception:  # noqa: BLE001 — individual pitcher failures are non-fatal
+            pass
+
+    map_limit(unique, 16, fetch)
+    return out
+
+
+def pitcher_as_of(entries: list[dict] | None, ymd: str) -> dict:
+    """Season ERA / K9 / FIP accumulated strictly before `ymd` (no lookahead)."""
+    if not entries:
+        return {}
+    ip = er = so = bb = hbp = hr = 0.0
+    for e in entries:  # date-sorted; stop at the first game on/after the target date
+        if e["d"] >= ymd:
+            break
+        ip += e["ip"]
+        er += e["er"]
+        so += e["so"]
+        bb += e["bb"]
+        hbp += e["hbp"]
+        hr += e["hr"]
+    if ip <= 0:
+        return {}
+    return {
+        "era": round(er * 9 / ip, 2),
+        "k9": round(so * 9 / ip, 2),
+        "fip": round((13 * hr + 3 * (bb + hbp) - 2 * so) / ip + FIP_CONSTANT, 2),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Team season stats (OPS / ERA / fielding%)
 # ---------------------------------------------------------------------------
 
@@ -411,6 +499,139 @@ def attach_team_season_stats(games: list[dict], stats: dict) -> list[dict]:
             **g,
             "home": {**g["home"], **home_stats},
             "away": {**g["away"], **away_stats},
+        })
+    return out
+
+
+def _compact_hitting_entry(split: dict) -> dict | None:
+    st = split.get("stat") or {}
+    return {
+        "d": split.get("date") or "",
+        "ab": _num(st.get("atBats")),
+        "h": _num(st.get("hits")),
+        "bb": _num(st.get("baseOnBalls")),
+        "hbp": _num(st.get("hitByPitch")),
+        "sf": _num(st.get("sacFlies")),
+        "tb": _num(st.get("totalBases")),
+    }
+
+
+def _compact_fielding_entry(split: dict) -> dict | None:
+    st = split.get("stat") or {}
+    return {"d": split.get("date") or "", "po": _num(st.get("putOuts")), "a": _num(st.get("assists")), "e": _num(st.get("errors"))}
+
+
+def fetch_team_game_logs(pairs: list[dict], cached: dict | None = None) -> dict:
+    """{id|season} -> {"hitting": [...], "pitching": [...], "fielding": [...]} (gameLog)."""
+    cached = cached or {}
+    seen = set()
+    unique = []
+    for p in pairs:
+        key = f"{p['id']}|{p['season']}"
+        if p["id"] <= 0 or key in seen or key in cached:
+            continue
+        seen.add(key)
+        unique.append(p)
+    out: dict = {}
+
+    def fetch(p):
+        key = f"{p['id']}|{p['season']}"
+        try:
+            data = fetch_json(
+                f"{MLB_BASE}/api/v1/teams/{p['id']}/stats?stats=gameLog&group=hitting,pitching,fielding&season={p['season']}&gameType=R"
+            )
+            result: dict = {}
+            for block in data.get("stats") or []:
+                group = (block.get("group") or {}).get("displayName") or ""
+                splits = block.get("splits") or []
+                if group == "hitting":
+                    entries = [e for e in (_compact_hitting_entry(s) for s in splits) if e and e["d"]]
+                elif group == "pitching":
+                    entries = [e for e in (_compact_pitcher_entry(s) for s in splits) if e and e["d"]]
+                elif group == "fielding":
+                    entries = [e for e in (_compact_fielding_entry(s) for s in splits) if e and e["d"]]
+                else:
+                    continue
+                entries.sort(key=lambda e: e["d"])
+                result[group] = entries
+            if result:
+                out[key] = result
+        except Exception:  # noqa: BLE001 — individual team failures are non-fatal
+            pass
+
+    map_limit(unique, 16, fetch)
+    return out
+
+
+def _ops_from_hitting(ab: float, h: float, bb: float, hbp: float, sf: float, tb: float) -> float | None:
+    if ab + bb + hbp + sf <= 0:
+        return None
+    obp = (h + bb + hbp) / (ab + bb + hbp + sf)
+    slg = tb / ab if ab > 0 else 0.0
+    return obp + slg
+
+
+def team_as_of(log: dict | None, ymd: str) -> dict:
+    """Team OPS / staff ERA / fielding pct accumulated strictly before `ymd`."""
+    if not log:
+        return {}
+    out: dict = {}
+
+    ab = h = bb = hbp = sf = tb = 0.0
+    for e in log.get("hitting") or []:
+        if e["d"] >= ymd:
+            break
+        ab += e["ab"]
+        h += e["h"]
+        bb += e["bb"]
+        hbp += e["hbp"]
+        sf += e["sf"]
+        tb += e["tb"]
+    ops = _ops_from_hitting(ab, h, bb, hbp, sf, tb)
+    if ops is not None:
+        out["ops"] = round(ops, 3)
+
+    ip = er = 0.0
+    for e in log.get("pitching") or []:
+        if e["d"] >= ymd:
+            break
+        ip += e["ip"]
+        er += e["er"]
+    if ip > 0:
+        out["era"] = round(er * 9 / ip, 2)
+
+    po = a = err = 0.0
+    for e in log.get("fielding") or []:
+        if e["d"] >= ymd:
+            break
+        po += e["po"]
+        a += e["a"]
+        err += e["e"]
+    chances = po + a + err
+    if chances > 0:
+        out["fieldingPct"] = round((po + a) / chances, 3)
+
+    return out
+
+
+def attach_as_of_stats(games: list[dict], pitcher_logs: dict, team_logs: dict) -> list[dict]:
+    """Attach per-game as-of-date pitcher + team stats (no lookahead)."""
+    out = []
+    for g in games:
+        season = g.get("season")
+        ymd = g["date"]
+
+        def pitcher_stats(p):
+            if not p:
+                return p
+            return {**p, **pitcher_as_of(pitcher_logs.get(f"{p['id']}|{season}"), ymd)}
+
+        out.append({
+            **g,
+            "awayPitcher": pitcher_stats(g.get("awayPitcher")),
+            "homePitcher": pitcher_stats(g.get("homePitcher")),
+            "home": {**g["home"], **team_as_of(team_logs.get(f"{g['home']['id']}|{season}"), ymd)},
+            "away": {**g["away"], **team_as_of(team_logs.get(f"{g['away']['id']}|{season}"), ymd)},
         })
     return out
 
@@ -624,6 +845,88 @@ def fetch_player_season_ops(ids: list[int], season: str, cached: dict | None = N
             pass
 
     map_limit(unique, 24, fetch)
+    return out
+
+
+def fetch_batter_game_logs(ids: list[int], season: str, cached: dict | None = None) -> dict:
+    """{pid|season} -> sorted compact per-game hitting entries (gameLog)."""
+    cached = cached or {}
+    unique = sorted({pid for pid in ids if pid > 0 and f"{pid}|{season}" not in cached})
+    out: dict = {}
+
+    def fetch(pid):
+        key = f"{pid}|{season}"
+        try:
+            data = fetch_json(
+                f"{MLB_BASE}/api/v1/people/{pid}/stats?stats=gameLog&group=hitting&season={season}&gameType=R"
+            )
+            splits = (data.get("stats") or [{}])[0].get("splits") or []
+            entries = [e for e in (_compact_hitting_entry(s) for s in splits) if e and e["d"]]
+            entries.sort(key=lambda e: e["d"])
+            if entries:
+                out[key] = entries
+        except Exception:  # noqa: BLE001 — individual batter failures are non-fatal
+            pass
+
+    map_limit(unique, 24, fetch)
+    return out
+
+
+def batter_ops_as_of(entries: list[dict] | None, ymd: str) -> float | None:
+    """Batter season OPS accumulated strictly before `ymd`; None with no prior games."""
+    if not entries:
+        return None
+    ab = h = bb = hbp = sf = tb = 0.0
+    for e in entries:  # date-sorted; stop at the first game on/after the target date
+        if e["d"] >= ymd:
+            break
+        ab += e["ab"]
+        h += e["h"]
+        bb += e["bb"]
+        hbp += e["hbp"]
+        sf += e["sf"]
+        tb += e["tb"]
+    ops = _ops_from_hitting(ab, h, bb, hbp, sf, tb)
+    return round(ops, 3) if ops is not None else None
+
+
+def attach_lineups_as_of(games: list[dict], lineups: dict, batter_logs: dict) -> list[dict]:
+    """Attach lineups with each batter's OPS as-of the game's own date (no lookahead)."""
+    out = []
+    for g in games:
+        lu = lineups.get(g["gamePk"])
+        if not lu:
+            out.append(g)
+            continue
+        season = g.get("season")
+        ymd = g["date"]
+
+        def with_ops(side):
+            if not side:
+                return side
+            return {
+                "battingOrder": [
+                    {**p, "ops": batter_ops_as_of(batter_logs.get(f"{p['id']}|{season}"), ymd)}
+                    for p in side["battingOrder"]
+                ],
+                "bench": [
+                    {**p, "ops": batter_ops_as_of(batter_logs.get(f"{p['id']}|{season}"), ymd)}
+                    for p in side["bench"]
+                ],
+            }
+
+        home = with_ops(lu.get("home"))
+        away = with_ops(lu.get("away"))
+        home_ops = lineup_ops(home["battingOrder"]) if home else 0.0
+        away_ops = lineup_ops(away["battingOrder"]) if away else 0.0
+        out.append({
+            **g,
+            "lineups": {"home": home, "away": away},
+            "lineupStats": {
+                "home": {"known": home_ops > 0, "ops": home_ops},
+                "away": {"known": away_ops > 0, "ops": away_ops},
+            },
+        })
     return out
 
 
