@@ -44,7 +44,13 @@ from .engine.metrics import (
     logit,
     spearman_rank,
 )
-from .engine.model import apply_model, run_model, simulate_runs_batch
+from .engine.model import (
+    apply_model,
+    build_power_rankings,
+    run_model,
+    run_model_light,
+    simulate_runs_batch,
+)
 from .engine.runs import expected_margin, expected_total, simulate_runs
 
 RUN_SIM_TRIALS = 10000
@@ -1030,7 +1036,8 @@ def _backtest_state(target: str, report=None) -> dict | None:
         return None
     fingerprint = _data_fingerprint(prior, {})
 
-    states = cache.load_json(BACKTEST_STATES_FILE, {}) or {}
+    states_raw = cache.load_json(BACKTEST_STATES_FILE, {}) or {}
+    states = states_raw.get("days", {}) if isinstance(states_raw, dict) and "days" in states_raw else {}
     existing = states.get(target)
     if existing and existing.get("dataFingerprint") == fingerprint:
         return existing
@@ -1052,8 +1059,8 @@ def _backtest_state(target: str, report=None) -> dict | None:
     # No matchup enrichment: current-season platoon/vs-team splits are
     # season-to-date and would leak post-target games into training features.
     completed_enriched = [g for g in enriched if g.get("winner") in ("home", "away")]
-    run = run_model(completed_enriched, season, target, cache.load_injury_snapshots())
-    result = run["result"]
+    fe = compute_elo_and_features(completed_enriched, cache.load_injury_snapshots(), target)
+    result = run_model_light(fe["rows"], completed_enriched, season, target)
 
     state = {
         "key": "backtest",
@@ -1078,14 +1085,14 @@ def _backtest_state(target: str, report=None) -> dict | None:
         "brier": result["brier"],
         "logLoss": result["logLoss"],
         "ece": result["ece"],
-        "powerRankings": result["powerRankings"],
+        "powerRankings": build_power_rankings(completed_enriched, fe["teamState"], fe["teamStats"]),
         "runModel": result["runModel"],
         "runLineCalibration": result["runLineCalibration"],
         "runMarginCalibration": result["runMarginCalibration"],
         "dataFingerprint": fingerprint,
     }
     states[target] = state
-    cache.save_json(BACKTEST_STATES_FILE, states)
+    cache.save_json(BACKTEST_STATES_FILE, {"version": 2, "days": states})
     rep("Backtest model ready", 45, f"Walk-forward model trained through {target}.")
     return state
 
@@ -1096,17 +1103,19 @@ CALIBRATION_WF_FILE = "calibration_rows_wf.json"
 def build_walk_forward_calibration_rows(report=None) -> list[dict]:
     """Strict walk-forward calibration rows — the true point-in-time backtest.
 
-    Every completed game on date D is scored with a model trained ONLY on
-    games strictly before D (cached per date via `_backtest_state`), using
-    features/elo replayed chronologically as-of D. Each row records the date
-    its scoring model was trained through, so a row's game date is always
-    >= its model's training cutoff (the game was never in the training set).
+    Every completed game in the **current season** on date D is scored with a
+    model trained ONLY on games strictly before D (cached per date in
+    `calibration_rows_wf.json`), using features/elo replayed chronologically
+    as-of D.
+    Each row records the date its scoring model was trained through, so a
+    row's game date is always >= its model's training cutoff (the game was
+    never in the training set).
 
-    Per-date results are cached keyed by a fingerprint of (games < D plus
-    games on D), so later calls re-score only new/changed dates — a refresh
-    that only adds later games reuses every earlier day's cached rows. Dates
-    with fewer than MIN_COMPLETED_GAMES prior games are skipped (no history
-    to train on).
+    Prior seasons are used as training history but are not scored — the
+    dashboard only reports the current season's completed games. Per-date
+    results are cached keyed by a fingerprint of (games < D plus games on D),
+    so later calls re-score only new/changed dates. Dates with fewer than
+    MIN_COMPLETED_GAMES prior games are skipped.
     """
     def rep(stage, pct, msg):
         if report:
@@ -1144,36 +1153,49 @@ def build_walk_forward_calibration_rows(report=None) -> list[dict]:
     for g in enriched:
         by_date.setdefault(g["date"], []).append(g)
 
-    existing = cache.load_json(CALIBRATION_WF_FILE, {}) or {}
+    existing_raw = cache.load_json(CALIBRATION_WF_FILE, {}) or {}
+    existing = existing_raw.get("days", {}) if isinstance(existing_raw, dict) and "days" in existing_raw else {}
     out: dict[str, dict] = {}
-    dates = sorted(by_date)
+    season = today[:4]
+    fe_rows = fe["rows"]
+    dates = sorted(d for d in by_date if d[:4] == season)
     for i, d in enumerate(dates):
-        prior = [g for g in enriched if g["date"] < d]
-        fp = _data_fingerprint(prior + by_date[d], {})
+        prior_rows = [r for r in fe_rows if r["game"]["date"] < d]
+        if len(prior_rows) < MIN_COMPLETED_GAMES:
+            continue
+        prior_games = [r["game"] for r in prior_rows]
+        fp = _data_fingerprint(prior_games + by_date[d], {})
         cached_day = existing.get(d)
         if cached_day and cached_day.get("fp") == fp:
             out[d] = cached_day
             continue
-        st = _backtest_state(d, report)
-        if st is None:
-            continue
         day_rows = rows_by_date.get(d) or []
         if not day_rows:
             continue
-        model = reconstruct_model(st)
+        result = run_model_light(prior_rows, prior_games, season, d)
+        model = {
+            "featureNames": result["featureNames"],
+            "weights": result["weights"],
+            "bias": result["bias"],
+            "featureStats": result["featureStats"],
+            "isotonicPoints": result["isotonicPoints"],
+            "monteCarloSigma": result["monteCarloSigma"],
+            "monteCarloEnabled": result["monteCarloEnabled"],
+            "eloHfa": result["eloHfa"],
+        }
         cal_rows = build_calibration_rows(
             day_rows,
             model,
-            st["runModel"],
-            st["runLineCalibration"] or [],
-            st["runMarginCalibration"] or {"slope": 0, "intercept": 0},
+            result["runModel"],
+            result["runLineCalibration"],
+            result["runMarginCalibration"],
         )
         for r in cal_rows:
-            r["trainedThrough"] = st["trainedThrough"]
+            r["trainedThrough"] = d
         out[d] = {"fp": fp, "rows": cal_rows}
         rep("Walk-forward", 30 + int(65 * (i + 1) / max(1, len(dates))),
-            f"Scored {len(cal_rows)} game(s) on {d} with a model trained on {len(prior)} prior game(s)…")
-    cache.save_json(CALIBRATION_WF_FILE, out)
+            f"Scored {len(cal_rows)} game(s) on {d} with a model trained on {len(prior_rows)} prior game(s)…")
+    cache.save_json(CALIBRATION_WF_FILE, {"version": 2, "days": out})
     flat: list[dict] = []
     for d in sorted(out):
         flat.extend(out[d]["rows"])

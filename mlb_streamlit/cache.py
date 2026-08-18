@@ -112,8 +112,15 @@ def save_calibration_rows(rows: list[dict]) -> None:
 
 
 def load_calibration_rows_wf() -> dict:
-    """Walk-forward calibration cache: date -> {"fp", "rows"}."""
-    return load_json(_CALIBRATION_WF, {}) or {}
+    """Walk-forward calibration cache: date -> {"fp", "rows"}.
+
+    Version 2 of the payload wraps the per-date map under a ``days`` key so
+    old full-model rows are not silently reused after the model changes.
+    """
+    raw = load_json(_CALIBRATION_WF, {}) or {}
+    if isinstance(raw, dict) and "days" in raw:
+        return raw.get("days") or {}
+    return raw
 
 
 def save_calibration_rows_wf(days: dict) -> None:

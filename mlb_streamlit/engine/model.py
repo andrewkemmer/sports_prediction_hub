@@ -764,3 +764,179 @@ def run_model(
         "rows": rows,
         "predict": predict,
     }
+
+
+def build_power_rankings(
+    completed_games: list[dict],
+    team_state: dict,
+    team_stats: dict,
+) -> list[dict]:
+    """Elo power-ranking table from a chronological feature pass.
+
+    Extracted from `run_model` so the lightweight walk-forward path can build
+    the same as-of rankings without re-running the full Auto-ML pipeline.
+    """
+    meta_map: dict[int, dict] = {}
+    for g in completed_games:
+        meta_map.setdefault(g["away"]["id"], {"name": g["away"]["name"], "abbrev": g["away"]["abbrev"]})
+        meta_map.setdefault(g["home"]["id"], {"name": g["home"]["name"], "abbrev": g["home"]["abbrev"]})
+    power_rankings: list[dict] = []
+    for tid in sorted(team_state["elo"].keys()):
+        rec = team_state["records"].get(tid, {"wins": 0, "losses": 0})
+        home_rec = team_stats["homeRecords"].get(tid, {"wins": 0, "losses": 0})
+        away_rec = team_stats["awayRecords"].get(tid, {"wins": 0, "losses": 0})
+        meta = meta_map.get(tid, {"name": f"Team {tid}", "abbrev": "TBD"})
+        home_total = home_rec["wins"] + home_rec["losses"]
+        away_total = away_rec["wins"] + away_rec["losses"]
+        wins = rec["wins"]
+        losses = rec["losses"]
+        power_rankings.append({
+            "teamId": tid,
+            "name": meta["name"],
+            "abbrev": meta["abbrev"],
+            "elo": team_state["elo"][tid],
+            "wins": wins,
+            "losses": losses,
+            "winPct": wins / (wins + losses) if (wins + losses) > 0 else 0.0,
+            "last10WinPct": team_state["form"].get(tid, 0.5),
+            "lastGameDate": team_state["lastGameDate"].get(tid, ""),
+            "injuries": team_state["injuries"].get(tid, 0),
+            "runDiff": team_stats["runDiff"].get(tid, 0),
+            "homeWinPct": home_rec["wins"] / home_total if home_total > 0 else 0.0,
+            "awayWinPct": away_rec["wins"] / away_total if away_total > 0 else 0.0,
+        })
+    power_rankings.sort(key=lambda r: -r["elo"])
+    return power_rankings
+
+
+def run_model_light(
+    rows: list[dict],
+    completed_games: list[dict],
+    season: str,
+    as_of_date: str,
+) -> dict:
+    """Cheap point-in-time refit for walk-forward backtests.
+
+    Reuses precomputed chronological feature rows (`rows`) and fits the same
+    core production recipe — L2 logistic + Elo blend + isotonic calibration +
+    Poisson run-scoring — but skips the expensive Auto-ML layers (greedy
+    backward elimination, the full candidate pool, stacking, Monte Carlo grid,
+    drift and cross-validation diagnostics). Each call is tens of times faster
+    than `run_model` while still training strictly on prior rows, so no future
+    outcome leaks into the fitted model.
+    """
+    n = len(rows)
+    train_end = int(math.floor(n * 0.7))
+    calib_end = min(n, int(math.floor(n * 0.85)))
+    train = rows[:train_end]
+    calib = rows[train_end:calib_end]
+    test = rows[calib_end:]
+
+    selected = list(FEATURE_KEYS)
+    lr_model = train_logistic(train, selected)
+
+    elo_hfa = 30.0
+    if len(train) >= 20:
+        best_brier = float("inf")
+        for hfa in HFA_GRID:
+            preds = [elo_prob(r, hfa) for r in train]
+            b = compute_brier(preds, [r["label"] for r in train])
+            if b < best_brier:
+                best_brier = b
+                elo_hfa = hfa
+
+    calib_labels = [r["label"] for r in calib]
+    lr_logits = [logistic_logit(lr_model, r["features"], None) for r in calib]
+    elo_logits = [logit(elo_prob(r, elo_hfa)) for r in calib]
+    blend_w = 0.5
+    if len(calib) >= 20:
+        best_brier = float("inf")
+        w = 0.0
+        while w <= 1.0001:
+            preds = [sigmoid((1 - w) * l + w * e) for l, e in zip(lr_logits, elo_logits)]
+            b = compute_brier(preds, calib_labels)
+            if b < best_brier:
+                best_brier = b
+                blend_w = w
+            w += 0.05
+
+    chosen_preds = [sigmoid((1 - blend_w) * l + blend_w * e) for l, e in zip(lr_logits, elo_logits)]
+    order = sorted(zip(chosen_preds, calib_labels), key=lambda t: t[0])
+    isotonic_points = isotonic_regression([o[0] for o in order], [o[1] for o in order])
+
+    model = {
+        "featureNames": selected,
+        "weights": lr_model["weights"],
+        "bias": lr_model["bias"],
+        "featureStats": lr_model["featureStats"],
+        "isotonicPoints": isotonic_points,
+        "monteCarloSigma": 0.0,
+        "monteCarloEnabled": False,
+        "eloHfa": elo_hfa,
+    }
+
+    run_margin_calibration = fit_run_margin_calibration(rows, model)
+    run_model_state = fit_run_model(completed_games)
+
+    calib_rows = rows[:calib_end]
+    if np is not None and len(calib_rows) > 0:
+        sims = simulate_runs_batch(
+            run_model_state,
+            [r["game"]["home"]["id"] for r in calib_rows],
+            [r["game"]["away"]["id"] for r in calib_rows],
+            [0.0] * len(calib_rows),
+            [0.0] * len(calib_rows),
+            200,
+        )
+    else:
+        sims = [
+            simulate_runs(run_model_state, r["game"]["home"]["id"], r["game"]["away"]["id"], 0, 200)
+            for r in calib_rows
+        ]
+    rl_pairs: list[tuple[float, int]] = []
+    for r, sim in zip(calib_rows, sims):
+        margin = (r["game"]["home"].get("score") or 0) - (r["game"]["away"].get("score") or 0)
+        rl_pairs.append((sim["homeRunLineProb"], 1 if margin >= 2 else 0))
+    rl_pairs.sort(key=lambda t: t[0])
+    run_line_calibration = (
+        isotonic_regression([t[0] for t in rl_pairs], [t[1] for t in rl_pairs])
+        if len(rl_pairs) >= 40 else []
+    )
+
+    test_labels = [r["label"] for r in test]
+    test_preds = [
+        apply_model(model, r["features"], r["homeElo"], r["awayElo"])["homeWinProb"]
+        for r in test
+    ]
+    test_eval = evaluate(test_preds, test_labels)
+
+    description = (
+        f"Point-in-time ensemble: {1 - blend_w:.2f}·logistic + {blend_w:.2f}·Elo, "
+        "isotonic-calibrated."
+    )
+
+    return {
+        "season": season,
+        "asOfDate": as_of_date,
+        "gamesTrained": n,
+        "holdoutCount": len(test),
+        "selectedModel": "Logistic + Elo (point-in-time)",
+        "modelDescription": description,
+        "featureNames": selected,
+        "weights": lr_model["weights"],
+        "bias": lr_model["bias"],
+        "featureStats": lr_model["featureStats"],
+        "isotonicPoints": isotonic_points,
+        "eloHfa": elo_hfa,
+        "monteCarloEnabled": False,
+        "monteCarloTrials": 0,
+        "monteCarloSigma": 0.0,
+        "auc": test_eval["auc"],
+        "brier": test_eval["brier"],
+        "logLoss": test_eval["logLoss"],
+        "ece": test_eval["ece"],
+        "runModel": run_model_state,
+        "runLineCalibration": run_line_calibration,
+        "runMarginCalibration": run_margin_calibration,
+        "model": model,
+    }

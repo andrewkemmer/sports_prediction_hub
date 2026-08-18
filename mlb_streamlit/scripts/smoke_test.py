@@ -320,14 +320,14 @@ def test_backtest_guards() -> None:
     tmp2 = tempfile.mkdtemp(prefix="mlb_cache_")
     old_dir2 = cache.CACHE_DIR
     cache.CACHE_DIR = Path(tmp2)
-    real_run_model = refresh.run_model
+    real_run_model_light = refresh.run_model_light
     calls = {"n": 0}
 
-    def counting_run(*args, **kwargs):
+    def counting_light(*args, **kwargs):
         calls["n"] += 1
-        return real_run_model(*args, **kwargs)
+        return real_run_model_light(*args, **kwargs)
 
-    refresh.run_model = counting_run
+    refresh.run_model_light = counting_light
     try:
         cache.save_games(bt_games)
         st1 = refresh._backtest_state(bt_target)
@@ -355,7 +355,7 @@ def test_backtest_guards() -> None:
         check("rankings as-of lastGameDate < target",
               all((r.get("lastGameDate") or "") < bt_target for r in pr))
     finally:
-        refresh.run_model = real_run_model
+        refresh.run_model_light = real_run_model_light
         cache.CACHE_DIR = old_dir2
         shutil.rmtree(tmp2, ignore_errors=True)
     # Strict walk-forward calibration rows (see test_walk_forward_calibration;
@@ -372,28 +372,26 @@ def test_walk_forward_calibration() -> None:
     from mlb_streamlit.data import et_date_string
     import mlb_streamlit.engine.model as emod
 
-    real_run_model = refresh.run_model
+    real_run_model_light = refresh.run_model_light
     real_min_games = refresh.MIN_COMPLETED_GAMES
     real_sim = emod.simulate_runs_batch
     calls = {"n": 0}
 
-    def stub_run_model(completed, season, as_of_date, injury_snapshots=None):
+    def stub_run_model_light(rows, completed_games, season, as_of_date):
         calls["n"] += 1
         return {
-            "result": {
-                "season": season, "asOfDate": as_of_date,
-                "gamesTrained": len(completed), "holdoutCount": 0,
-                "selectedModel": "stub", "modelDescription": "stub",
-                "featureNames": [], "weights": [], "bias": 0.0,
-                "featureStats": {}, "isotonicPoints": [], "eloHfa": 30,
-                "monteCarloEnabled": False, "monteCarloTrials": 0,
-                "monteCarloSigma": 0.0, "auc": 0.5, "brier": 0.25,
-                "logLoss": 0.69, "ece": 0.0, "powerRankings": [],
-                "runModel": {"parkFactor": {}, "leagueRuns": 4.5,
-                              "teamOffense": {}, "teamDefense": {}},
-                "runLineCalibration": [],
-                "runMarginCalibration": {"slope": 0.0, "intercept": 0.0},
-            }
+            "season": season, "asOfDate": as_of_date,
+            "gamesTrained": len(rows), "holdoutCount": 0,
+            "selectedModel": "stub", "modelDescription": "stub",
+            "featureNames": [], "weights": [], "bias": 0.0,
+            "featureStats": {}, "isotonicPoints": [], "eloHfa": 30,
+            "monteCarloEnabled": False, "monteCarloTrials": 0,
+            "monteCarloSigma": 0.0, "auc": 0.5, "brier": 0.25,
+            "logLoss": 0.69, "ece": 0.0,
+            "runModel": {"parkFactor": {}, "leagueRuns": 4.5,
+                          "teamOffense": {}, "teamDefense": {}},
+            "runLineCalibration": [],
+            "runMarginCalibration": {"slope": 0.0, "intercept": 0.0},
         }
 
     def fast_sim(state, home_ids, away_ids, totals, margins, trials):
@@ -403,7 +401,7 @@ def test_walk_forward_calibration() -> None:
     old_dir3 = cache.CACHE_DIR
     cache.CACHE_DIR = Path(tmp3)
     refresh.MIN_COMPLETED_GAMES = 5
-    refresh.run_model = stub_run_model
+    refresh.run_model_light = stub_run_model_light
     emod.simulate_runs_batch = fast_sim
     try:
         wf_games = make_games(48, seed=13)
@@ -436,7 +434,7 @@ def test_walk_forward_calibration() -> None:
         check("walk-forward deterministic", rows1 == rows2)
         check("walk-forward persisted to cache", len(cache.load_calibration_rows_wf()) > 0)
     finally:
-        refresh.run_model = real_run_model
+        refresh.run_model_light = real_run_model_light
         refresh.MIN_COMPLETED_GAMES = real_min_games
         emod.simulate_runs_batch = real_sim
         cache.CACHE_DIR = old_dir3
@@ -454,7 +452,7 @@ def test_point_in_time_docs() -> None:
     from mlb_streamlit.data import et_date_string
     from mlb_streamlit.refresh import PREDICTION_VERSION
 
-    real_run_model = refresh.run_model
+    real_run_model_light = refresh.run_model_light
     real_sim_runs = refresh.simulate_runs
     real_min_games = refresh.MIN_COMPLETED_GAMES
     real_sched = refresh.fetch_schedule_range
@@ -464,22 +462,20 @@ def test_point_in_time_docs() -> None:
     real_batter = refresh.fetch_batter_game_logs
     real_odds = refresh.fetch_market_odds
 
-    def stub_run_model(completed, season, as_of_date, injury_snapshots=None):
+    def stub_run_model_light(rows, completed_games, season, as_of_date):
         return {
-            "result": {
-                "season": season, "asOfDate": as_of_date,
-                "gamesTrained": len(completed), "holdoutCount": 0,
-                "selectedModel": "stub", "modelDescription": "stub",
-                "featureNames": [], "weights": [], "bias": 0.0,
-                "featureStats": {}, "isotonicPoints": [], "eloHfa": 30,
-                "monteCarloEnabled": False, "monteCarloTrials": 0,
-                "monteCarloSigma": 0.0, "auc": 0.5, "brier": 0.25,
-                "logLoss": 0.69, "ece": 0.0, "powerRankings": [],
-                "runModel": {"parkFactor": {}, "leagueRuns": 4.5,
-                              "teamOffense": {}, "teamDefense": {}},
-                "runLineCalibration": [],
-                "runMarginCalibration": {"slope": 0.0, "intercept": 0.0},
-            }
+            "season": season, "asOfDate": as_of_date,
+            "gamesTrained": len(rows), "holdoutCount": 0,
+            "selectedModel": "stub", "modelDescription": "stub",
+            "featureNames": [], "weights": [], "bias": 0.0,
+            "featureStats": {}, "isotonicPoints": [], "eloHfa": 30,
+            "monteCarloEnabled": False, "monteCarloTrials": 0,
+            "monteCarloSigma": 0.0, "auc": 0.5, "brier": 0.25,
+            "logLoss": 0.69, "ece": 0.0,
+            "runModel": {"parkFactor": {}, "leagueRuns": 4.5,
+                          "teamOffense": {}, "teamDefense": {}},
+            "runLineCalibration": [],
+            "runMarginCalibration": {"slope": 0.0, "intercept": 0.0},
         }
 
     def stub_sim_runs(run_model_state, home_id, away_id, line=0.0, trials=10000,
@@ -491,7 +487,7 @@ def test_point_in_time_docs() -> None:
     old_dir4 = cache.CACHE_DIR
     cache.CACHE_DIR = Path(tmp4)
     refresh.MIN_COMPLETED_GAMES = 5
-    refresh.run_model = stub_run_model
+    refresh.run_model_light = stub_run_model_light
     refresh.simulate_runs = stub_sim_runs
     refresh.fetch_lineups_for_games = lambda targets, concurrency=16: {}
     refresh.fetch_pitcher_game_logs = lambda pairs, cached=None: {}
@@ -522,7 +518,7 @@ def test_point_in_time_docs() -> None:
         check("point-in-time doc has probability",
               isinstance(docs[0].get("homeWinProb"), float))
     finally:
-        refresh.run_model = real_run_model
+        refresh.run_model_light = real_run_model_light
         refresh.simulate_runs = real_sim_runs
         refresh.MIN_COMPLETED_GAMES = real_min_games
         refresh.fetch_schedule_range = real_sched
