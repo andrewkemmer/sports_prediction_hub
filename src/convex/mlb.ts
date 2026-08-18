@@ -427,3 +427,46 @@ export const clearGames = internalMutation({
     for (const g of all) await ctx.db.delete(g._id);
   },
 });
+
+// Remove the singleton trained model so the next refresh treats the database
+// as a cold start: it re-fetches the full season history, re-fits the model,
+// and regenerates every stored prediction from point-in-time features.
+export const clearModelState = internalMutation({
+  args: {},
+  handler: async (ctx) => {
+    const existing = await ctx.db
+      .query("modelState")
+      .withIndex("by_key", (q) => q.eq("key", "current"))
+      .first();
+    if (existing) await ctx.db.delete(existing._id);
+  },
+});
+
+// Lean paginated read of game ids (no full docs) so a hard-reset retrain can
+// delete a multi-season history without a single mutation reading/writing past
+// Convex's transaction bandwidth limits.
+export const getGameIdsRange = internalQuery({
+  args: {
+    startDate: v.string(),
+    endDate: v.string(),
+    cursor: v.union(v.string(), v.null()),
+    limit: v.optional(v.number()),
+  },
+  handler: async (ctx, args) => {
+    const page = await ctx.db
+      .query("games")
+      .withIndex("by_date", (q) => q.gte("date", args.startDate).lte("date", args.endDate))
+      .order("asc")
+      .paginate({ numItems: Math.min(args.limit ?? 500, 500), cursor: args.cursor ?? null });
+    return { ids: page.page.map((g) => g._id), cursor: page.continueCursor };
+  },
+});
+
+// Delete a bounded batch of games by id (used by the retrain action to clear
+// history in pages instead of one oversized transaction).
+export const deleteGamesByIds = internalMutation({
+  args: { ids: v.array(v.id("games")) },
+  handler: async (ctx, args) => {
+    for (const id of args.ids) await ctx.db.delete(id);
+  },
+});

@@ -426,7 +426,7 @@ function CrossValidationPanel({ modelState }: { modelState: ModelStateDoc }) {
 // ---------------------------------------------------------------------------
 
 function AutoMlPanel({ modelState }: { modelState: ModelStateDoc }) {
-  const runAutoMl = useAction(api.mlbActions.refreshModel);
+  const runAutoMl = useAction(api.mlbRetrain.retrainModel);
   const [running, setRunning] = useState(false);
 
   const [autoSub, setAutoSub] = useState<"features" | "stacking" | "params" | "cv">("features");
@@ -450,7 +450,7 @@ function AutoMlPanel({ modelState }: { modelState: ModelStateDoc }) {
     if (running) return;
     setRunning(true);
     try {
-      const res = await runAutoMl({});
+      const res = await runAutoMl();
       toast.success("Auto-ML optimization complete", {
         description: `Trained on ${formatNumber(res.gamesTrained)} games · Ensemble AUC ${res.auc.toFixed(3)}`,
       });

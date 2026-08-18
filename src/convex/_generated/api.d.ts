@@ -18,6 +18,7 @@ import type * as ml_teams from "../ml/teams.js";
 import type * as ml_types from "../ml/types.js";
 import type * as mlb from "../mlb.js";
 import type * as mlbActions from "../mlbActions.js";
+import type * as mlbRetrain from "../mlbRetrain.js";
 import type * as users from "../users.js";
 
 import type {
@@ -37,6 +38,7 @@ declare const fullApi: ApiFromModules<{
   "ml/types": typeof ml_types;
   mlb: typeof mlb;
   mlbActions: typeof mlbActions;
+  mlbRetrain: typeof mlbRetrain;
   users: typeof users;
 }>;
 

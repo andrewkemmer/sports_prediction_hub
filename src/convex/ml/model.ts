@@ -227,16 +227,22 @@ function edge(home: unknown, away: unknown, lowerBetter = false): number {
   return lowerBetter ? away - home : home - away;
 }
 
-function buildFeatures(game: RawGame, state: MutableState): FeatureValues {
+function buildFeatures(game: RawGame, state: MutableState, useApiRecord = false): FeatureValues {
   const homeElo = state.elo[game.home.id] ?? ELO_INIT;
   const awayElo = state.elo[game.away.id] ?? ELO_INIT;
 
   const homeRec = state.records[game.home.id] ?? { wins: 0, losses: 0 };
   const awayRec = state.records[game.away.id] ?? { wins: 0, losses: 0 };
-  const homeWins = game.home.wins ?? homeRec.wins;
-  const homeLosses = game.home.losses ?? homeRec.losses;
-  const awayWins = game.away.wins ?? awayRec.wins;
-  const awayLosses = game.away.losses ?? awayRec.losses;
+  // Historical training rows must use the chronologically accumulated
+  // PRE-game record only. The schedule API's `leagueRecord` for a completed
+  // game already includes that game's result, which would leak the outcome
+  // into that same game's prediction (e.g. an opening-day team showing 0-1
+  // instead of 0-0 produces an absurd 99% favorite). Only upcoming/current
+  // games may use the live API record.
+  const homeWins = useApiRecord ? (game.home.wins ?? homeRec.wins) : homeRec.wins;
+  const homeLosses = useApiRecord ? (game.home.losses ?? homeRec.losses) : homeRec.losses;
+  const awayWins = useApiRecord ? (game.away.wins ?? awayRec.wins) : awayRec.wins;
+  const awayLosses = useApiRecord ? (game.away.losses ?? awayRec.losses) : awayRec.losses;
   const homeWp = homeWins + homeLosses > 0 ? homeWins / (homeWins + homeLosses) : 0.5;
   const awayWp = awayWins + awayLosses > 0 ? awayWins / (awayWins + awayLosses) : 0.5;
 
@@ -451,7 +457,7 @@ export function buildFeaturesForGame(game: RawGame, state: TeamState): FeatureVa
     const wins = Math.round(p * 10);
     mut.formHistory[Number(id)] = Array.from({ length: 10 }, (_, i) => (i < wins ? 1 : 0));
   }
-  return buildFeatures(game, mut);
+  return buildFeatures(game, mut, true);
 }
 
 // ---------------------------------------------------------------------------
@@ -931,7 +937,7 @@ function buildModelVersions(
     const train = rows.slice(0, trainEnd);
     const test = rows.slice(trainEnd, end);
     if (train.length < 40 || test.length < 20) continue;
-    const m = trainLogistic(train, stage.features);
+    const m = trainLogistic(train, stage.features, { iterations: 12 });
     const preds = test.map((r) => sigmoid(logisticLogit(m, r.features, null)));
     const labels = test.map((r) => r.label);
     versions.push({
@@ -1030,7 +1036,7 @@ function crossValidate(
     const train = rows.slice(0, trainEnd);
     const test = rows.slice(trainEnd, testEnd);
     if (train.length < 40 || test.length < 20) continue;
-    const m = trainLogistic(train, featureNames);
+    const m = trainLogistic(train, featureNames, { iterations: 12 });
     const preds = test.map((r) => sigmoid(logisticLogit(m, r.features, null)));
     const labels = test.map((r) => r.label);
     foldAucs.push(computeAuc(preds, labels));
@@ -1144,6 +1150,15 @@ export function runModel(
   const calib = rows.slice(trainEnd, calibEnd);
   const test = rows.slice(calibEnd);
 
+  // CPU budget: backward-elimination and walk-forward CV retrain the logistic
+  // model dozens of times. Run those inner loops on the most-recent,
+  // still-chronologically-ordered subsample so their cost stays bounded
+  // regardless of how many stored seasons exist. The deployed model below
+  // still fits on the full `train` slice.
+  const FIT_TRAIN_CAP = 2400;
+  const fitTrain = train.length > FIT_TRAIN_CAP ? train.slice(train.length - FIT_TRAIN_CAP) : train;
+  const cvRows = rows.length > FIT_TRAIN_CAP ? rows.slice(rows.length - FIT_TRAIN_CAP) : rows;
+
   const calibLabels = calib.map((r) => r.label);
   const testLabels = test.map((r) => r.label);
 
@@ -1151,17 +1166,17 @@ export function runModel(
   let selected: FeatureKey[] = [...FEATURE_KEYS];
   const score = (preds: number[], labels: number[]) => computeBrier(preds, labels) - 0.5 * computeAuc(preds, labels);
 
-  if (calib.length >= 20 && train.length >= 20) {
-    // Use a quick IRLS pass for candidate screening; the final model below is
-    // refit with more iterations. The backward pass is capped to keep on-demand
-    // refreshes inside Convex's per-action time budget when the feature pool
-    // and calib set are large.
-    let currentModel = trainLogistic(train, selected, { iterations: 10 });
+  if (calib.length >= 20 && fitTrain.length >= 20) {
+    // Use a quick IRLS pass for candidate screening on the recent subsample;
+    // the final model below is refit on the full training slice with more
+    // iterations. Both the row count and the number of backward rounds are
+    // capped so the refresh stays inside Convex's per-action CPU budget.
+    let currentModel = trainLogistic(fitTrain, selected, { iterations: 8 });
     let currentPreds = calib.map((r) => sigmoid(logisticLogit(currentModel, r.features, null)));
     let currentScore = score(currentPreds, calibLabels);
     let improved = true;
     let stagnationRounds = 0;
-    const MAX_BE_ROUNDS = Math.max(4, Math.min(8, selected.length - 2));
+    const MAX_BE_ROUNDS = Math.max(3, Math.min(5, selected.length - 2));
     let rounds = 0;
     while (improved && selected.length > 2 && rounds < MAX_BE_ROUNDS) {
       improved = false;
@@ -1170,7 +1185,7 @@ export function runModel(
       let bestScore = currentScore;
       for (const drop of selected) {
         const candidate = selected.filter((f) => f !== drop);
-        const m = trainLogistic(train, candidate, { iterations: 10 });
+        const m = trainLogistic(fitTrain, candidate, { iterations: 8 });
         const preds = calib.map((r) => sigmoid(logisticLogit(m, r.features, null)));
         const s = score(preds, calibLabels);
         if (s < bestScore) {
@@ -1181,7 +1196,7 @@ export function runModel(
       if (bestFeatures.length < selected.length && bestScore < currentScore - 1e-5) {
         selected = bestFeatures;
         currentScore = bestScore;
-        currentModel = trainLogistic(train, selected, { iterations: 10 });
+        currentModel = trainLogistic(fitTrain, selected, { iterations: 8 });
         currentPreds = calib.map((r) => sigmoid(logisticLogit(currentModel, r.features, null)));
         stagnationRounds = 0;
         improved = true;
@@ -1353,7 +1368,7 @@ export function runModel(
   });
 
   // Diagnostics: 5-fold cross-validation and hyperparameter audit trail.
-  const crossValidation = crossValidate(rows, selected, 5);
+  const crossValidation = crossValidate(cvRows, selected, 5);
   const optimizationParams: OptimizationParams = {
     learningRate: 0,
     l2Lambda: 0.001,
