@@ -44,6 +44,7 @@ from mlb_streamlit.data import (  # noqa: E402
 )
 from mlb_streamlit.engine.features import (  # noqa: E402
     FEATURE_KEYS,
+    build_features,
     build_features_for_game,
     compute_elo_and_features,
     new_state,
@@ -255,6 +256,23 @@ def test_backtest_guards() -> None:
     check("single-feature cap leaves headroom (not pinned at clamp)", p_hi < 0.9999 and p_lo > 0.0001,
           f"{p_hi} / {p_lo}")
 
+    # 1b. winPctDiff must use the accumulated prior record, never the
+    #     schedule's leagueRecord (which is post-game and would leak the
+    #     game's own outcome into the feature — the old 99% past picks).
+    st = new_state()
+    st["elo"][108] = 1500.0
+    st["elo"][119] = 1500.0
+    st["lastGameDate"][108] = "2026-04-01"
+    st["lastGameDate"][119] = "2026-04-01"
+    leaky_game = {
+        "date": "2026-04-02",
+        "home": {"id": 119, "wins": 1, "losses": 0},
+        "away": {"id": 108, "wins": 0, "losses": 1},
+    }
+    f = build_features(leaky_game, st)
+    check("winPctDiff uses prior record, not post-game leagueRecord",
+          f["winPctDiff"] == 0.0, f"{f['winPctDiff']}")
+
     # 2. As-of team state: replaying cached games strictly before a date must
     #    never include post-date results (elo / records / lastGameDate).
     completed = make_games(120, seed=3)
@@ -286,11 +304,12 @@ def test_backtest_guards() -> None:
     future_state = refresh._team_state_as_of(et_date_string())
     check("today/future date keeps stored state", future_state is None)
 
-    # 3. Matchup recency gating: current-season splits may only attach inside
-    #    the recent window (older dates would leak games played after them).
+    # 3. Matchup gating: season-to-date splits + career BvP are fetched as-of
+    #    now, so they may only attach to today/future games — even one day
+    #    back would leak games played after it.
     today = et_date_string()
     check("matchups allowed today", refresh._matchups_allowed(today))
-    check("matchups allowed 1 day back", refresh._matchups_allowed(add_days(today, -1)))
+    check("matchups blocked 1 day back", not refresh._matchups_allowed(add_days(today, -1)))
     check("matchups blocked 30 days back", not refresh._matchups_allowed(add_days(today, -30)))
 
     # 4. Walk-forward backtest: the per-date model is trained only on games

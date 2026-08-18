@@ -34,7 +34,7 @@ from .data import (
     market_odds_enabled,
     market_odds_for_game,
 )
-from .engine.features import build_features_for_game, compute_elo_and_features
+from .engine.features import FEATURE_VERSION, build_features_for_game, compute_elo_and_features
 from .engine.metrics import (
     apply_isotonic,
     calibration_curve_points,
@@ -58,7 +58,7 @@ RUN_SIM_TRIALS = 10000
 RUN_CALIB_TRIALS = 500
 MIN_COMPLETED_GAMES = 40
 
-PREDICTION_VERSION = 3  # bump to force re-scoring of previously cached dates
+PREDICTION_VERSION = 4  # bump to force re-scoring of previously cached dates
 BACKTEST_STATES_FILE = "backtest_states.json"
 BACKTEST_CACHE_VERSION = cache.BACKTEST_CACHE_VERSION  # bump with PREDICTION_VERSION to invalidate stale backtest caches
 WF_REFIT_DAYS = 3  # refit the walk-forward model every N days (games in a block share a model)
@@ -369,6 +369,10 @@ def _data_fingerprint(completed: list[dict], injury_counts: dict) -> str:
         )
     for tid in sorted(injury_counts):
         lines.append(f"il:{tid}:{injury_counts[tid]}")
+    # Feature-engineering version participates in the fingerprint so a change
+    # to how features are computed (e.g. a point-in-time leak fix) forces a
+    # full retrain instead of reusing a model trained on stale features.
+    lines.append(f"featureVersion:{FEATURE_VERSION}")
     lines.sort()
     return hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
 
@@ -771,9 +775,10 @@ def run_refresh(
     #    the React engine's enrichWithMatchups — no lookahead and no junk
     #    values on older history.
     rep("Loading matchups", 54, "Fetching BvP & platoon splits…")
-    window_start = add_days(today, -2)
-    window_end = add_days(today, UPCOMING_WINDOW_DAYS)
-    window_games = [g for g in enriched if window_start <= (g.get("date") or "") <= window_end]
+    # Matchup edges (season-to-date splits + career BvP as-of-now) are only
+    # valid for games whose outcome is not yet known. Attaching them to a
+    # completed game would leak games played after that game's date.
+    window_games = [g for g in enriched if g.get("winner") not in ("home", "away")]
     matchup = enrich_with_matchups(
         window_games,
         batter_log_cache,
@@ -1277,12 +1282,12 @@ def _team_state_as_of(date: str) -> dict | None:
 
 
 def _matchups_allowed(date: str) -> bool:
-    """Current-season platoon / vs-team splits are season-to-date, so they may
-    only be attached inside the recent/fresh window. Attaching them to an
-    older backtest date would silently absorb games played AFTER that date
-    (data leakage); the statsapi splits endpoint has no as-of-date filter.
+    """Season-to-date platoon / vs-team splits and career BvP are fetched as
+    of *now* and have no as-of-date filter, so they may only be used for
+    today/future games. Any backtest date (even one day ago) would silently
+    absorb games played after it — data leakage.
     """
-    return date >= add_days(et_date_string(), -RECENT_WINDOW_DAYS)
+    return date >= et_date_string()
 
 
 def power_rankings_as_of(date: str) -> list[dict] | None:

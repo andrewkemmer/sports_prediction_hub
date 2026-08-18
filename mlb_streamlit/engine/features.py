@@ -14,6 +14,10 @@ from .metrics import clamp
 ELO_INIT = 1500.0
 ELO_HFA_UPDATE = 30.0  # home advantage baked into Elo updates only
 
+# Bump whenever feature engineering changes so refresh fingerprints and every
+# cached prediction/backtest are invalidated and rebuilt point-in-time.
+FEATURE_VERSION = 4
+
 # Canonical feature order (27 features). Every feature is computed as-of the
 # game's own date (no lookahead) and flows into the ML candidate set; greedy
 # backward elimination decides which ones the final model actually uses.
@@ -165,10 +169,14 @@ def build_features(game: dict, state: dict) -> dict:
 
     home_rec = state["records"].get(game["home"]["id"], {"wins": 0, "losses": 0})
     away_rec = state["records"].get(game["away"]["id"], {"wins": 0, "losses": 0})
-    home_wins = game["home"].get("wins") if game["home"].get("wins") is not None else home_rec["wins"]
-    home_losses = game["home"].get("losses") if game["home"].get("losses") is not None else home_rec["losses"]
-    away_wins = game["away"].get("wins") if game["away"].get("wins") is not None else away_rec["wins"]
-    away_losses = game["away"].get("losses") if game["away"].get("losses") is not None else away_rec["losses"]
+    # Point-in-time records: always use the chronologically accumulated state,
+    # never the schedule's leagueRecord. For a completed game the leagueRecord
+    # is the team's record AFTER that game, so using it would leak the game's
+    # own outcome into winPctDiff (the source of the old "99%" past picks).
+    home_wins = home_rec["wins"]
+    home_losses = home_rec["losses"]
+    away_wins = away_rec["wins"]
+    away_losses = away_rec["losses"]
     home_wp = home_wins / (home_wins + home_losses) if (home_wins + home_losses) > 0 else 0.5
     away_wp = away_wins / (away_wins + away_losses) if (away_wins + away_losses) > 0 else 0.5
 
