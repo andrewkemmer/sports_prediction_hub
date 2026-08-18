@@ -110,7 +110,7 @@ Any date the user picks in the Games tab is predicted on demand via
 ## Testing
 
 ```bash
-python3 mlb_streamlit/scripts/smoke_test.py          # engine + data pipeline (287 checks)
+python3 mlb_streamlit/scripts/smoke_test.py          # engine + data pipeline (288 checks)
 python3 mlb_streamlit/scripts/ui_render_test.py       # Streamlit UI panels with stubbed streamlit/plotly
 ```
 

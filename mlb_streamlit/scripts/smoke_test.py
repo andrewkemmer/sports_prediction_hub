@@ -1503,6 +1503,35 @@ def test_ensemble_models() -> None:
     tnn = [tiny_nn(r["features"]) for r in calib[:5]]
     check("mlp tiny-train prior fallback", all(abs(v - 0.5) < 0.15 for v in tnn), f"{tnn}")
 
+    # numpy-path contract (runs on the deployed app, which has numpy): a past
+    # bug stored W3 (shape (1, 10)) as a single element, so every MLP predict
+    # crashed with "matmul: ... core dimension 0 ... (size 10 is different
+    # from 1)". Guard the output shapes and cross-path agreement whenever
+    # numpy is installed.
+    from mlb_streamlit.engine import nn as _nn
+    if _nn._np is None:
+        check("mlp numpy path contract (skipped - numpy not installed)", True)
+    else:
+        np_ = _nn._np
+        rng = random.Random(31)
+        Xs = np_.array([[r["features"][f] for f in FEATURE_KEYS] for r in train], dtype=float)
+        means = Xs.mean(axis=0)
+        stds = np_.where(Xs.std(axis=0) == 0, 1.0, Xs.std(axis=0))
+        Xz = ((Xs - means) / stds).tolist()
+        prm = _nn._fit_numpy(Xz, [r["label"] for r in train], (20, 10), 8, 128,
+                             0.03, 1e-4, 0.9, 0.15, 6, rng)
+        check("mlp numpy W3 holds all 10 output weights",
+              isinstance(prm["W3"], list) and len(prm["W3"]) == 10,
+              f"len={len(prm['W3'])}")
+        check("mlp numpy W1/W2 shapes",
+              len(prm["W1"]) == 20 and len(prm["W2"]) == 10
+              and len(prm["W2"][0]) == 20)
+        xz0 = Xz[0]
+        pn = _nn._predict_numpy(prm, xz0, 20, 10)
+        pp = _nn._predict_pure(prm, xz0, 20, 10)
+        check("mlp numpy predict agrees with pure path",
+              abs(pn - pp) < 1e-9, f"{pn} vs {pp}")
+
     # Distance-weighted k-NN: deterministic, valid, batch == scalar path.
     w1 = weighted_knn_model(train, FEATURE_KEYS, k=11)
     w2 = weighted_knn_model(train, FEATURE_KEYS, k=11)

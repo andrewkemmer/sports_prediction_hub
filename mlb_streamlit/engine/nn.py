@@ -165,7 +165,7 @@ def _fit_numpy(
     if best is not None:
         W1, W2, W3, b1, b2, b3 = best
     return {
-        "W1": W1.tolist(), "W2": W2.tolist(), "W3": [row[0] for row in W3.tolist()],
+        "W1": W1.tolist(), "W2": W2.tolist(), "W3": W3.tolist()[0],
         "b1": b1.tolist(), "b2": b2.tolist(), "b3": float(b3[0]),
     }
 
@@ -399,10 +399,16 @@ def mlp_model(
 
     rng = random.Random(seed)
     h1n, h2n = hidden
+
+    def _std_vec(features: dict) -> list[float]:
+        # Serve exactly what the fit saw: z-scores from the training stats
+        # (raw values at predict time would be train/serve skew).
+        return [(features[f] - stats[f]["mean"]) / stats[f]["std"] for f in feature_names]
+
     if _np is not None:
         params = _fit_numpy(X, labels, hidden, epochs, batch, lr, l2, momentum, val_frac, patience, rng)
-        predict = lambda features: _predict_numpy(params, [features[f] for f in feature_names], h1n, h2n)  # noqa: E731
+        predict = lambda features: _predict_numpy(params, _std_vec(features), h1n, h2n)  # noqa: E731
     else:
         params = _fit_pure(X, labels, hidden, epochs, batch, lr, l2, momentum, val_frac, patience, rng)
-        predict = lambda features: _predict_pure(params, [features[f] for f in feature_names], h1n, h2n)  # noqa: E731
+        predict = lambda features: _predict_pure(params, _std_vec(features), h1n, h2n)  # noqa: E731
     return predict
