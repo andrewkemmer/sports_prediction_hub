@@ -239,6 +239,19 @@ def test_logistic() -> None:
     preds_b = [knn(r["features"]) for r in rows]
     stacking = build_stacking_weights({"A": preds_a, "B": preds_b}, [r["label"] for r in rows])
     check("stacking preds length", len(stacking["preds"]) == len(rows))
+
+    # Warm-start IRLS must reach the SAME fixed point as a cold fit (convergence
+    # is detected exactly, so fewer iterations never change the model), and
+    # converge in far fewer iterations from a good seed.
+    w1 = m["weights"] + [m["bias"]]
+    m_ws = train_logistic(rows, ["x", "noise"], iterations=20, w0=w1)
+    w2 = m_ws["weights"] + [m_ws["bias"]]
+    check("warm-start (20 iters) matches cold fit",
+          all(abs(a - b) < 1e-6 for a, b in zip(w1, w2)), f"{w1} vs {w2}")
+    m_fast = train_logistic(rows, ["x", "noise"], iterations=3, w0=w1)
+    w3 = m_fast["weights"] + [m_fast["bias"]]
+    check("warm-start converges in few iterations",
+          all(abs(a - b) < 1e-4 for a, b in zip(w1, w3)), f"{w1} vs {w3}")
     wsum = sum(w["weight"] for w in stacking["weights"])
     check("stacking weights sum to 1", abs(wsum - 1.0) < 1e-6, f"sum={wsum}")
     cv = cross_validate(rows, ["x", "noise"], 5)
@@ -537,6 +550,35 @@ def test_matchups() -> None:
     check("starters without hand trigger fetch",
           calls["hands"] == [[902, 901]] or calls["hands"] == [[901, 902]],
           f"{calls['hands']}")
+
+    # 7. BvP TTL: entries fetched within the TTL skip the refetch (career
+    #    totals barely move); stale entries refetch; pre-TTL legacy caches
+    #    (no timestamp) are treated as fresh so deploy doesn't mass-refetch.
+    calls = {"n": 0}
+
+    def fake_bvp_json(url, attempt=0):
+        calls["n"] += 1
+        return {"stats": [{"splits": [{"stat": {"plateAppearances": "40", "ops": ".850"}}]}]}
+
+    orig_json = data.fetch_json
+    data.fetch_json = fake_bvp_json
+    try:
+        out = data.fetch_bvp_stats([{"batterId": 11, "pitcherId": 902}], {})
+        check("bvp fetched on empty cache", calls["n"] == 1 and "11|902" in out
+              and out["11|902"].get("fetchedAt") is not None, f"{out} calls={calls['n']}")
+        calls["n"] = 0
+        data.fetch_bvp_stats([{"batterId": 11, "pitcherId": 902}], out)
+        check("bvp TTL skips fresh refetch", calls["n"] == 0, f"calls={calls['n']}")
+        stale = {"11|902": {"pa": 5, "ops": 1.0, "fetchedAt": int(time.time() * 1000) - 48 * 3600 * 1000}}
+        calls["n"] = 0
+        data.fetch_bvp_stats([{"batterId": 11, "pitcherId": 902}], stale)
+        check("bvp TTL refetches stale entries", calls["n"] == 1, f"calls={calls['n']}")
+        legacy = {"11|902": {"pa": 5, "ops": 1.0}}
+        calls["n"] = 0
+        data.fetch_bvp_stats([{"batterId": 11, "pitcherId": 902}], legacy)
+        check("bvp legacy cache (no timestamp) treated fresh", calls["n"] == 0, f"calls={calls['n']}")
+    finally:
+        data.fetch_json = orig_json
 
 def test_as_of_stats() -> None:
     print("as-of-date stats")

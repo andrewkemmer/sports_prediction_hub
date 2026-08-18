@@ -55,11 +55,13 @@ def solve_linear_system(A: list[list[float]], b: list[float]) -> list[float]:
     return [row[n] for row in aug]
 
 
-def _train_logistic_vectorized(rows: list[dict], feature_names: list[str], iterations: int) -> dict | None:
+def _train_logistic_vectorized(rows: list[dict], feature_names: list[str], iterations: int, w0: list[float] | None = None) -> dict | None:
     """numpy IRLS — identical math to the pure-Python path below, ~50-100x faster.
 
     Returns None (so the caller falls back to the reference implementation) when
-    the linear solve fails, e.g. on a singular system.
+    the linear solve fails, e.g. on a singular system. `w0` seeds the iteration
+    with a previous fit's weights (same standardized feature space, intercept
+    last) so drop-one refits converge in a couple of iterations.
     """
     np = _np
     n = len(rows)
@@ -79,8 +81,11 @@ def _train_logistic_vectorized(rows: list[dict], feature_names: list[str], itera
     y = np.array([r["label"] for r in rows], dtype=float)
     d = m + 1  # feature columns + intercept column
     pos = float(y.sum())
-    w = np.zeros(d)
-    w[m] = math.log((pos + 1) / (n - pos + 1))
+    if w0 is not None and len(w0) == d:
+        w = np.array(w0, dtype=float)
+    else:
+        w = np.zeros(d)
+        w[m] = math.log((pos + 1) / (n - pos + 1))
     lambda_ = 0.001
 
     for _ in range(iterations):
@@ -99,6 +104,9 @@ def _train_logistic_vectorized(rows: list[dict], feature_names: list[str], itera
             return None
         if not np.all(np.isfinite(nxt)):
             break
+        if float(np.max(np.abs(nxt - w))) < 1e-9:  # converged — stop exactly at the fixed point
+            w = nxt
+            break
         w = nxt
 
     return {
@@ -109,11 +117,18 @@ def _train_logistic_vectorized(rows: list[dict], feature_names: list[str], itera
     }
 
 
-def train_logistic(rows: list[dict], feature_names: list[str], iterations: int = 20) -> dict:
-    """Newton-Raphson / IRLS ridge logistic regression (standardized features)."""
+def train_logistic(rows: list[dict], feature_names: list[str], iterations: int = 20, w0: list[float] | None = None) -> dict:
+    """Newton-Raphson / IRLS ridge logistic regression (standardized features).
+
+    `w0` seeds the iteration with a previous fit's weights (same standardized
+    feature space, intercept last); used by feature selection so each drop-one
+    refit starts near the optimum and converges in a couple of iterations.
+    Convergence is detected exactly (max weight change < 1e-9), so fewer
+    iterations never change the fitted model.
+    """
     if _np is not None:
         try:
-            m = _train_logistic_vectorized(rows, feature_names, iterations)
+            m = _train_logistic_vectorized(rows, feature_names, iterations, w0)
             if m is not None:
                 return m
         except Exception:  # pragma: no cover - fall back to the reference on any edge case
@@ -134,8 +149,11 @@ def train_logistic(rows: list[dict], feature_names: list[str], iterations: int =
     pos = sum(y)
     d = m + 1  # feature columns + intercept column
     Xaug = [xi + [1.0] for xi in X]
-    w = [0.0] * d
-    w[m] = math.log((pos + 1) / (n - pos + 1))
+    if w0 is not None and len(w0) == d:
+        w = list(w0)
+    else:
+        w = [0.0] * d
+        w[m] = math.log((pos + 1) / (n - pos + 1))
     lambda_ = 0.001
 
     for _ in range(iterations):
@@ -159,6 +177,9 @@ def train_logistic(rows: list[dict], feature_names: list[str], iterations: int =
                 A[j][j] += lambda_  # ridge the features, not the intercept
         nxt = solve_linear_system(A, rhs)
         if any(not math.isfinite(v) for v in nxt):
+            break
+        if max(abs(a - b) for a, b in zip(nxt, w)) < 1e-9:  # converged — stop exactly
+            w = nxt
             break
         w = nxt
 

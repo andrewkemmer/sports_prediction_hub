@@ -497,9 +497,16 @@ def run_refresh(
                 continue
             for p in side["battingOrder"] + side["bench"]:
                 batter_ids_by_season.setdefault(s, set()).add(p["id"])
-    for s, ids in batter_ids_by_season.items():
-        fresh_logs = fetch_batter_game_logs(sorted(ids), s, batter_log_cache)
-        batter_log_cache.update(fresh_logs)
+    # Fetch each {batter, season} family in parallel (a first-run backfill
+    # spans several seasons); the cache is only read inside the workers, so
+    # no locking is needed.
+    with ThreadPoolExecutor(max_workers=min(3, max(1, len(batter_ids_by_season)))) as pool:
+        futures = {
+            pool.submit(fetch_batter_game_logs, sorted(ids), s, batter_log_cache): s
+            for s, ids in batter_ids_by_season.items()
+        }
+        for fut in futures:
+            batter_log_cache.update(fut.result())
     rep("Batter game logs loaded", 48, f"Cached {len(batter_log_cache)} batter-season logs.")
     enriched = attach_lineups_as_of(enriched, lineups, batter_log_cache)
 

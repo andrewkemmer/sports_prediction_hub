@@ -782,13 +782,21 @@ def fetch_current_injury_snapshot(team_ids: list[int], d: str, season: str) -> d
 # ---------------------------------------------------------------------------
 
 def fetch_game_lineup(game_pk: int) -> dict | None:
-    """Actual lineup from the boxscore. None when lineups are not posted yet."""
-    try:
-        req = urllib.request.Request(f"{MLB_BASE}/api/v1/game/{game_pk}/boxscore", headers={"User-Agent": _USER_AGENT})
-        with urllib.request.urlopen(req, timeout=20) as r:
-            data = json.load(r)
-    except Exception:  # noqa: BLE001 — 404/empty boxscore is the expected pre-lineup state
-        return None
+    """Actual lineup from the boxscore. None when lineups are not posted yet.
+
+    A transient network failure is retried once so a real game is never
+    permanently cached as "no lineups" because of a timeout."""
+    data = None
+    for attempt in (0, 1):
+        try:
+            req = urllib.request.Request(f"{MLB_BASE}/api/v1/game/{game_pk}/boxscore", headers={"User-Agent": _USER_AGENT})
+            with urllib.request.urlopen(req, timeout=20) as r:
+                data = json.load(r)
+            break
+        except Exception:  # noqa: BLE001 — 404/empty boxscore is the expected pre-lineup state
+            if attempt == 1:
+                return None
+            time.sleep(0.5)
     teams = data.get("teams")
     if not teams or not teams.get("home") or not teams.get("away"):
         return None
@@ -1087,6 +1095,21 @@ def attach_lineups_as_of(games: list[dict], lineups: dict, batter_logs: dict) ->
 # ---------------------------------------------------------------------------
 
 SHRINK_PA = 15  # BvP PA count that pulls the blend halfway to season OPS
+BVP_TTL_MS = 24 * 3600 * 1000  # career BvP totals change slowly; skip refetches within a day
+
+
+def _bvp_fresh(entry) -> bool:
+    """True when a cached BvP entry is recent enough to skip the refetch.
+
+    Missing entries must be fetched; entries WITHOUT a timestamp are pre-TTL
+    legacy caches and are treated as fresh so deploying this does not trigger
+    a one-time refetch of the whole cache."""
+    if not entry:
+        return False
+    ts = entry.get("fetchedAt")
+    if not isinstance(ts, (int, float)):
+        return True
+    return (time.time() * 1000 - ts) < BVP_TTL_MS
 
 
 def matchup_ops(stat) -> float | None:
@@ -1128,11 +1151,14 @@ def fetch_bvp_stats(pairs: list[dict], cached: dict | None = None) -> dict:
     unique = []
     for p in pairs:
         key = f"{p['batterId']}|{p['pitcherId']}"
-        if p["batterId"] <= 0 or p["pitcherId"] <= 0 or key in seen or key in cached:
+        if p["batterId"] <= 0 or p["pitcherId"] <= 0 or key in seen:
             continue
+        if _bvp_fresh(cached.get(key)):
+            continue  # refetched within the TTL — career totals barely move
         seen.add(key)
         unique.append(p)
     out: dict = {}
+    now_ms = int(time.time() * 1000)
 
     def fetch(p):
         key = f"{p['batterId']}|{p['pitcherId']}"
@@ -1145,11 +1171,11 @@ def fetch_bvp_stats(pairs: list[dict], cached: dict | None = None) -> dict:
             ops = matchup_ops(stat)
             pa = matchup_pa(stat)
             if ops is not None and pa > 0:
-                out[key] = {"pa": pa, "ops": ops}
+                out[key] = {"pa": pa, "ops": ops, "fetchedAt": now_ms}
         except Exception:  # noqa: BLE001 — individual matchups are non-fatal
             pass
 
-    map_limit(unique, 20, fetch)
+    map_limit(unique, 40, fetch)
     return out
 
 
@@ -1193,7 +1219,7 @@ def fetch_platoon_splits(pairs: list[dict], cached: dict | None = None) -> dict:
         except Exception:  # noqa: BLE001 — individual batters are non-fatal
             pass
 
-    map_limit(unique, 20, fetch)
+    map_limit(unique, 40, fetch)
     return out
 
 
@@ -1228,7 +1254,7 @@ def fetch_vs_team_stats(pairs: list[dict], cached: dict | None = None) -> dict:
         except Exception:  # noqa: BLE001 — individual matchups are non-fatal
             pass
 
-    map_limit(unique, 20, fetch)
+    map_limit(unique, 40, fetch)
     return out
 
 
@@ -1430,10 +1456,12 @@ def enrich_with_matchups(
                     seen_vs_team.add(v_key)
                     vs_team_pairs.append({"batterId": p["id"], "teamId": opp_team_id, "season": s})
 
-    # Career BvP is always refetched for the window so repeat matchups stay
-    # fresh; season splits refetch for the current season (they change daily)
-    # and reuse cached totals for past seasons (they are complete).
-    new_bvp = fetch_bvp_stats(bvp_pairs, {})
+    # Career BvP is refetched only when the cached total is older than the
+    # TTL (career numbers barely move day-to-day, so back-to-back refreshes
+    # don't re-pull the whole window); season splits refetch for the current
+    # season (they change daily) and reuse cached totals for past seasons
+    # (they are complete).
+    new_bvp = fetch_bvp_stats(bvp_pairs, bvp_cache)
     merged_bvp = {**bvp_cache, **new_bvp}
     cur_platoon = [p for p in platoon_pairs if p["season"] == season]
     past_platoon = [p for p in platoon_pairs if p["season"] != season]

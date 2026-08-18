@@ -290,6 +290,11 @@ def compute_elo_and_features(games: list[dict], injury_snapshots=None, latest_da
     for game in sorted_games:
         if game["winner"] not in ("home", "away"):
             continue
+        # Defensive guard: drop only genuinely malformed cache rows (no team
+        # ids) — never actual results. Every decided game with valid team ids
+        # still produces a training row.
+        if not (game.get("home") or {}).get("id") or not (game.get("away") or {}).get("id"):
+            continue
         state["injuries"][game["home"]["id"]] = lookup_injuries(game["home"]["id"], game["date"], injury_snapshots)
         state["injuries"][game["away"]["id"]] = lookup_injuries(game["away"]["id"], game["date"], injury_snapshots)
         features = build_features(game, state)

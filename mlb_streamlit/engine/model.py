@@ -19,6 +19,7 @@ used to accelerate the Poisson Monte Carlo and k-NN paths.
 from __future__ import annotations
 
 import math
+import warnings
 
 from .features import FEATURE_KEYS, FEATURE_LABELS, build_features_for_game, compute_elo_and_features
 from .logistic import (
@@ -320,6 +321,17 @@ def run_model(
     """Train, select features, calibrate, and decide on Monte Carlo."""
     from .features import shift_date
 
+    # numpy accelerates the IRLS fits, k-NN and Monte Carlo by 50-100x; make
+    # the pure-Python fallback visible instead of silently running slow.
+    if _np is None:
+        warnings.warn(
+            "numpy is not installed — the ML pipeline is running in its pure-Python "
+            "fallback (roughly 50-100x slower). Install numpy>=1.24.0 to accelerate "
+            "model training, k-NN, and Monte Carlo simulation.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+
     # 1. Features / Elo (chronological, as-of-game-time).
     fe = compute_elo_and_features(completed_games, injury_snapshots, as_of_date)
     rows = fe["rows"]
@@ -340,6 +352,11 @@ def run_model(
         return compute_brier(preds, labels) - 0.5 * compute_auc(preds, labels)
 
     # 2. Feature selection: greedy backward elimination on the calib set.
+    #    Every candidate fit reuses the accepted model's weights as its IRLS
+    #    seed (dropping one feature only removes that column; the rest are
+    #    already near-optimal), so each refit converges in a couple of
+    #    iterations. No feature is removed from the candidate set — the same
+    #    full FEATURE_KEYS universe always enters selection.
     selected = list(FEATURE_KEYS)
     if len(calib) >= 20 and len(train) >= 20:
         current_model = train_logistic(train, selected, iterations=10)
@@ -354,18 +371,22 @@ def run_model(
             rounds += 1
             best_features = selected
             best_score = current_score
+            best_model = current_model
             for drop in selected:
+                drop_idx = selected.index(drop)
                 candidate = [f for f in selected if f != drop]
-                m = train_logistic(train, candidate, iterations=10)
+                w0 = current_model["weights"][:drop_idx] + current_model["weights"][drop_idx + 1:] + [current_model["bias"]]
+                m = train_logistic(train, candidate, iterations=10, w0=w0)
                 preds = [sigmoid(logistic_logit(m, r["features"], None)) for r in calib]
                 s = score_fn(preds, calib_labels)
                 if s < best_score:
                     best_score = s
                     best_features = candidate
+                    best_model = m
             if len(best_features) < len(selected) and best_score < current_score - 1e-5:
                 selected = best_features
                 current_score = best_score
-                current_model = train_logistic(train, selected, iterations=10)
+                current_model = best_model
                 current_preds = [sigmoid(logistic_logit(current_model, r["features"], None)) for r in calib]
                 stagnation_rounds = 0
                 improved = True
