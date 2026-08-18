@@ -9,6 +9,7 @@ tested headlessly (`python3 mlb_streamlit/scripts/smoke_test.py`).
 from __future__ import annotations
 
 import datetime as _dt
+import hashlib
 from concurrent.futures import ThreadPoolExecutor
 
 from . import cache
@@ -336,6 +337,220 @@ def merge_raw_with_stored(fresh: dict, stored: dict) -> dict:
     }
 
 
+def _data_fingerprint(completed: list[dict], injury_counts: dict) -> str:
+    """Stable hash of everything the trained model depends on.
+
+    Every completed game (id, date, result, score) plus each team's current
+    injured-list count. When this matches the stored fingerprint, retraining
+    would produce an identical model, so the refresh can reuse the stored
+    state and only re-score the fresh window. Sort order is fixed so the hash
+    is stable across runs.
+    """
+    lines = []
+    for g in completed:
+        lines.append(
+            f"{g['gamePk']}|{g.get('date')}|{g.get('winner')}|"
+            f"{(g.get('home') or {}).get('score')}|{(g.get('away') or {}).get('score')}"
+        )
+    for tid in sorted(injury_counts):
+        lines.append(f"il:{tid}:{injury_counts[tid]}")
+    lines.sort()
+    return hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
+
+
+def _refresh_fast(fresh: list[dict], all_games: list[dict], cached_state: dict, today: str, season: str, report=None) -> dict:
+    """Reuse the stored model when the training data is unchanged.
+
+    The data fingerprint matched, so the trained model/team state are still
+    exactly right. This path only fetches what the fresh window needs
+    (lineups for the window, missing per-entity logs, TTL-gated matchup
+    splits, market odds) and re-scores those games — no full log waves, no
+    training, no calibration rebuild, no rewriting of the big caches.
+    """
+    def rep(stage, pct, message):
+        if report:
+            report(stage, pct, message)
+
+    now = _dt.datetime.now()
+    rep("No changes detected", 60, "Data unchanged — reusing trained model, refreshing predictions…")
+
+    lineup_cache = cache.load_lineups()
+    lineup_targets = [g for g in all_games if g["gamePk"] not in lineup_cache]
+    fetched_lineups = fetch_lineups_for_games(lineup_targets, 16)
+    for g in lineup_targets:
+        lu = fetched_lineups.get(g["gamePk"])
+        if lu:
+            lineup_cache[g["gamePk"]] = lu
+        elif g.get("winner") in ("home", "away"):
+            # Completed game with no posted lineups — final, never refetch.
+            lineup_cache[g["gamePk"]] = None
+    lineups = {pk: lu for pk, lu in lineup_cache.items() if lu}
+
+    pitcher_log_cache = cache.load_pitcher_logs()
+    team_log_cache = cache.load_team_logs()
+    batter_log_cache = cache.load_batter_logs()
+
+    fresh_dates = {g["date"] for g in fresh}
+    fresh_games = [g for g in all_games if g["date"] in fresh_dates]
+
+    # Missing per-entity logs for the fresh window (rare on this path — every
+    # entity with a completed game is already cached from the training run).
+    pitcher_pairs = []
+    team_pairs = {}
+    for g in fresh_games:
+        s = g.get("season") or season
+        for p in (g.get("awayPitcher"), g.get("homePitcher")):
+            if p and p.get("id") and f"{p['id']}|{s}" not in pitcher_log_cache:
+                pitcher_pairs.append({"id": p["id"], "season": s})
+        for tid in (g["home"]["id"], g["away"]["id"]):
+            team_pairs.setdefault(f"{tid}|{s}", {"id": tid, "season": s})
+    to_fetch_team = [p for p in team_pairs.values() if f"{p['id']}|{p['season']}" not in team_log_cache]
+    p0 = len(pitcher_log_cache)
+    t0 = len(team_log_cache)
+    if pitcher_pairs:
+        pitcher_log_cache.update(fetch_pitcher_game_logs(pitcher_pairs, pitcher_log_cache))
+    if to_fetch_team:
+        team_log_cache.update(fetch_team_game_logs(to_fetch_team, team_log_cache))
+
+    enriched = attach_as_of_stats(fresh_games, pitcher_log_cache, team_log_cache)
+
+    batter_ids = []
+    for g in fresh_games:
+        lu = lineups.get(g["gamePk"])
+        if not lu:
+            continue
+        for side in (lu.get("home"), lu.get("away")):
+            if not side:
+                continue
+            for p in side["battingOrder"] + side["bench"]:
+                batter_ids.append(p["id"])
+    to_fetch_batter = sorted({pid for pid in batter_ids if f"{pid}|{season}" not in batter_log_cache})
+    b0 = len(batter_log_cache)
+    if to_fetch_batter:
+        batter_log_cache.update(fetch_batter_game_logs(to_fetch_batter, season, batter_log_cache))
+    enriched = attach_lineups_as_of(enriched, lineups, batter_log_cache)
+
+    rep("Scoring fresh games", 78, "Predicting with the stored model…")
+    matchup = enrich_with_matchups(
+        enriched,
+        batter_log_cache,
+        cache.load_bvp_logs(),
+        cache.load_platoon_logs(),
+        cache.load_vs_team_logs(),
+        season,
+    )
+    enriched = matchup["games"]
+    market_odds = fetch_market_odds()
+
+    model = reconstruct_model(cached_state)
+    team_state = reconstruct_team_state(cached_state.get("powerRankings") or [])
+    run_model_state = cached_state.get("runModel")
+    run_line_iso = cached_state.get("runLineCalibration") or []
+    run_margin_cal = cached_state.get("runMarginCalibration") or {"slope": 0, "intercept": 0}
+
+    up_batch: list[tuple[dict, dict, dict | None]] = []
+    up_solo: list[tuple[dict, dict, dict | None]] = []
+    for g in enriched:
+        odds = market_odds_for_game(market_odds, g)
+        pred = predict_for_game(g, model, team_state)
+        if ((odds or {}).get("runLine") or 1.5) == 1.5:
+            up_batch.append((g, pred, odds))
+        else:
+            up_solo.append((g, pred, odds))
+    proj_by_pk: dict[int, dict] = {}
+    if up_batch:
+        sims = simulate_runs_batch(
+            run_model_state,
+            [g["home"]["id"] for g, _, _ in up_batch],
+            [g["away"]["id"] for g, _, _ in up_batch],
+            [(od or {}).get("total") if (od or {}).get("total") is not None else expected_total(run_model_state, g["home"]["id"], g["away"]["id"]) for g, _, od in up_batch],
+            [margin_shift_for_game(run_model_state, run_margin_cal, g["home"]["id"], g["away"]["id"], p["homeWinProb"]) for g, p, _ in up_batch],
+            RUN_SIM_TRIALS,
+        )
+        for (g, _, _), sim in zip(up_batch, sims):
+            proj_by_pk[g["gamePk"]] = postprocess_projection(sim, run_line_iso)
+    docs: list[dict] = []
+    for g, pred, odds in up_batch:
+        docs.append(
+            build_game_doc(
+                g,
+                pred,
+                {"home": team_state["injuries"].get(g["home"]["id"], 0), "away": team_state["injuries"].get(g["away"]["id"], 0)},
+                proj_by_pk.get(g["gamePk"]),
+                odds,
+            )
+        )
+    for g, pred, odds in up_solo:
+        docs.append(
+            build_game_doc(
+                g,
+                pred,
+                {"home": team_state["injuries"].get(g["home"]["id"], 0), "away": team_state["injuries"].get(g["away"]["id"], 0)},
+                build_run_projection(
+                    run_model_state,
+                    run_line_iso,
+                    g,
+                    (odds or {}).get("total"),
+                    (odds or {}).get("runLine"),
+                    RUN_SIM_TRIALS,
+                    pred["homeWinProb"],
+                    run_margin_cal,
+                ),
+                odds,
+            )
+        )
+
+    # Persist only what actually changed: the fresh docs, any newly fetched
+    # lineups/logs (rare), and the TTL-gated matchup splits.
+    docs_by_date = cache.load_docs_by_date()
+    for doc in docs:
+        docs_by_date[doc["date"]] = [d for d in docs_by_date.get(doc["date"], []) if d["gamePk"] != doc["gamePk"]] + [doc]
+    items: list[tuple[str, object]] = [("docs_by_date.json", docs_by_date)]
+    if lineup_targets:
+        items.append(("lineups.json", lineup_cache))
+    if len(pitcher_log_cache) != p0:
+        items.append(("pitcher_game_logs.json", pitcher_log_cache))
+    if len(team_log_cache) != t0:
+        items.append(("team_game_logs.json", team_log_cache))
+    if len(batter_log_cache) != b0:
+        items.append(("batter_game_logs.json", batter_log_cache))
+    if matchup["bvpLogs"] or matchup["platoonLogs"] or matchup["vsTeamLogs"]:
+        items.extend([
+            ("bvp_logs.json", matchup["bvpLogs"]),
+            ("platoon_logs.json", matchup["platoonLogs"]),
+            ("vs_team_logs.json", matchup["vsTeamLogs"]),
+            ("pitcher_hands.json", matchup["pitcherHands"]),
+        ])
+    cache.save_many(items)
+
+    # Keep the as-of label fresh without retraining (the model itself is
+    # unchanged — same data, same weights).
+    state = dict(cached_state)
+    state["asOfDate"] = today
+    state["trainedAt"] = int(now.timestamp() * 1000)
+    state["marketOddsStatus"] = {
+        "enabled": market_odds_enabled(),
+        "count": len(market_odds),
+        "fetchedAt": int(now.timestamp() * 1000),
+    }
+    cache.save_model_state(state)
+
+    rep("Complete", 100, f"Refreshed {len(fresh_dates)} day(s) of predictions (no retrain needed)")
+    return {
+        "season": season,
+        "asOfDate": today,
+        "gamesTrained": state.get("gamesTrained"),
+        "holdoutCount": state.get("holdoutCount"),
+        "auc": state.get("auc"),
+        "brier": state.get("brier"),
+        "logLoss": state.get("logLoss"),
+        "ece": state.get("ece"),
+        "selectedModel": state.get("selectedModel"),
+        "monteCarloEnabled": state.get("monteCarloEnabled"),
+        "storedGames": len(docs),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Model-state reconstruction (for on-demand date predictions)
 # ---------------------------------------------------------------------------
@@ -452,19 +667,33 @@ def run_refresh(
     lineup_targets = [g for g in all_games if g["gamePk"] not in lineup_cache]
     team_ids = sorted({tid for g in completed for tid in (g["home"]["id"], g["away"]["id"]) if tid > 0})
 
-    with ThreadPoolExecutor(max_workers=5) as pool:
+    # Fast path: when the training data is unchanged since the last run (same
+    # completed games, same IL counts), retraining would reproduce the same
+    # model — reuse the stored state and only re-score the fresh window.
+    # Current IL counts are fetched first (30 small calls, ~1-2s) so an
+    # intraday roster change still triggers a retrain.
+    rep("Checking for changes", 22, "Comparing data fingerprint…")
+    current_injury = fetch_current_injury_snapshot(team_ids, today, season)
+    fingerprint = _data_fingerprint(completed, current_injury)
+    if (
+        not force_full
+        and cached_state
+        and cached_state.get("dataFingerprint") == fingerprint
+    ):
+        return _refresh_fast(fresh, all_games, cached_state, today, season, report)
+
+    rep("Fetching game data", 24, "Loading pitcher/team logs, lineups & injuries…")
+    with ThreadPoolExecutor(max_workers=4) as pool:
         f_pitcher = pool.submit(fetch_pitcher_game_logs, to_fetch_pitcher, pitcher_log_cache)
         f_team = pool.submit(fetch_team_game_logs, to_fetch_team, team_log_cache)
         f_lineups = pool.submit(fetch_lineups_for_games, lineup_targets, 16)
         f_injuries = pool.submit(
             fetch_injury_snapshots, team_ids, season, f"{season}-{SEASON_START_MD}", today, injury_cache
         )
-        f_current_injury = pool.submit(fetch_current_injury_snapshot, team_ids, today, season)
         fresh_pitcher_logs = f_pitcher.result()
         fresh_team_logs = f_team.result()
         fetched_lineups = f_lineups.result()
         injury_snapshots = f_injuries.result()
-        current_injury = f_current_injury.result()
 
     pitcher_log_cache.update(fresh_pitcher_logs)
     team_log_cache.update(fresh_team_logs)
@@ -716,34 +945,38 @@ def run_refresh(
         "runModel": result["runModel"],
         "runLineCalibration": result["runLineCalibration"],
         "runMarginCalibration": result["runMarginCalibration"],
-        "pitcherLogs": pitcher_log_cache,
-        "teamLogs": team_log_cache,
-        "batterLogs": batter_log_cache,
-        "injurySnapshots": injury_cache,
+        # The per-entity log caches are deliberately NOT embedded here: they
+        # are persisted as their own files and never read back from the state,
+        # so duplicating them (multi-MB, rewritten every refresh) only slowed
+        # every save and every app startup.
+        "dataFingerprint": fingerprint,
         "calibrationSummary": calibration_summary,
         "spearmanRho": spearman,
         "topDecileWinRate": top_decile,
         "todaysRecord": todays_record,
         "marketOddsStatus": market_odds_status,
     }
-    cache.save_model_state(state)
-    cache.save_games(all_games)
-    cache.save_calibration_rows(calibration_rows)
-    cache.save_pitcher_logs(pitcher_log_cache)
-    cache.save_team_logs(team_log_cache)
-    cache.save_batter_logs(batter_log_cache)
-    cache.save_bvp_logs(bvp_log_cache)
-    cache.save_platoon_logs(platoon_log_cache)
-    cache.save_vs_team_logs(vs_team_log_cache)
-    cache.save_pitcher_hands(pitcher_hands_cache)
-    cache.save_lineups(lineup_cache)
-    cache.save_injury_snapshots(injury_cache)
-
-    # 12. Update the games-by-date doc cache for the fresh window.
+    # 11-12. Persist everything in one parallel write (each file is written
+    #        atomically and independently, so concurrency is safe), then update
+    #        the games-by-date doc cache for the fresh window.
     docs_by_date = cache.load_docs_by_date()
     for doc in fresh_docs:
         docs_by_date[doc["date"]] = [d for d in docs_by_date.get(doc["date"], []) if d["gamePk"] != doc["gamePk"]] + [doc]
-    cache.save_docs_by_date(docs_by_date)
+    cache.save_many([
+        ("games.json", all_games),
+        ("model_state.json", state),
+        ("calibration_rows.json", calibration_rows),
+        ("pitcher_game_logs.json", pitcher_log_cache),
+        ("team_game_logs.json", team_log_cache),
+        ("batter_game_logs.json", batter_log_cache),
+        ("bvp_logs.json", bvp_log_cache),
+        ("platoon_logs.json", platoon_log_cache),
+        ("vs_team_logs.json", vs_team_log_cache),
+        ("pitcher_hands.json", pitcher_hands_cache),
+        ("lineups.json", lineup_cache),
+        ("injury_snapshots.json", injury_cache),
+        ("docs_by_date.json", docs_by_date),
+    ])
 
     rep("Complete", 100, f"Refreshed {len(fresh_dates)} day(s) of predictions", )
     return {
@@ -861,16 +1094,18 @@ def predict_date(date: str, state: dict | None = None) -> int:
             )
         )
     # Persist the (possibly grown) log caches so the next refresh is incremental.
-    cache.save_pitcher_logs(pitcher_log_cache)
-    cache.save_team_logs(team_log_cache)
-    cache.save_batter_logs(batter_log_cache)
-    cache.save_bvp_logs(matchup["bvpLogs"])
-    cache.save_platoon_logs(matchup["platoonLogs"])
-    cache.save_vs_team_logs(matchup["vsTeamLogs"])
-    cache.save_pitcher_hands(matchup["pitcherHands"])
+    cache.save_many([
+        ("pitcher_game_logs.json", pitcher_log_cache),
+        ("team_game_logs.json", team_log_cache),
+        ("batter_game_logs.json", batter_log_cache),
+        ("bvp_logs.json", matchup["bvpLogs"]),
+        ("platoon_logs.json", matchup["platoonLogs"]),
+        ("vs_team_logs.json", matchup["vsTeamLogs"]),
+        ("pitcher_hands.json", matchup["pitcherHands"]),
+    ])
     docs_by_date = cache.load_docs_by_date()
     docs_by_date[date] = docs
-    cache.save_docs_by_date(docs_by_date)
+    cache.save_json("docs_by_date.json", docs_by_date)
     return len(docs)
 
 

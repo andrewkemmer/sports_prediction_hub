@@ -282,7 +282,7 @@ def test_features_and_elo() -> None:
     check("home field present", feats["homeField"] == 1.0)
 
 
-def test_lineups() -> None:
+def test_lineups() -> None:  # noqa: E999-probe
     print("lineups")
     # lineup_ops: batting-order slots 1-4 carry 2x weight.
     lu = [
@@ -624,7 +624,7 @@ def test_matchups() -> None:
     finally:
         data.fetch_json = orig_json
 
-def test_as_of_stats() -> None:
+def test_as_of_stats() -> None:  # probe4
     print("as-of-date stats")
     import mlb_streamlit.data as data
 
@@ -739,7 +739,7 @@ def test_as_of_stats() -> None:
     check("attach as-of keeps team ids", g1["home"]["id"] == 119 and g1["away"]["id"] == 108)
 
 
-def test_runs_model() -> None:
+def test_runs_model() -> None:  # probe5
     print("runs")
     games = make_games(120, seed=5)
     rm = fit_run_model(games)
@@ -754,7 +754,7 @@ def test_runs_model() -> None:
     check("sim probs sum ~ 1", abs(sim["overProb"] + sim["underProb"] - 1.0) < 1e-6)
 
 
-def test_automl_pipeline() -> None:
+def test_automl_pipeline() -> None:  # probe6
     print("auto-ml pipeline")
     # 500 games keeps the calibration/test splits large enough that the
     # isotonic fit does not saturate (matches real-season sample sizes).

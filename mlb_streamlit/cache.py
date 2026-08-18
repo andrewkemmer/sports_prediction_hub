@@ -3,12 +3,18 @@
 Fully self-contained: everything the dashboard needs lives in this directory
 as JSON files, so the app survives restarts and refreshes are incremental
 (only new dates are fetched from the MLB Stats API).
+
+Files are written compact (no whitespace) and atomically (tmp + os.replace).
+`save_many` writes several independent files concurrently — the refresh
+pipeline persists ~12 caches per run, and the writes are pure I/O with no
+shared state, so a small thread pool hides their latency.
 """
 
 from __future__ import annotations
 
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 CACHE_DIR = Path(__file__).resolve().parent / "cache"
@@ -51,8 +57,25 @@ def save_json(name: str, data) -> None:
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     tmp = _path(name).with_suffix(".tmp")
     with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f)
+        json.dump(data, f, separators=(",", ":"))
     os.replace(tmp, _path(name))
+
+
+def save_many(items: list[tuple[str, object]], workers: int = 4) -> None:
+    """Write several independent cache files concurrently (atomic per file).
+
+    Deterministic by construction: each file is written independently and
+    replaced atomically, so a crash leaves every file either old or new —
+    never half-written. Falls back to serial for tiny batches.
+    """
+    if len(items) <= 1:
+        for name, data in items:
+            save_json(name, data)
+        return
+    with ThreadPoolExecutor(max_workers=max(1, min(workers, len(items)))) as ex:
+        futures = [ex.submit(save_json, name, data) for name, data in items]
+        for fut in futures:
+            fut.result()  # propagate the first write failure
 
 
 def has(name: str) -> bool:

@@ -716,25 +716,161 @@ def team_as_of(log: dict | None, ymd: str) -> dict:
     return out
 
 
+def _pitcher_prefix_stats(log: list[dict] | None, ymd: str, acc: dict, key: str) -> dict:
+    """Pointer-accumulated twin of `pitcher_as_of` over a chronological pass.
+
+    `acc[key]` holds running totals + a cursor into `log` (date-sorted), so
+    consecutive games advance the cursor instead of rescanning the whole log.
+    The arithmetic (sum order, windows, rounding) is identical to
+    `pitcher_as_of`; a game earlier than the cursor resets and re-accumulates
+    so unsorted input still matches the naive result exactly.
+    """
+    if not log:
+        return {}
+    st = acc.get(key)
+    if st is None:
+        st = {"ptr": 0, "ip": 0.0, "er": 0.0, "so": 0.0, "bb": 0.0, "hbp": 0.0, "hr": 0.0, "h": 0.0, "lastYmd": ""}
+        acc[key] = st
+    if st["lastYmd"] and ymd < st["lastYmd"]:
+        st.update({"ptr": 0, "ip": 0.0, "er": 0.0, "so": 0.0, "bb": 0.0, "hbp": 0.0, "hr": 0.0, "h": 0.0})
+    st["lastYmd"] = ymd
+    ptr = st["ptr"]
+    while ptr < len(log) and log[ptr]["d"] < ymd:
+        e = log[ptr]
+        st["ip"] += e["ip"]
+        st["er"] += e["er"]
+        st["so"] += e["so"]
+        st["bb"] += e["bb"]
+        st["hbp"] += e["hbp"]
+        st["hr"] += e["hr"]
+        st["h"] += e.get("h", 0.0)
+        ptr += 1
+    st["ptr"] = ptr
+    if st["ip"] <= 0:
+        return {}
+    out = {
+        "era": round(st["er"] * 9 / st["ip"], 2),
+        "k9": round(st["so"] * 9 / st["ip"], 2),
+        "fip": round((13 * st["hr"] + 3 * (st["bb"] + st["hbp"]) - 2 * st["so"]) / st["ip"] + FIP_CONSTANT, 2),
+        "whip": round((st["bb"] + st["h"]) / st["ip"], 2),
+    }
+    recent = log[max(0, ptr - 3):ptr]
+    r_ip = sum(r["ip"] for r in recent)
+    r_er = sum(r["er"] for r in recent)
+    if r_ip > 0:
+        out["recentEra"] = round(r_er * 9 / r_ip, 2)
+    if recent:
+        last = recent[-1]["d"]
+        try:
+            rest = (date.fromisoformat(ymd) - date.fromisoformat(last)).days
+        except ValueError:
+            rest = 14
+        out["restDays"] = max(0, min(14, rest))
+        out["workload"] = round(sum(r["ip"] for r in recent), 2)
+    trend = log[max(0, ptr - 5):ptr]
+    if len(trend) >= 3:
+        n_t = len(trend)
+        mean_x = (n_t - 1) / 2
+        mean_fip = 0.0
+        for i, e in enumerate(trend):
+            mean_fip += (13 * e["hr"] + 3 * (e["bb"] + e["hbp"]) - 2 * e["so"]) / e["ip"] + FIP_CONSTANT
+        mean_fip /= n_t
+        sxy = 0.0
+        sxx = 0.0
+        for i, e in enumerate(trend):
+            f = (13 * e["hr"] + 3 * (e["bb"] + e["hbp"]) - 2 * e["so"]) / e["ip"] + FIP_CONSTANT
+            sxy += (i - mean_x) * (f - mean_fip)
+            sxx += (i - mean_x) * (i - mean_x)
+        if sxx > 0:
+            out["trendFip"] = round(sxy / sxx, 3)
+    return out
+
+
+def _team_prefix_stats(log: dict | None, ymd: str, acc: dict, key: str) -> dict:
+    """Pointer-accumulated twin of `team_as_of` (identical sums/rounding)."""
+    if not log:
+        return {}
+    st = acc.get(key)
+    if st is None:
+        st = {
+            "hit": {"ptr": 0, "ab": 0.0, "h": 0.0, "bb": 0.0, "hbp": 0.0, "sf": 0.0, "tb": 0.0},
+            "pitch": {"ptr": 0, "ip": 0.0, "er": 0.0, "so": 0.0, "bb": 0.0, "h": 0.0},
+            "field": {"ptr": 0, "po": 0.0, "a": 0.0, "e": 0.0},
+            "lastYmd": "",
+        }
+        acc[key] = st
+    if st["lastYmd"] and ymd < st["lastYmd"]:
+        for sub in ("hit", "pitch", "field"):
+            for k in st[sub]:
+                if k != "ptr":
+                    st[sub][k] = 0.0
+            st[sub]["ptr"] = 0
+    st["lastYmd"] = ymd
+    out: dict = {}
+
+    def advance(sub: str, entries: list[dict]):
+        ptr = st[sub]["ptr"]
+        while ptr < len(entries) and entries[ptr]["d"] < ymd:
+            e = entries[ptr]
+            s = st[sub]
+            for k in s:
+                if k in ("ptr",):
+                    continue
+                if k in e:
+                    s[k] += e[k]
+            ptr += 1
+        st[sub]["ptr"] = ptr
+
+    advance("hit", log.get("hitting") or [])
+    advance("pitch", log.get("pitching") or [])
+    advance("field", log.get("fielding") or [])
+
+    h = st["hit"]
+    ops = _ops_from_hitting(h["ab"], h["h"], h["bb"], h["hbp"], h["sf"], h["tb"])
+    if ops is not None:
+        out["ops"] = round(ops, 3)
+    p = st["pitch"]
+    if p["ip"] > 0:
+        out["era"] = round(p["er"] * 9 / p["ip"], 2)
+        out["k9"] = round(p["so"] * 9 / p["ip"], 2)
+        out["whip"] = round((p["bb"] + p["h"]) / p["ip"], 2)
+    f = st["field"]
+    chances = f["po"] + f["a"] + f["e"]
+    if chances > 0:
+        out["fieldingPct"] = round((f["po"] + f["a"]) / chances, 3)
+    return out
+
+
 def attach_as_of_stats(games: list[dict], pitcher_logs: dict, team_logs: dict) -> list[dict]:
-    """Attach per-game as-of-date pitcher + team stats (no lookahead)."""
-    out = []
-    for g in games:
+    """Attach per-game as-of-date pitcher + team stats (no lookahead).
+
+    Processes games in chronological order once, advancing per-entity cursors
+    into the cached logs (amortized O(1) per game instead of rescanning every
+    log from the start), then restores the caller's input order. Output is
+    byte-identical to the naive rescan (same sums, same order, same rounding).
+    """
+    n = len(games)
+    order = sorted(range(n), key=lambda i: (games[i].get("gameDate") or games[i].get("date") or "", i))
+    out: list[dict] = [None] * n  # type: ignore[list-item]
+    pacc: dict[str, dict] = {}
+    tacc: dict[str, dict] = {}
+    for i in order:
+        g = games[i]
         season = g.get("season")
         ymd = g["date"]
-
-        def pitcher_stats(p):
-            if not p:
-                return p
-            return {**p, **pitcher_as_of(pitcher_logs.get(f"{p['id']}|{season}"), ymd)}
-
-        out.append({
+        hp = g.get("homePitcher")
+        ap = g.get("awayPitcher")
+        if hp and hp.get("id"):
+            hp = {**hp, **_pitcher_prefix_stats(pitcher_logs.get(f"{hp['id']}|{season}"), ymd, pacc, f"{hp['id']}|{season}")}
+        if ap and ap.get("id"):
+            ap = {**ap, **_pitcher_prefix_stats(pitcher_logs.get(f"{ap['id']}|{season}"), ymd, pacc, f"{ap['id']}|{season}")}
+        out[i] = {
             **g,
-            "awayPitcher": pitcher_stats(g.get("awayPitcher")),
-            "homePitcher": pitcher_stats(g.get("homePitcher")),
-            "home": {**g["home"], **team_as_of(team_logs.get(f"{g['home']['id']}|{season}"), ymd)},
-            "away": {**g["away"], **team_as_of(team_logs.get(f"{g['away']['id']}|{season}"), ymd)},
-        })
+            "awayPitcher": ap,
+            "homePitcher": hp,
+            "home": {**g["home"], **_team_prefix_stats(team_logs.get(f"{g['home']['id']}|{season}"), ymd, tacc, f"{g['home']['id']}|{season}")},
+            "away": {**g["away"], **_team_prefix_stats(team_logs.get(f"{g['away']['id']}|{season}"), ymd, tacc, f"{g['away']['id']}|{season}")},
+        }
     return out
 
 
@@ -1083,31 +1219,109 @@ def batter_games7_as_of(entries: list[dict] | None, ymd: str) -> int:
     return sum(1 for e in entries if cutoff <= e["d"] < ymd)
 
 
+def _batter_prefix(log: list[dict] | None, ymd: str, acc: dict, key: str) -> dict:
+    """Pointer-accumulated twin of the per-batter as-of fields.
+
+    Equivalent to running `batter_ops_as_of` / `woba` / `iso` / `recent` /
+    `momentum` / `games7` on the log prefix strictly before `ymd`, but the
+    cursor advances across a chronological pass instead of rescanning the
+    whole log per game. Identical arithmetic and rounding.
+    """
+    if not log:
+        return {"ops": None, "woba": None, "iso": None, "recentOps": None, "momentum": None, "games7": 0}
+    st = acc.get(key)
+    if st is None:
+        st = {"ptr": 0, "ptr7": 0, "count": 0, "count7": 0, "ab": 0.0, "h": 0.0, "bb": 0.0, "ibb": 0.0,
+              "hbp": 0.0, "sf": 0.0, "tb": 0.0, "2b": 0.0, "3b": 0.0, "hr": 0.0, "lastYmd": ""}
+        acc[key] = st
+    if st["lastYmd"] and ymd < st["lastYmd"]:
+        for k in ("ptr", "ptr7", "count", "count7", "ab", "h", "bb", "ibb", "hbp", "sf", "tb", "2b", "3b", "hr"):
+            st[k] = 0 if k in ("ptr", "ptr7", "count", "count7") else 0.0
+    st["lastYmd"] = ymd
+    ptr = st["ptr"]
+    while ptr < len(log) and log[ptr]["d"] < ymd:
+        e = log[ptr]
+        st["ab"] += e["ab"]
+        st["h"] += e["h"]
+        st["bb"] += e["bb"]
+        st["ibb"] += e.get("ibb", 0.0)
+        st["hbp"] += e["hbp"]
+        st["sf"] += e["sf"]
+        st["tb"] += e["tb"]
+        st["2b"] += e.get("2b", 0.0)
+        st["3b"] += e.get("3b", 0.0)
+        st["hr"] += e.get("hr", 0.0)
+        st["count"] += 1
+        ptr += 1
+    st["ptr"] = ptr
+    try:
+        cutoff = (date.fromisoformat(ymd) - timedelta(days=7)).isoformat()
+    except ValueError:
+        cutoff = ""
+    if cutoff:
+        ptr7 = st["ptr7"]
+        while ptr7 < ptr and log[ptr7]["d"] < cutoff:
+            st["count7"] += 1
+            ptr7 += 1
+        st["ptr7"] = ptr7
+
+    ab, h = st["ab"], st["h"]
+    ops = _ops_from_hitting(ab, h, st["bb"], st["hbp"], st["sf"], st["tb"])
+    ops = round(ops, 3) if ops is not None else None
+    woba = _woba_from_hitting(ab, h, st["bb"], st["ibb"], st["hbp"], st["sf"], st["2b"], st["3b"], st["hr"])
+    woba = round(woba, 3) if woba is not None else None
+    iso = _iso_from_hitting(h, st["tb"], ab)
+    iso = round(iso, 3) if iso is not None else None
+    recent = log[max(0, ptr - 10):ptr]
+    recent_ops = None
+    if recent:
+        r_ab = r_h = r_bb = r_hbp = r_sf = r_tb = 0.0
+        for e in recent:
+            r_ab += e["ab"]
+            r_h += e["h"]
+            r_bb += e["bb"]
+            r_hbp += e["hbp"]
+            r_sf += e["sf"]
+            r_tb += e["tb"]
+        rv = _ops_from_hitting(r_ab, r_h, r_bb, r_hbp, r_sf, r_tb)
+        recent_ops = round(rv, 3) if rv is not None else None
+    recent_ops_val = recent_ops if recent_ops is not None else ops
+    momentum = None
+    if st["count"] >= 5 and ops is not None and recent_ops is not None:
+        momentum = round(recent_ops - ops, 3)
+    games7 = st["count"] - st["count7"] if cutoff else 0
+    return {"ops": ops, "woba": woba, "iso": iso, "recentOps": recent_ops_val, "momentum": momentum, "games7": games7}
+
+
 def attach_lineups_as_of(games: list[dict], lineups: dict, batter_logs: dict) -> list[dict]:
-    """Attach lineups with each batter's OPS as-of the game's own date (no lookahead)."""
-    out = []
-    for g in games:
+    """Attach lineups with each batter's OPS as-of the game's own date (no lookahead).
+
+    One chronological pass with per-batter cursors (amortized O(1) per game),
+    then restores input order. Output is byte-identical to the naive rescan.
+    """
+    n = len(games)
+    order = sorted(range(n), key=lambda i: (games[i].get("gameDate") or games[i].get("date") or "", i))
+    out: list[dict] = [None] * n  # type: ignore[list-item]
+    bacc: dict[str, dict] = {}
+    for i in order:
+        g = games[i]
         lu = lineups.get(g["gamePk"])
         if not lu:
-            out.append(g)
+            out[i] = g
             continue
         season = g.get("season")
         ymd = g["date"]
 
         def batter(p):
-            log = batter_logs.get(f"{p['id']}|{season}")
-            ops = batter_ops_as_of(log, ymd)
-            recent = batter_recent_ops_as_of(log, ymd)
-            if recent is None:
-                recent = ops  # fall back to season OPS so hot-streak stays populated
+            stats = _batter_prefix(batter_logs.get(f"{p['id']}|{season}"), ymd, bacc, f"{p['id']}|{season}")
             return {
                 **p,
-                "ops": ops,
-                "woba": batter_woba_as_of(log, ymd),
-                "iso": batter_iso_as_of(log, ymd),
-                "recentOps": recent,
-                "momentum": batter_momentum_as_of(log, ymd),
-                "games7": batter_games7_as_of(log, ymd),
+                "ops": stats["ops"],
+                "woba": stats["woba"],
+                "iso": stats["iso"],
+                "recentOps": stats["recentOps"],
+                "momentum": stats["momentum"],
+                "games7": stats["games7"],
             }
 
         def with_ops(side):
@@ -1124,7 +1338,7 @@ def attach_lineups_as_of(games: list[dict], lineups: dict, batter_logs: dict) ->
         away_ops = lineup_ops(away["battingOrder"]) if away else 0.0
         home_known = home_ops > 0
         away_known = away_ops > 0
-        out.append({
+        out[i] = {
             **g,
             "lineups": {"home": home, "away": away},
             "lineupStats": {
@@ -1147,7 +1361,7 @@ def attach_lineups_as_of(games: list[dict], lineups: dict, batter_logs: dict) ->
                     "games7": _lineup_weighted(away["battingOrder"], "games7") if away_known else 0.0,
                 },
             },
-        })
+        }
     return out
 
 
