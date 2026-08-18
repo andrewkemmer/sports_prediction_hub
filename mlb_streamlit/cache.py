@@ -38,6 +38,10 @@ _INJURIES = "injury_snapshots.json"
 _DOCS_BY_DATE = "docs_by_date.json"
 _MARKET_ODDS = "market_odds.json"
 
+# Bump to invalidate stale backtest caches (calibration_rows_wf.json).
+# refresh.py reads this value as its source of truth.
+BACKTEST_CACHE_VERSION = 3
+
 
 def _path(name: str) -> Path:
     return CACHE_DIR / name
@@ -114,13 +118,14 @@ def save_calibration_rows(rows: list[dict]) -> None:
 def load_calibration_rows_wf() -> dict:
     """Walk-forward calibration cache: date -> {"fp", "rows"}.
 
-    Version 2 of the payload wraps the per-date map under a ``days`` key so
-    old full-model rows are not silently reused after the model changes.
+    The payload wraps the per-date map under a ``days`` key plus a top-level
+    ``version``. Rows stamped with an older version are treated as absent so
+    the calibration tab rebuilds them rather than rendering stale results.
     """
     raw = load_json(_CALIBRATION_WF, {}) or {}
-    if isinstance(raw, dict) and "days" in raw:
+    if isinstance(raw, dict) and raw.get("version") == BACKTEST_CACHE_VERSION:
         return raw.get("days") or {}
-    return raw
+    return {}
 
 
 def save_calibration_rows_wf(days: dict) -> None:

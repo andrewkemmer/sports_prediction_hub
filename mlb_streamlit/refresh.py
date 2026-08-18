@@ -59,6 +59,8 @@ MIN_COMPLETED_GAMES = 40
 
 PREDICTION_VERSION = 3  # bump to force re-scoring of previously cached dates
 BACKTEST_STATES_FILE = "backtest_states.json"
+BACKTEST_CACHE_VERSION = cache.BACKTEST_CACHE_VERSION  # bump with PREDICTION_VERSION to invalidate stale backtest caches
+WF_REFIT_DAYS = 3  # refit the walk-forward model every N days (games in a block share a model)
 
 SEASON_START = "2022-03-15"  # earliest calibration-range date (UI default)
 
@@ -1038,6 +1040,8 @@ def _backtest_state(target: str, report=None) -> dict | None:
 
     states_raw = cache.load_json(BACKTEST_STATES_FILE, {}) or {}
     states = states_raw.get("days", {}) if isinstance(states_raw, dict) and "days" in states_raw else {}
+    if (states_raw.get("version") if isinstance(states_raw, dict) else None) != BACKTEST_CACHE_VERSION:
+        states = {}
     existing = states.get(target)
     if existing and existing.get("dataFingerprint") == fingerprint:
         return existing
@@ -1092,7 +1096,7 @@ def _backtest_state(target: str, report=None) -> dict | None:
         "dataFingerprint": fingerprint,
     }
     states[target] = state
-    cache.save_json(BACKTEST_STATES_FILE, {"version": 2, "days": states})
+    cache.save_json(BACKTEST_STATES_FILE, {"version": BACKTEST_CACHE_VERSION, "days": states})
     rep("Backtest model ready", 45, f"Walk-forward model trained through {target}.")
     return state
 
@@ -1155,47 +1159,84 @@ def build_walk_forward_calibration_rows(report=None) -> list[dict]:
 
     existing_raw = cache.load_json(CALIBRATION_WF_FILE, {}) or {}
     existing = existing_raw.get("days", {}) if isinstance(existing_raw, dict) and "days" in existing_raw else {}
+    if (existing_raw.get("version") if isinstance(existing_raw, dict) else None) != BACKTEST_CACHE_VERSION:
+        existing = {}
     out: dict[str, dict] = {}
     season = today[:4]
     fe_rows = fe["rows"]
     dates = sorted(d for d in by_date if d[:4] == season)
+
+    # Refit cadence: a full model fit for every single date is the dominant
+    # CPU cost of this backtest (one fit per day over the whole season). Refit
+    # once per WF_REFIT_DAYS and reuse that model for every game in the block.
+    # The block model is still trained strictly on games before the block
+    # start, so no future result ever leaks into a scored game — it simply
+    # uses slightly fewer prior games. The prior-games pointer advances once
+    # through the chronological feature rows instead of rescanning them for
+    # every date (removing the O(days × games) rescans).
+    current_model: dict | None = None
+    current_cutoff: str | None = None
+    current_run_model: dict | None = None
+    current_run_line_iso: list[dict] | None = None
+    current_run_margin_cal: dict | None = None
+    prior_games: list[dict] = []
+    ptr = 0  # fe_rows is chronological; the pointer only moves forward
+
     for i, d in enumerate(dates):
-        prior_rows = [r for r in fe_rows if r["game"]["date"] < d]
-        if len(prior_rows) < MIN_COMPLETED_GAMES:
+        day_rows = rows_by_date.get(d) or []
+        if not day_rows:
             continue
-        prior_games = [r["game"] for r in prior_rows]
+        # Advance the prior-games pointer once through the chronological
+        # feature rows (amortized O(n) over the whole loop instead of an
+        # O(n) rescan per date).
+        while ptr < len(fe_rows) and fe_rows[ptr]["game"]["date"] < d:
+            prior_games.append(fe_rows[ptr]["game"])
+            ptr += 1
+        if len(prior_games) < MIN_COMPLETED_GAMES:
+            current_model = None
+            current_cutoff = None
+            continue
         fp = _data_fingerprint(prior_games + by_date[d], {})
         cached_day = existing.get(d)
         if cached_day and cached_day.get("fp") == fp:
             out[d] = cached_day
+            # A cache hit needs no model; clear the block so a later uncached
+            # date refits against its own training cutoff.
+            current_model = None
+            current_cutoff = None
             continue
-        day_rows = rows_by_date.get(d) or []
-        if not day_rows:
-            continue
-        result = run_model_light(prior_rows, prior_games, season, d)
-        model = {
-            "featureNames": result["featureNames"],
-            "weights": result["weights"],
-            "bias": result["bias"],
-            "featureStats": result["featureStats"],
-            "isotonicPoints": result["isotonicPoints"],
-            "monteCarloSigma": result["monteCarloSigma"],
-            "monteCarloEnabled": result["monteCarloEnabled"],
-            "eloHfa": result["eloHfa"],
-        }
+        # Cache miss: fit the block model once, then reuse it for the next
+        # WF_REFIT_DAYS of dates.
+        if current_model is None or d >= add_days(current_cutoff, WF_REFIT_DAYS):
+            prior_rows = fe_rows[:ptr]
+            result = run_model_light(prior_rows, prior_games, season, d)
+            current_model = {
+                "featureNames": result["featureNames"],
+                "weights": result["weights"],
+                "bias": result["bias"],
+                "featureStats": result["featureStats"],
+                "isotonicPoints": result["isotonicPoints"],
+                "monteCarloSigma": result["monteCarloSigma"],
+                "monteCarloEnabled": result["monteCarloEnabled"],
+                "eloHfa": result["eloHfa"],
+            }
+            current_run_model = result["runModel"]
+            current_run_line_iso = result["runLineCalibration"]
+            current_run_margin_cal = result["runMarginCalibration"]
+            current_cutoff = d
         cal_rows = build_calibration_rows(
             day_rows,
-            model,
-            result["runModel"],
-            result["runLineCalibration"],
-            result["runMarginCalibration"],
+            current_model,
+            current_run_model,
+            current_run_line_iso,
+            current_run_margin_cal,
         )
         for r in cal_rows:
-            r["trainedThrough"] = d
+            r["trainedThrough"] = current_cutoff
         out[d] = {"fp": fp, "rows": cal_rows}
         rep("Walk-forward", 30 + int(65 * (i + 1) / max(1, len(dates))),
-            f"Scored {len(cal_rows)} game(s) on {d} with a model trained on {len(prior_rows)} prior game(s)…")
-    cache.save_json(CALIBRATION_WF_FILE, {"version": 2, "days": out})
+            f"Scored {len(cal_rows)} game(s) on {d} with a model trained on {len(prior_games)} prior game(s)…")
+    cache.save_json(CALIBRATION_WF_FILE, {"version": BACKTEST_CACHE_VERSION, "days": out})
     flat: list[dict] = []
     for d in sorted(out):
         flat.extend(out[d]["rows"])
@@ -1281,7 +1322,16 @@ def predict_date(date: str, state: dict | None = None, report=None) -> int:
         if bs is not None:
             state = bs
         else:
-            rep("Using stored model", 12, "Too little history before this date — using the current model.")
+            # Never score a past date with the current full-season model: that
+            # model has seen every game through today and would leak future
+            # results into a historical pick (the source of the old "99%"
+            # results). Fail loudly so the UI reports insufficient history
+            # instead of rendering a forward-looking prediction.
+            raise RuntimeError(
+                "Not enough completed games before this date to build a "
+                "point-in-time model; refusing to use the current model for "
+                "a past date."
+            )
     model = reconstruct_model(state)
     if backtest and state.get("key") == "backtest":
         # The walk-forward model's own power rankings are as-of this date.
