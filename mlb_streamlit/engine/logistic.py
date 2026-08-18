@@ -12,6 +12,7 @@ from .metrics import (
     compute_auc,
     compute_brier,
     mean,
+    parallel_map,
     roundn,
     sigmoid,
     std,
@@ -312,22 +313,36 @@ def cross_validate(rows: list[dict], feature_names: list[str], cv_folds: int = 5
     """Walk-forward 5-fold CV of the logistic model (no lookahead)."""
     n = len(rows)
     chunk_size = max(1, n // (cv_folds + 1))
-    fold_aucs: list[float] = []
-    fold_briers: list[float] = []
-    games_per_fold: list[int] = []
-    for f in range(1, cv_folds + 1):
+
+    def fit_fold(f: int):
         train_end = f * chunk_size
         test_end = n if f == cv_folds else (f + 1) * chunk_size
         train = rows[:train_end]
         test = rows[train_end:test_end]
         if len(train) < 40 or len(test) < 20:
-            continue
+            return None
         m = train_logistic(train, feature_names)
         preds = [sigmoid(logistic_logit(m, r["features"], None)) for r in test]
         labels = [r["label"] for r in test]
-        fold_aucs.append(compute_auc(preds, labels))
-        fold_briers.append(compute_brier(preds, labels))
-        games_per_fold.append(len(test))
+        return {
+            "auc": compute_auc(preds, labels),
+            "brier": compute_brier(preds, labels),
+            "games": len(test),
+        }
+
+    # Folds are independent walk-forward fits — run them concurrently (order
+    # preserved) when numpy is present (its ops release the GIL; pure-Python
+    # fits serialize under the GIL, so a pool would only add overhead).
+    fold_aucs: list[float] = []
+    fold_briers: list[float] = []
+    games_per_fold: list[int] = []
+    fold_workers = min(cv_folds, 5) if _np is not None else 1
+    for fit in parallel_map(fit_fold, list(range(1, cv_folds + 1)), max_workers=fold_workers):
+        if fit is None:
+            continue
+        fold_aucs.append(fit["auc"])
+        fold_briers.append(fit["brier"])
+        games_per_fold.append(fit["games"])
     return {
         "folds": len(fold_aucs),
         "aucMean": roundn(mean(fold_aucs), 3) if fold_aucs else 0,

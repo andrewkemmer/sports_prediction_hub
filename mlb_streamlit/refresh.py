@@ -43,7 +43,7 @@ from .engine.metrics import (
     logit,
     spearman_rank,
 )
-from .engine.model import apply_model, run_model
+from .engine.model import apply_model, run_model, simulate_runs_batch
 from .engine.runs import expected_margin, expected_total, simulate_runs
 
 RUN_SIM_TRIALS = 10000
@@ -93,6 +93,16 @@ def build_run_projection(
     )
     line = market_total if market_total is not None else expected_total(run_model_state, game["home"]["id"], game["away"]["id"])
     sim = simulate_runs(run_model_state, game["home"]["id"], game["away"]["id"], line, trials, run_line, margin_shift)
+    return postprocess_projection(sim, run_line_iso, run_line)
+
+
+def postprocess_projection(sim: dict, run_line_iso: list[dict], run_line: float = 1.5) -> dict:
+    """Finalize a raw simulation into the projection doc shape.
+
+    Shared by the scalar `build_run_projection` and the vectorized batch path
+    (`simulate_runs_batch`) so both produce byte-identical output formatting.
+    Isotonic calibration applies only to the ±1.5 run line (the market default).
+    """
     home_rl = apply_isotonic(run_line_iso, sim["homeRunLineProb"]) if run_line_iso and run_line == 1.5 else sim["homeRunLineProb"]
     home = min(0.999, max(0.001, home_rl))
     return {
@@ -442,7 +452,7 @@ def run_refresh(
     lineup_targets = [g for g in all_games if g["gamePk"] not in lineup_cache]
     team_ids = sorted({tid for g in completed for tid in (g["home"]["id"], g["away"]["id"]) if tid > 0})
 
-    with ThreadPoolExecutor(max_workers=4) as pool:
+    with ThreadPoolExecutor(max_workers=5) as pool:
         f_pitcher = pool.submit(fetch_pitcher_game_logs, to_fetch_pitcher, pitcher_log_cache)
         f_team = pool.submit(fetch_team_game_logs, to_fetch_team, team_log_cache)
         f_lineups = pool.submit(fetch_lineups_for_games, lineup_targets, 16)
@@ -540,20 +550,26 @@ def run_refresh(
 
     completed_enriched = [g for g in enriched if g.get("winner") in ("home", "away")]
 
-    # 7. Train / calibrate / select.
+    # 7-8. Train / calibrate / select — while market odds (a single independent
+    #      I/O call) fetch concurrently in a background thread. Odds depend on
+    #      nothing the ML pipeline produces, so waiting for them only after
+    #      training hides their full latency under the train time.
     rep("Training model", 62, "Fitting models & selecting features…")
-    run = run_model(completed_enriched, season, today, injury_snapshots)
-    result = run["result"]
-    model = run["model"]
-    rows = run["rows"]
-    team_state = run["teamState"]
-    run_model_state = result["runModel"]
-    run_line_iso = result["runLineCalibration"] or []
-    run_margin_cal = result["runMarginCalibration"] or {"slope": 0, "intercept": 0}
-
-    # 8. Market odds (best-effort).
-    rep("Fetching market odds", 68, "Loading market odds (best-effort)…")
-    market_odds = fetch_market_odds()
+    odds_pool = ThreadPoolExecutor(max_workers=1)
+    try:
+        odds_future = odds_pool.submit(fetch_market_odds)
+        run = run_model(completed_enriched, season, today, injury_snapshots)
+        result = run["result"]
+        model = run["model"]
+        rows = run["rows"]
+        team_state = run["teamState"]
+        run_model_state = result["runModel"]
+        run_line_iso = result["runLineCalibration"] or []
+        run_margin_cal = result["runMarginCalibration"] or {"slope": 0, "intercept": 0}
+        rep("Fetching market odds", 68, "Loading market odds (best-effort)…")
+        market_odds = odds_future.result()
+    finally:
+        odds_pool.shutdown(wait=False)
     market_odds_status = {
         "enabled": market_odds_enabled(),
         "count": len(market_odds),
@@ -573,48 +589,89 @@ def run_refresh(
     top_decile = (sum(1 for r in high_conf if r["isCorrect"]) / len(high_conf)) if high_conf else 0.0
     calibration_summary = build_calibration_summary(calibration_rows)
 
-    # 10. Fresh game docs for the fetched window.
+    # 10. Fresh game docs for the fetched window. The 10,000-trial Monte Carlo
+    #     per upcoming game is the single biggest CPU cost of a refresh, so all
+    #     projections for the window are computed in ONE vectorized numpy pass
+    #     (`simulate_runs_batch`) instead of a Python loop of scalar sims.
+    #     Games with a non-standard market run line (±1.5 is the norm) fall
+    #     back to the scalar path; both share postprocess_projection.
     fresh_dates = {g["date"] for g in fresh}
     rows_by_pk = {r["game"]["gamePk"]: r for r in rows}
-    fresh_docs: list[dict] = []
-    for g in enriched:
-        if g["date"] not in fresh_dates:
-            continue
+    fresh_games = [g for g in enriched if g["date"] in fresh_dates]
+
+    comp: list[tuple[dict, dict]] = []  # (game, pred) for completed games
+    up_batch: list[tuple[dict, dict, dict | None]] = []  # (game, pred, odds) with run line 1.5
+    up_solo: list[tuple[dict, dict, dict | None]] = []  # (game, pred, odds) with a non-1.5 run line
+    for g in fresh_games:
         if g.get("winner") in ("home", "away"):
             row = rows_by_pk.get(g["gamePk"])
             if not row:
                 continue
-            pred = apply_model(model, row["features"], row["homeElo"], row["awayElo"])
-            fresh_docs.append(
-                build_game_doc(
-                    g,
-                    pred,
-                    None,
-                    build_run_projection(run_model_state, run_line_iso, g, None, None, RUN_CALIB_TRIALS, pred["homeWinProb"], run_margin_cal),
-                    None,
-                )
-            )
+            comp.append((g, apply_model(model, row["features"], row["homeElo"], row["awayElo"])))
         else:
             odds = market_odds_for_game(market_odds, g)
             pred = predict_for_game(g, model, team_state)
-            fresh_docs.append(
-                build_game_doc(
-                    g,
-                    pred,
-                    {"home": team_state["injuries"].get(g["home"]["id"], 0), "away": team_state["injuries"].get(g["away"]["id"], 0)},
-                    build_run_projection(
-                        run_model_state,
-                        run_line_iso,
-                        g,
-                        (odds or {}).get("total"),
-                        (odds or {}).get("runLine"),
-                        RUN_SIM_TRIALS,
-                        pred["homeWinProb"],
-                        run_margin_cal,
-                    ),
-                    odds,
-                )
+            if ((odds or {}).get("runLine") or 1.5) == 1.5:
+                up_batch.append((g, pred, odds))
+            else:
+                up_solo.append((g, pred, odds))
+
+    proj_by_pk: dict[int, dict] = {}
+    if comp:
+        sims = simulate_runs_batch(
+            run_model_state,
+            [g["home"]["id"] for g, _ in comp],
+            [g["away"]["id"] for g, _ in comp],
+            [expected_total(run_model_state, g["home"]["id"], g["away"]["id"]) for g, _ in comp],
+            [margin_shift_for_game(run_model_state, run_margin_cal, g["home"]["id"], g["away"]["id"], p["homeWinProb"]) for g, p in comp],
+            RUN_CALIB_TRIALS,
+        )
+        for (g, _), sim in zip(comp, sims):
+            proj_by_pk[g["gamePk"]] = postprocess_projection(sim, run_line_iso)
+    if up_batch:
+        sims = simulate_runs_batch(
+            run_model_state,
+            [g["home"]["id"] for g, _, _ in up_batch],
+            [g["away"]["id"] for g, _, _ in up_batch],
+            [(od or {}).get("total") if (od or {}).get("total") is not None else expected_total(run_model_state, g["home"]["id"], g["away"]["id"]) for g, _, od in up_batch],
+            [margin_shift_for_game(run_model_state, run_margin_cal, g["home"]["id"], g["away"]["id"], p["homeWinProb"]) for g, p, _ in up_batch],
+            RUN_SIM_TRIALS,
+        )
+        for (g, _, _), sim in zip(up_batch, sims):
+            proj_by_pk[g["gamePk"]] = postprocess_projection(sim, run_line_iso)
+
+    fresh_docs: list[dict] = []
+    for g, pred in comp:
+        fresh_docs.append(build_game_doc(g, pred, None, proj_by_pk.get(g["gamePk"]), None))
+    for g, pred, odds in up_batch:
+        fresh_docs.append(
+            build_game_doc(
+                g,
+                pred,
+                {"home": team_state["injuries"].get(g["home"]["id"], 0), "away": team_state["injuries"].get(g["away"]["id"], 0)},
+                proj_by_pk.get(g["gamePk"]),
+                odds,
             )
+        )
+    for g, pred, odds in up_solo:
+        fresh_docs.append(
+            build_game_doc(
+                g,
+                pred,
+                {"home": team_state["injuries"].get(g["home"]["id"], 0), "away": team_state["injuries"].get(g["away"]["id"], 0)},
+                build_run_projection(
+                    run_model_state,
+                    run_line_iso,
+                    g,
+                    (odds or {}).get("total"),
+                    (odds or {}).get("runLine"),
+                    RUN_SIM_TRIALS,
+                    pred["homeWinProb"],
+                    run_margin_cal,
+                ),
+                odds,
+            )
+        )
 
     todays_record = build_todays_record([r for r in calibration_rows if r["date"] == today], today)
 
@@ -764,18 +821,22 @@ def predict_date(date: str, state: dict | None = None) -> int:
     enriched = attach_lineups_as_of(enriched, lineups, batter_log_cache)
 
     # Matchup edges (BvP / platoon / vs-team) for the selected date's real
-    # lineups, mirroring React's predictDate.
-    matchup = enrich_with_matchups(
-        enriched,
-        batter_log_cache,
-        cache.load_bvp_logs(),
-        cache.load_platoon_logs(),
-        cache.load_vs_team_logs(),
-        season,
-    )
+    # lineups, mirroring React's predictDate. Market odds are independent and
+    # I/O-bound, so the two fetch concurrently.
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        f_matchup = pool.submit(
+            enrich_with_matchups,
+            enriched,
+            batter_log_cache,
+            cache.load_bvp_logs(),
+            cache.load_platoon_logs(),
+            cache.load_vs_team_logs(),
+            season,
+        )
+        f_odds = pool.submit(fetch_market_odds)
+        matchup = f_matchup.result()
+        market_odds = f_odds.result()
     enriched = matchup["games"]
-
-    market_odds = fetch_market_odds()
 
     docs = []
     for g in enriched:

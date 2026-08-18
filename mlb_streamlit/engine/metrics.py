@@ -52,6 +52,33 @@ def dot(a: list[float], b: list[float]) -> float:
     return sum(x * y for x, y in zip(a, b))
 
 
+def parallel_map(fn, items, max_workers: int | None = None) -> list:
+    """Apply `fn` over items in threads, preserving input order.
+
+    Deterministic by construction (results come back in input order, so
+    caller tie-breaking and iteration order never change) and safe when each
+    item is independent (no shared mutable state). Falls back to serial for
+    empty/tiny inputs. Threads overlap work that releases the GIL (numpy
+    matmuls / solves); pure-Python work simply serializes under the GIL,
+    which is no slower than a plain loop.
+    """
+    if not items:
+        return []
+    count = len(items)
+    if max_workers is None:
+        max_workers = min(8, count)
+    if max_workers <= 1:
+        return [fn(it) for it in items]
+    from concurrent.futures import ThreadPoolExecutor
+
+    results = [None] * count
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = [ex.submit(fn, it) for it in items]
+        for i, fut in enumerate(futures):
+            results[i] = fut.result()
+    return results
+
+
 def roundn(n: float, digits: int) -> float:
     f = 10.0 ** digits
     return round(n * f) / f

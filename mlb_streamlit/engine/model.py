@@ -41,6 +41,7 @@ from .metrics import (
     logit,
     mean,
     monte_carlo_adjust,
+    parallel_map,
     roundn,
     sigmoid,
     std,
@@ -173,26 +174,34 @@ def build_model_versions(rows: list[dict], as_of_date: str, final_eval: dict) ->
                 "homeField", "spFipDiff", "spEraDiff"],
          "Added injured-list edge, starting-pitcher FIP/ERA and isotonic calibration"),
     ]
-    versions: list[dict] = []
-    for frac, features, note in stages:
+    def fit_stage(args):
+        frac, features, note = args
         end = int(math.floor(n * frac))
         if end < 60:
-            continue
+            return None
         train_end = int(math.floor(end * 0.85))
         train = rows[:train_end]
         test = rows[train_end:end]
         if len(train) < 40 or len(test) < 20:
-            continue
+            return None
         m = train_logistic(train, features)
         preds = [sigmoid(logistic_logit(m, r["features"], None)) for r in test]
         labels = [r["label"] for r in test]
-        versions.append({
-            "version": f"v{len(versions) + 1}.0.0",
+        return {
             "date": rows[end - 1]["game"]["date"] if end - 1 < len(rows) else as_of_date,
             "auc": roundn(compute_auc(preds, labels), 3),
             "brier": roundn(compute_brier(preds, labels), 3),
             "notes": note,
-        })
+        }
+
+    # The three stage fits are independent — run them concurrently (only when
+    # numpy is present; pure-Python fits serialize under the GIL anyway),
+    # then number the surviving stages in order (identical versioning).
+    versions: list[dict] = []
+    for fit in parallel_map(fit_stage, stages, max_workers=len(stages) if np is not None else 1):
+        if fit is None:
+            continue
+        versions.append({"version": f"v{len(versions) + 1}.0.0", **fit})
     versions.append({
         "version": f"v{len(versions) + 1}.0.0",
         "date": as_of_date,
@@ -369,16 +378,31 @@ def run_model(
         while improved and len(selected) > 2 and rounds < max_rounds:
             improved = False
             rounds += 1
-            best_features = selected
-            best_score = current_score
-            best_model = current_model
+            # All drop-one candidates of a round are independent (each starts
+            # from the accepted model's weights), so the fits run concurrently
+            # and the results come back in order — the selection below is
+            # byte-identical to a serial pass.
+            fit_jobs: list[tuple[list[str], list[float]]] = []
             for drop in selected:
                 drop_idx = selected.index(drop)
                 candidate = [f for f in selected if f != drop]
                 w0 = current_model["weights"][:drop_idx] + current_model["weights"][drop_idx + 1:] + [current_model["bias"]]
+                fit_jobs.append((candidate, w0))
+
+            def fit_candidate(args):
+                candidate, w0 = args
                 m = train_logistic(train, candidate, iterations=10, w0=w0)
                 preds = [sigmoid(logistic_logit(m, r["features"], None)) for r in calib]
-                s = score_fn(preds, calib_labels)
+                return candidate, m, score_fn(preds, calib_labels)
+
+            best_features = selected
+            best_score = current_score
+            best_model = current_model
+            # Threads only overlap real work when numpy releases the GIL; in
+            # the pure-Python fallback a pool just adds switching overhead, so
+            # it stays serial there.
+            fit_workers = min(8, max(2, len(fit_jobs))) if np is not None else 1
+            for candidate, m, s in parallel_map(fit_candidate, fit_jobs, max_workers=fit_workers):
                 if s < best_score:
                     best_score = s
                     best_features = candidate

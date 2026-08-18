@@ -1460,20 +1460,30 @@ def enrich_with_matchups(
     # TTL (career numbers barely move day-to-day, so back-to-back refreshes
     # don't re-pull the whole window); season splits refetch for the current
     # season (they change daily) and reuse cached totals for past seasons
-    # (they are complete).
-    new_bvp = fetch_bvp_stats(bvp_pairs, bvp_cache)
-    merged_bvp = {**bvp_cache, **new_bvp}
+    # (they are complete). All six families are I/O-bound statsapi calls, so
+    # they run concurrently (each family keeps its own internal pool).
     cur_platoon = [p for p in platoon_pairs if p["season"] == season]
     past_platoon = [p for p in platoon_pairs if p["season"] != season]
-    new_platoon = fetch_platoon_splits(cur_platoon, {})
-    reused_platoon = fetch_platoon_splits(past_platoon, platoon_cache)
-    merged_platoon = {**platoon_cache, **reused_platoon, **new_platoon}
     cur_vs_team = [p for p in vs_team_pairs if p["season"] == season]
     past_vs_team = [p for p in vs_team_pairs if p["season"] != season]
-    new_vs_team = fetch_vs_team_stats(cur_vs_team, {})
-    reused_vs_team = fetch_vs_team_stats(past_vs_team, vs_team_cache)
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        f_bvp = pool.submit(fetch_bvp_stats, bvp_pairs, bvp_cache)
+        f_plat_cur = pool.submit(fetch_platoon_splits, cur_platoon, {})
+        f_plat_past = pool.submit(fetch_platoon_splits, past_platoon, platoon_cache)
+        f_vst_cur = pool.submit(fetch_vs_team_stats, cur_vs_team, {})
+        f_vst_past = pool.submit(fetch_vs_team_stats, past_vs_team, vs_team_cache)
+        f_hands = pool.submit(fetch_pitcher_hands, pitchers_needing_hand)
+        new_bvp = f_bvp.result()
+        new_platoon = f_plat_cur.result()
+        reused_platoon = f_plat_past.result()
+        new_vs_team = f_vst_cur.result()
+        reused_vs_team = f_vst_past.result()
+        pitcher_hands = f_hands.result()
+
+    merged_bvp = {**bvp_cache, **new_bvp}
+    merged_platoon = {**platoon_cache, **reused_platoon, **new_platoon}
     merged_vs_team = {**vs_team_cache, **reused_vs_team, **new_vs_team}
-    pitcher_hands = fetch_pitcher_hands(pitchers_needing_hand)
 
     return {
         "games": attach_matchups(games, batter_logs, merged_bvp, merged_platoon, merged_vs_team, pitcher_hands),

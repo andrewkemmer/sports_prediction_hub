@@ -748,6 +748,55 @@ def test_automl_pipeline() -> None:
     applied = apply_model(model, row["features"], row["homeElo"], row["awayElo"])
     check("apply_model probability", 0 <= applied["homeWinProb"] <= 1)
 
+    # The parallelized paths (feature selection, CV folds, version fits) must
+    # be deterministic: a second identical run produces byte-identical output.
+    # This catches any thread-ordering race in the parallel helpers.
+    out2 = run_model(games, season="2026", as_of_date="2026-08-15")
+    r2 = out2["result"]
+    check("run_model deterministic across runs (parallel paths)",
+          r2["featureNames"] == result["featureNames"]
+          and r2["auc"] == result["auc"]
+          and r2["brier"] == result["brier"]
+          and r2["modelVersions"] == result["modelVersions"]
+          and r2["crossValidation"] == result["crossValidation"],
+          "parallelized pipeline drifted between identical runs")
+
+
+def test_parallel_refresh() -> None:
+    print("parallel refresh paths")
+    from mlb_streamlit.engine.metrics import parallel_map
+    from mlb_streamlit.engine.model import simulate_runs_batch
+    from mlb_streamlit.refresh import build_run_projection, postprocess_projection
+
+    # 1) parallel_map preserves input order (deterministic) and falls back to
+    #    serial for empty / single-worker inputs.
+    items = list(range(30))
+    check("parallel_map order-preserving",
+          parallel_map(lambda i: i * i, items, max_workers=8) == [i * i for i in items])
+    check("parallel_map empty -> []", parallel_map(lambda i: i, []) == [])
+    check("parallel_map serial fallback",
+          parallel_map(lambda i: i + 1, [1, 2, 3], max_workers=1) == [2, 3, 4])
+
+    # 2) The vectorized batch projection (used for the fresh window) produces
+    #    the same doc shape as the scalar per-game path.
+    rm = {"leagueRuns": 4.5, "teamOffense": {119: 1.1, 108: 0.95},
+          "teamDefense": {119: 0.98, 108: 1.05}, "parkFactor": {119: 1.02, 108: 1.0}}
+    game = {"gamePk": 7, "date": "2026-08-20", "season": "2026",
+            "home": {"id": 119, "name": "Dodgers", "abbrev": "LAD"},
+            "away": {"id": 108, "name": "Angels", "abbrev": "LAA"}}
+    scalar = build_run_projection(rm, [], game, 8.5, None, trials=500, home_win_prob=0.55, run_margin_cal=None)
+    sim = simulate_runs_batch(rm, [119], [108], [8.5], [0.0], 500)[0]
+    batched = postprocess_projection(sim, [], 1.5)
+    keys = ("homeScore", "awayScore", "total", "overProb", "underProb",
+            "homeRunLineProb", "awayRunLineProb")
+    check("scalar projection has all keys", all(k in scalar for k in keys), f"{scalar}")
+    check("batch projection has all keys", all(k in batched for k in keys), f"{batched}")
+    check("batch projection values finite", all(isinstance(batched[k], (int, float)) for k in keys))
+    check("batch projection scores rounded to 2dp",
+          all(batched[k] == round(batched[k], 2) for k in ("homeScore", "awayScore", "total")))
+    check("batch run-line probs sum ~ 1",
+          abs(batched["homeRunLineProb"] + batched["awayRunLineProb"] - 1.0) < 1e-9)
+
 
 def test_data_layer() -> None:
     print("data layer")
@@ -936,6 +985,7 @@ def main() -> int:
     test_data_layer()
     test_market_odds()
     test_automl_pipeline()
+    test_parallel_refresh()
     test_cache_roundtrip()
     print(f"\nAll {_CHECKS} checks passed.")
     return 0
