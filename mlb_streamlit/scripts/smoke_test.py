@@ -293,6 +293,64 @@ def test_backtest_guards() -> None:
     check("matchups allowed 1 day back", refresh._matchups_allowed(add_days(today, -1)))
     check("matchups blocked 30 days back", not refresh._matchups_allowed(add_days(today, -30)))
 
+    # 4. Walk-forward backtest: the per-date model is trained only on games
+    #    strictly before the target, cached, and retrained when those games
+    #    change (fingerprint invalidation). Docs carry a version + as-of mark.
+    from mlb_streamlit.refresh import PREDICTION_VERSION, build_game_doc
+
+    doc = build_game_doc(
+        {"gamePk": 1, "date": "2026-04-01", "gameDate": "2026-04-01T18:00:00Z",
+         "status": "x", "dayNight": "day",
+         "home": {"id": 119}, "away": {"id": 108}, "season": "2026"},
+        {"homeWinProb": 0.5, "awayWinProb": 0.5, "pickTeam": "home", "pickProb": 0.5,
+         "edge": 0.0, "fairHomeOdds": 100, "fairAwayOdds": -120, "shap": []},
+        None, None, None,
+        trained_through="2026-03-31",
+    )
+    check("doc carries prediction version + trainedThrough",
+          doc.get("predictionVersion") == PREDICTION_VERSION
+          and doc.get("trainedThrough") == "2026-03-31", f"{doc.get('predictionVersion')}")
+
+    bt_games = make_games(120, seed=9)
+    for g in bt_games:
+        g["status"] = {"abstractGameState": "Final", "detailedState": "Final"}
+        g["dayNight"] = "day"
+    bt_dates = sorted({g["date"] for g in bt_games})
+    bt_target = bt_dates[len(bt_dates) // 2]
+    tmp2 = tempfile.mkdtemp(prefix="mlb_cache_")
+    old_dir2 = cache.CACHE_DIR
+    cache.CACHE_DIR = Path(tmp2)
+    real_run_model = refresh.run_model
+    calls = {"n": 0}
+
+    def counting_run(*args, **kwargs):
+        calls["n"] += 1
+        return real_run_model(*args, **kwargs)
+
+    refresh.run_model = counting_run
+    try:
+        cache.save_games(bt_games)
+        st1 = refresh._backtest_state(bt_target)
+        check("backtest state built (key/trainedThrough)",
+              st1 is not None and st1.get("key") == "backtest"
+              and st1.get("trainedThrough") == bt_target, f"{bt_target}")
+        check("backtest state trains once", calls["n"] == 1, f"{calls['n']}")
+        st2 = refresh._backtest_state(bt_target)
+        check("backtest state cached (no retrain)",
+              st2 is not None and st2.get("dataFingerprint") == st1.get("dataFingerprint")
+              and st2.get("trainedThrough") == st1.get("trainedThrough")
+              and st2.get("key") == "backtest" and calls["n"] == 1, f"{calls['n']}")
+        games2 = [dict(g) for g in bt_games]
+        games2[0]["home"]["score"] = (games2[0]["home"]["score"] or 0) + 1
+        cache.save_games(games2)
+        refresh._backtest_state(bt_target)
+        check("backtest state retrains when prior games change", calls["n"] == 2, f"{calls['n']}")
+        check("backtest today/future returns None", refresh._backtest_state(today) is None)
+    finally:
+        refresh.run_model = real_run_model
+        cache.CACHE_DIR = old_dir2
+        shutil.rmtree(tmp2, ignore_errors=True)
+
 
 def test_logistic() -> None:
     print("logistic")

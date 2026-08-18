@@ -96,13 +96,17 @@ Any date the user picks in the Games tab is predicted on demand via
   component is enabled only when it measurably reduces calibration-set Brier.
 - **Validation**: 5-fold walk-forward cross-validation reports out-of-sample
   AUC/Brier per fold; final metrics are computed on a held-out test slice.
+  Backtested dates use strict walk-forward: viewing a past date retrains a
+  fresh model on games played strictly before that date (no lookahead, cached
+  per date) and predicts with as-of team state, so historical predictions
+  never see future results.
 - **Monitoring**: per-feature PSI drift, rolling 30-day Brier, and model
   version history are persisted with each training run.
 
 ## Testing
 
 ```bash
-python3 mlb_streamlit/scripts/smoke_test.py          # engine + data pipeline (233 checks)
+python3 mlb_streamlit/scripts/smoke_test.py          # engine + data pipeline (278 checks)
 python3 mlb_streamlit/scripts/ui_render_test.py       # Streamlit UI panels with stubbed streamlit/plotly
 ```
 

@@ -37,6 +37,7 @@ from mlb_streamlit.engine.metrics import (
 )
 from mlb_streamlit.engine.teams import team_meta
 from mlb_streamlit.refresh import (
+    PREDICTION_VERSION,
     SEASON_START,
     load_bundle,
     predict_date,
@@ -444,16 +445,26 @@ def _ensure_games_for_date(bundle) -> None:
     ymd = st.session_state.games_date.isoformat()
     if ymd in st.session_state.requested_dates:
         return
-    if bundle["docs_by_date"].get(ymd) is not None:
+    # Stale docs (written before PREDICTION_VERSION) are re-scored on view —
+    # e.g. backtest dates now get a walk-forward model trained only on games
+    # before that date, instead of the leaked full-season model.
+    cached_docs = bundle["docs_by_date"].get(ymd)
+    if cached_docs and all(d.get("predictionVersion") == PREDICTION_VERSION for d in cached_docs):
         return
     st.session_state.requested_dates.add(ymd)
-    with st.spinner(f"Fetching schedule & predicting {fmt_date_long(ymd)}…"):
-        try:
-            predict_date(ymd, ms)
-        except Exception as e:  # noqa: BLE001
-            st.warning(f"Could not load predictions for {ymd}: {e}")
-            st.session_state.requested_dates.discard(ymd)
-            return
+    progress = st.progress(0, text=f"Building predictions for {fmt_date_long(ymd)}…")
+    try:
+        predict_date(
+            ymd,
+            ms,
+            report=lambda stage, pct, msg: progress.progress(max(0, min(int(pct), 99)), text=msg or stage),
+        )
+    except Exception as e:  # noqa: BLE001
+        st.warning(f"Could not load predictions for {ymd}: {e}")
+        st.session_state.requested_dates.discard(ymd)
+        return
+    finally:
+        progress.empty()
     st.session_state.bundle = load_bundle()
     st.rerun()
 

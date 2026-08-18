@@ -51,6 +51,9 @@ RUN_SIM_TRIALS = 10000
 RUN_CALIB_TRIALS = 500
 MIN_COMPLETED_GAMES = 40
 
+PREDICTION_VERSION = 2  # bump to force re-scoring of previously cached dates
+BACKTEST_STATES_FILE = "backtest_states.json"
+
 SEASON_START = "2022-03-15"  # earliest calibration-range date (UI default)
 
 
@@ -263,6 +266,7 @@ def build_game_doc(
     injuries: dict | None,
     run_projection: dict | None,
     market_odds: dict | None,
+    trained_through: str | None = None,
 ) -> dict:
     # Pitcher/team stats are already attached as-of the game's own date by
     # attach_as_of_stats — never override them with a flat full-season dict.
@@ -293,6 +297,8 @@ def build_game_doc(
         "homeInjuries": injuries["home"] if injuries else None,
         "awayInjuries": injuries["away"] if injuries else None,
         "season": season,
+        "predictionVersion": PREDICTION_VERSION,
+        "trainedThrough": trained_through,
         "weather": game.get("weather"),
         "lineups": game.get("lineups"),
         "lineupStats": game.get("lineupStats"),
@@ -994,6 +1000,92 @@ def run_refresh(
     }
 
 
+def _backtest_state(target: str, report=None) -> dict | None:
+    """Train a model strictly on games played before `target` (walk-forward).
+
+    The stored model is trained on the whole season through today, so scoring
+    a past date with it is an in-sample backtest. This builds — and caches
+    per date — a fresh model using ONLY completed games with date < target,
+    so the prediction reflects exactly what the model could have known then.
+    Returns None for today/future dates or when history is too thin.
+    """
+    def rep(stage, pct, msg):
+        if report:
+            report(stage, pct, msg)
+
+    if target >= et_date_string():
+        return None
+    cached = cache.load_games()
+    prior = [
+        g for g in cached
+        if g.get("winner") in ("home", "away")
+        and (g.get("date") or "") < target
+        and (g.get("home") or {}).get("id") and (g.get("away") or {}).get("id")
+    ]
+    if len(prior) < MIN_COMPLETED_GAMES:
+        return None
+    fingerprint = _data_fingerprint(prior, {})
+
+    states = cache.load_json(BACKTEST_STATES_FILE, {}) or {}
+    existing = states.get(target)
+    if existing and existing.get("dataFingerprint") == fingerprint:
+        return existing
+
+    season = target[:4]
+    rep("Training backtest model", 30, f"Building walk-forward model on {len(prior)} games before {target}…")
+    pitcher_log_cache = cache.load_pitcher_logs()
+    team_log_cache = cache.load_team_logs()
+    enriched = attach_as_of_stats(prior, pitcher_log_cache, team_log_cache)
+    lineups = {}
+    for pk, lu in (cache.load_lineups() or {}).items():
+        if lu:
+            try:
+                lineups[int(pk)] = lu
+            except (TypeError, ValueError):
+                pass
+    batter_log_cache = cache.load_batter_logs()
+    enriched = attach_lineups_as_of(enriched, lineups, batter_log_cache)
+    # No matchup enrichment: current-season platoon/vs-team splits are
+    # season-to-date and would leak post-target games into training features.
+    completed_enriched = [g for g in enriched if g.get("winner") in ("home", "away")]
+    run = run_model(completed_enriched, season, target, cache.load_injury_snapshots())
+    result = run["result"]
+
+    state = {
+        "key": "backtest",
+        "trainedAt": int(_dt.datetime.now().timestamp() * 1000),
+        "trainedThrough": target,
+        "season": season,
+        "asOfDate": target,
+        "gamesTrained": result["gamesTrained"],
+        "holdoutCount": result["holdoutCount"],
+        "selectedModel": result["selectedModel"],
+        "modelDescription": result["modelDescription"],
+        "featureNames": result["featureNames"],
+        "weights": result["weights"],
+        "bias": result["bias"],
+        "featureStats": result["featureStats"],
+        "isotonicPoints": result["isotonicPoints"],
+        "eloHfa": result["eloHfa"],
+        "monteCarloEnabled": result["monteCarloEnabled"],
+        "monteCarloTrials": result["monteCarloTrials"],
+        "monteCarloSigma": result["monteCarloSigma"],
+        "auc": result["auc"],
+        "brier": result["brier"],
+        "logLoss": result["logLoss"],
+        "ece": result["ece"],
+        "powerRankings": result["powerRankings"],
+        "runModel": result["runModel"],
+        "runLineCalibration": result["runLineCalibration"],
+        "runMarginCalibration": result["runMarginCalibration"],
+        "dataFingerprint": fingerprint,
+    }
+    states[target] = state
+    cache.save_json(BACKTEST_STATES_FILE, states)
+    rep("Backtest model ready", 45, f"Walk-forward model trained through {target}.")
+    return state
+
+
 def _team_state_as_of(date: str) -> dict | None:
     """Rebuild elo/form/records/injuries exactly as they were before `date`.
 
@@ -1028,20 +1120,39 @@ def _matchups_allowed(date: str) -> bool:
     return date >= add_days(et_date_string(), -RECENT_WINDOW_DAYS)
 
 
-def predict_date(date: str, state: dict | None = None) -> int:
+def predict_date(date: str, state: dict | None = None, report=None) -> int:
     """On-demand prediction for an arbitrary date in the season (port of
     mlbActions.predictDate). Uses the stored model; fetches only that day.
 
-    Backtest safety: for dates before today the team state (elo / form /
-    records / injuries) is rebuilt strictly from games played before that
-    date, and current-season matchup splits are only attached inside the
-    recent window — no post-date knowledge leaks into a historical pick.
+    Backtest safety: for dates before today, the game is scored by a
+    walk-forward model trained ONLY on games played before that date (see
+    _backtest_state), and current-season matchup splits are only attached
+    inside the recent window — no post-date knowledge leaks into a
+    historical pick.
     """
+    def rep(stage, pct, msg):
+        if report:
+            report(stage, pct, msg)
+
     state = state or cache.load_model_state()
     if not state:
         raise RuntimeError("Model has not been trained yet. Click refresh first.")
+    backtest = date < et_date_string()
+    trained_through = date if backtest else None
+    if backtest:
+        bs = _backtest_state(date, report)
+        if bs is not None:
+            state = bs
+        else:
+            rep("Using stored model", 12, "Too little history before this date — using the current model.")
     model = reconstruct_model(state)
-    team_state = _team_state_as_of(date) or reconstruct_team_state(state.get("powerRankings") or [])
+    if backtest and state.get("key") == "backtest":
+        # The walk-forward model's own power rankings are as-of this date.
+        team_state = reconstruct_team_state(state.get("powerRankings") or [])
+    elif backtest:
+        team_state = _team_state_as_of(date) or reconstruct_team_state(state.get("powerRankings") or [])
+    else:
+        team_state = reconstruct_team_state(state.get("powerRankings") or [])
     run_model_state = state.get("runModel")
     run_line_iso = state.get("runLineCalibration") or []
     run_margin_cal = state.get("runMarginCalibration") or {"slope": 0, "intercept": 0}
@@ -1137,6 +1248,7 @@ def predict_date(date: str, state: dict | None = None) -> int:
                     run_margin_cal,
                 ) if run_model_state else None,
                 odds,
+                trained_through=trained_through,
             )
         )
     # Persist the (possibly grown) log caches so the next refresh is incremental.
