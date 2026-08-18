@@ -33,7 +33,15 @@ ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(ROOT))
 
 from mlb_streamlit import cache  # noqa: E402
-from mlb_streamlit.data import attach_lineups_as_of, lineup_ops  # noqa: E402
+from mlb_streamlit.data import (  # noqa: E402
+    attach_lineups_as_of,
+    attach_matchups,
+    enrich_with_matchups,
+    lineup_ops,
+    matchup_lineup_mean,
+    matchup_ops,
+    matchup_pa,
+)
 from mlb_streamlit.engine.features import (  # noqa: E402
     FEATURE_KEYS,
     build_features_for_game,
@@ -344,6 +352,191 @@ def test_lineups() -> None:
         if p.exists():
             os.remove(p)
 
+
+def test_matchups() -> None:
+    print("matchups (BvP / platoon / vs-team)")
+    import mlb_streamlit.data as data
+    from mlb_streamlit.engine.features import build_features_for_game
+
+    # 1. Feature registration: the three matchup edges are part of the
+    #    candidate set and flow through Auto-ML selection.
+    from mlb_streamlit.engine.features import FEATURE_LABELS
+
+    for f in ("bvpOpsDiff", "platoonOpsDiff", "vsTeamOpsDiff"):
+        check(f"feature key registered: {f}", f in FEATURE_KEYS)
+        check(f"feature label present: {f}", f in FEATURE_LABELS)
+
+    # 2. statsapi stat-block parsing (OPS direct + OBP/SLG fallback + PA fallback).
+    check("matchup_ops direct", matchup_ops({"ops": "0.850", "obp": ".320", "slg": ".420"}) == 0.85)
+    check("matchup_ops obp+slg fallback", matchup_ops({"ops": ".000", "obp": ".300", "slg": ".400"}) == 0.7)
+    check("matchup_ops none", matchup_ops({"ops": ".000", "obp": ".000", "slg": ".000"}) is None)
+    check("matchup_pa direct", matchup_pa({"plateAppearances": "41", "atBats": 40}) == 41.0)
+    check("matchup_pa fallback", matchup_pa({"atBats": 40, "baseOnBalls": 5, "hitByPitch": 1, "sacFlies": 2}) == 48.0)
+
+    # 3. matchup_lineup_mean: slots 1-4 double-weighted; PA saturation caps the
+    #    influence of tiny BvP samples (pa 0 rows are excluded entirely).
+    lu = [{"bvpOPS": 0.8}, {"bvpOPS": 0.4}, {"bvpOPS": 0.4}, {"bvpOPS": 0.4}, {"bvpOPS": 0.4}]
+    exp = (2 * (0.8 + 0.4 + 0.4 + 0.4) + 0.4) / 9
+    check("matchup_lineup_mean top-4 double-weighted",
+          abs(matchup_lineup_mean(lu, "bvpOPS") - round(exp, 3)) < 1e-9, f"{matchup_lineup_mean(lu, 'bvpOPS')}")
+    sat = [{"bvpOPS": 0.9, "bvpPA": 1000}, {"bvpOPS": 0.5, "bvpPA": 0}]
+    check("matchup_lineup_mean PA saturation", matchup_lineup_mean(sat, "bvpOPS", "bvpPA") == 0.9,
+          f"{matchup_lineup_mean(sat, 'bvpOPS', 'bvpPA')}")
+    check("matchup_lineup_mean empty = 0", matchup_lineup_mean([], "bvpOPS") == 0.0)
+
+    # 4. attach_matchups gating + shrinkage.
+    #    Home batter 11 vs away RHP 902: BvP 5 PA @ 1.000 OPS, shrunk toward
+    #    season OPS 0.700 -> (5 + 15*0.7) / 20 = 0.775. Platoon uses the
+    #    starter's hand (vsRight). vsTeam targets the opposing team (108).
+    lineup = {
+        "home": {"battingOrder": [{"id": 11, "name": "H1"}, {"id": 12, "name": "H2"}], "bench": []},
+        "away": {"battingOrder": [{"id": 21, "name": "A1"}, {"id": 22, "name": "A2"}], "bench": []},
+    }
+    game = {
+        "gamePk": 1,
+        "date": "2026-06-01",
+        "season": "2026",
+        "home": {"id": 119, "name": "Dodgers", "abbrev": "LAD"},
+        "away": {"id": 108, "name": "Angels", "abbrev": "LAA"},
+        "homePitcher": {"id": 901, "name": "P1", "pitchHand": "L"},
+        "awayPitcher": {"id": 902, "name": "P2", "pitchHand": "R"},
+        "lineups": lineup,
+        "lineupStats": {"home": {"known": True, "ops": 0.8}, "away": {"known": True, "ops": 0.7}},
+    }
+    season_log = {"d": "2026-05-01", "ab": 10, "h": 3, "bb": 0, "ibb": 0, "hbp": 0, "sf": 0,
+                  "tb": 4, "2b": 1, "3b": 0, "hr": 0}  # OPS 0.300 + 0.400 = 0.700
+    batter_logs = {f"{pid}|2026": [season_log] for pid in (11, 12, 21, 22)}
+    bvp_cache = {"11|902": {"pa": 5, "ops": 1.0}}
+    platoon_cache = {"11|2026": {"vsLeft": {"pa": 30, "ops": 0.600}, "vsRight": {"pa": 40, "ops": 0.850}}}
+    vs_team_cache = {"11|108|2026": {"pa": 40, "ops": 0.900}}
+    attached = attach_matchups([game], batter_logs, bvp_cache, platoon_cache, vs_team_cache, {})[0]
+    home_stats = attached["lineupStats"]["home"]
+    away_stats = attached["lineupStats"]["away"]
+    check("bvpOPS shrunk toward season OPS", home_stats["bvpOps"] == 0.775, f"{home_stats['bvpOps']}")
+    check("platoon picks starter's hand (vsRight)", home_stats["platoonOps"] == 0.85, f"{home_stats['platoonOps']}")
+    check("vsTeam targets opposing team", home_stats["vsTeamOps"] == 0.9, f"{home_stats['vsTeamOps']}")
+    check("bvpPA summed across order", home_stats["bvpPA"] == 5.0, f"{home_stats['bvpPA']}")
+    check("away side has no matchup data -> 0",
+          away_stats["bvpOps"] == 0.0 and away_stats["platoonOps"] == 0.0 and away_stats["vsTeamOps"] == 0.0,
+          f"{away_stats}")
+    check("per-batter matchup keys attached",
+          attached["lineups"]["home"]["battingOrder"][0]["bvpOPS"] == 0.775
+          and attached["lineups"]["home"]["battingOrder"][0]["platoonOPS"] == 0.85
+          and attached["lineups"]["home"]["battingOrder"][0]["vsTeamOPS"] == 0.9
+          and attached["lineups"]["home"]["battingOrder"][0]["bvpPA"] == 5.0)
+    feats = build_features_for_game(attached, new_state())
+    check("bvpOpsDiff = home - away", feats["bvpOpsDiff"] == 0.775, f"{feats['bvpOpsDiff']}")
+    check("platoonOpsDiff = home - away", feats["platoonOpsDiff"] == 0.85, f"{feats['platoonOpsDiff']}")
+    check("vsTeamOpsDiff = home - away", feats["vsTeamOpsDiff"] == 0.9, f"{feats['vsTeamOpsDiff']}")
+
+    # No opposing starter known -> BvP / platoon stay 0 (vsTeam still works).
+    no_starter = {
+        **game,
+        "homePitcher": None,
+        "awayPitcher": None,
+        "lineups": lineup,
+        "lineupStats": {"home": {"known": True, "ops": 0.8}, "away": {"known": True, "ops": 0.7}},
+    }
+    ns = attach_matchups([no_starter], batter_logs, bvp_cache, platoon_cache, vs_team_cache, {})[0]
+    check("no starter -> bvp/platoon 0, vsTeam intact",
+          ns["lineupStats"]["home"]["bvpOps"] == 0.0
+          and ns["lineupStats"]["home"]["platoonOps"] == 0.0
+          and ns["lineupStats"]["home"]["vsTeamOps"] == 0.9)
+
+    # No real boxscore lineup -> game passes through untouched (fresh-window
+    # gating: older history never gets junk matchup values).
+    bare = {"gamePk": 2, "date": "2026-03-20", "season": "2026",
+            "home": {"id": 119}, "away": {"id": 108}}
+    passthrough = attach_matchups([bare], batter_logs, bvp_cache, platoon_cache, vs_team_cache, {})[0]
+    check("no lineup -> passthrough", passthrough == bare)
+    no_ls_src = {k: v for k, v in game.items() if k != "lineupStats"}
+    no_ls = attach_matchups([no_ls_src], batter_logs, bvp_cache, platoon_cache, vs_team_cache, {})[0]
+    check("lineup without lineupStats -> lineups attached only",
+          no_ls.get("lineupStats") is None and no_ls["lineups"]["home"]["battingOrder"][0].get("bvpOPS") == 0.775)
+
+    # 5. enrich_with_matchups: pair gathering + per-season caching, offline.
+    calls = {"bvp": [], "platoon": [], "vs": [], "hands": []}
+    orig = (data.fetch_bvp_stats, data.fetch_platoon_splits, data.fetch_vs_team_stats, data.fetch_pitcher_hands)
+
+    def fake_bvp(pairs, cached=None):
+        calls["bvp"].append(pairs)
+        return {"11|902": {"pa": 5, "ops": 1.0}}
+
+    def fake_platoon(pairs, cached=None):
+        calls["platoon"].append((pairs, cached))
+        return {"11|2026": {"vsRight": {"pa": 40, "ops": 0.850}}}
+
+    def fake_vs(pairs, cached=None):
+        calls["vs"].append(pairs)
+        return {"11|108|2026": {"pa": 40, "ops": 0.900}}
+
+    def fake_hands(ids):
+        calls["hands"].append(ids)
+        return {}
+
+    data.fetch_bvp_stats = fake_bvp
+    data.fetch_platoon_splits = fake_platoon
+    data.fetch_vs_team_stats = fake_vs
+    data.fetch_pitcher_hands = fake_hands
+    try:
+        result = enrich_with_matchups([game], batter_logs, {}, {}, {}, "2026")
+    finally:
+        (data.fetch_bvp_stats, data.fetch_platoon_splits, data.fetch_vs_team_stats,
+         data.fetch_pitcher_hands) = orig
+    check("bvp pairs = each batter vs opposing starter", len(calls["bvp"][0]) == 4, f"{calls['bvp'][0]}")
+    check("platoon pairs = each batter", len(calls["platoon"][0][0]) == 4)
+    check("vs-team pairs = each batter vs opposing team", len(calls["vs"][0]) == 4)
+    check("no hand fetch when starters carry pitchHand", calls["hands"] == [[]],
+          f"{calls['hands']}")
+    check("enrich merges fetched caches", result["bvpLogs"]["11|902"] == {"pa": 5, "ops": 1.0}
+          and result["platoonLogs"]["11|2026"]["vsRight"]["ops"] == 0.85
+          and result["vsTeamLogs"]["11|108|2026"]["ops"] == 0.9)
+    check("enrich attaches games", result["games"][0]["lineupStats"]["home"]["bvpOps"] == 0.775)
+
+    # Past-season splits are reused from the cache (cached= passed through);
+    # current-season splits always refetch (cached={}).
+    past = {"gamePk": 3, "date": "2025-06-01", "season": "2025",
+            "home": {"id": 119}, "away": {"id": 108},
+            "homePitcher": {"id": 901, "pitchHand": "L"},
+            "awayPitcher": {"id": 902, "pitchHand": "R"},
+            "lineups": lineup,
+            "lineupStats": {"home": {"known": True, "ops": 0.8}, "away": {"known": True, "ops": 0.7}}}
+    calls = {"bvp": [], "platoon": [], "vs": [], "hands": []}
+    data.fetch_platoon_splits = fake_platoon
+    data.fetch_vs_team_stats = fake_vs
+    data.fetch_bvp_stats = fake_bvp
+    data.fetch_pitcher_hands = fake_hands
+    try:
+        enrich_with_matchups([past], batter_logs, {}, {"11|2025": {"vsRight": {"pa": 9, "ops": 0.9}}}, {}, "2026")
+    finally:
+        data.fetch_platoon_splits = orig[1]
+        data.fetch_vs_team_stats = orig[2]
+        data.fetch_bvp_stats = orig[0]
+        data.fetch_pitcher_hands = orig[3]
+    cached_args = [c for c in calls["platoon"] if c[1] == {"11|2025": {"vsRight": {"pa": 9, "ops": 0.9}}}]
+    fresh_args = [c for c in calls["platoon"] if c[1] == {}]
+    check("past-season splits reuse cache (pairs passed through)",
+          len(cached_args) == 1 and len(cached_args[0][0]) == 4,
+          f"platoon calls={calls['platoon']}")
+    check("current-season splits refetch (cached={})",
+          len(fresh_args) == 1 and fresh_args[0][0] == [],
+          f"platoon calls={calls['platoon']}")
+
+    # 6. pitcher-hand fallback fetch when the schedule hydrate omits the hand.
+    no_hand = {"gamePk": 4, "date": "2026-06-02", "season": "2026",
+               "home": {"id": 119}, "away": {"id": 108},
+               "homePitcher": {"id": 901}, "awayPitcher": {"id": 902},
+               "lineups": lineup,
+               "lineupStats": {"home": {"known": True, "ops": 0.8}, "away": {"known": True, "ops": 0.7}}}
+    calls = {"bvp": [], "platoon": [], "vs": [], "hands": []}
+    data.fetch_pitcher_hands = fake_hands
+    try:
+        enrich_with_matchups([no_hand], batter_logs, {}, {}, {}, "2026")
+    finally:
+        data.fetch_pitcher_hands = orig[3]
+    check("starters without hand trigger fetch",
+          calls["hands"] == [[902, 901]] or calls["hands"] == [[901, 902]],
+          f"{calls['hands']}")
 
 def test_as_of_stats() -> None:
     print("as-of-date stats")
@@ -695,6 +888,7 @@ def main() -> int:
     test_logistic()
     test_features_and_elo()
     test_lineups()
+    test_matchups()
     test_as_of_stats()
     test_runs_model()
     test_data_layer()

@@ -22,6 +22,10 @@ _PLAYER_OPS = "player_ops.json"
 _PITCHER_LOGS = "pitcher_game_logs.json"
 _TEAM_LOGS = "team_game_logs.json"
 _BATTER_LOGS = "batter_game_logs.json"
+_BVP_LOGS = "bvp_logs.json"
+_PLATOON_LOGS = "platoon_logs.json"
+_VS_TEAM_LOGS = "vs_team_logs.json"
+_PITCHER_HANDS = "pitcher_hands.json"
 _LINEUPS = "lineups.json"
 _INJURIES = "injury_snapshots.json"
 _DOCS_BY_DATE = "docs_by_date.json"
@@ -132,6 +136,42 @@ def load_batter_logs() -> dict:
 
 def save_batter_logs(stats: dict) -> None:
     save_json(_BATTER_LOGS, stats)
+
+
+def load_bvp_logs() -> dict:
+    """{batterId|pitcherId} -> career BvP {"pa", "ops"}."""
+    return load_json(_BVP_LOGS, {}) or {}
+
+
+def save_bvp_logs(logs: dict) -> None:
+    save_json(_BVP_LOGS, logs)
+
+
+def load_platoon_logs() -> dict:
+    """{batterId|season} -> {"vsLeft": {"pa", "ops"}, "vsRight": {"pa", "ops"}}."""
+    return load_json(_PLATOON_LOGS, {}) or {}
+
+
+def save_platoon_logs(logs: dict) -> None:
+    save_json(_PLATOON_LOGS, logs)
+
+
+def load_vs_team_logs() -> dict:
+    """{batterId|teamId|season} -> season {"pa", "ops"} vs that team."""
+    return load_json(_VS_TEAM_LOGS, {}) or {}
+
+
+def save_vs_team_logs(logs: dict) -> None:
+    save_json(_VS_TEAM_LOGS, logs)
+
+
+def load_pitcher_hands() -> dict:
+    """{pitcherId} -> "L" | "R" (throwing hand for platoon features)."""
+    return load_json(_PITCHER_HANDS, {}) or {}
+
+
+def save_pitcher_hands(hands: dict) -> None:
+    save_json(_PITCHER_HANDS, hands)
 
 
 def load_lineups() -> dict:

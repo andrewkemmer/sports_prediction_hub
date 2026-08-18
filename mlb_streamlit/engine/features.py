@@ -14,7 +14,7 @@ from .metrics import clamp
 ELO_INIT = 1500.0
 ELO_HFA_UPDATE = 30.0  # home advantage baked into Elo updates only
 
-# Canonical feature order (24 features). Every feature is computed as-of the
+# Canonical feature order (27 features). Every feature is computed as-of the
 # game's own date (no lookahead) and flows into the ML candidate set; greedy
 # backward elimination decides which ones the final model actually uses.
 FEATURE_KEYS = [
@@ -37,6 +37,9 @@ FEATURE_KEYS = [
     "lineupWobaDiff",
     "lineupIsoDiff",
     "lineupHotDiff",
+    "bvpOpsDiff",
+    "platoonOpsDiff",
+    "vsTeamOpsDiff",
     "spK9Diff",
     "spWhipDiff",
     "spRecentDiff",
@@ -64,6 +67,9 @@ FEATURE_LABELS = {
     "lineupWobaDiff": "Starting-9 wOBA edge",
     "lineupIsoDiff": "Starting-9 ISO edge",
     "lineupHotDiff": "Starting-9 hot streak (L10 OPS)",
+    "bvpOpsDiff": "Batter vs. Pitcher (BvP) edge",
+    "platoonOpsDiff": "Platoon split edge (vs starter's hand)",
+    "vsTeamOpsDiff": "Batter vs. team split edge",
     "spK9Diff": "Starting Pitcher K/9 Delta",
     "spWhipDiff": "Starting Pitcher WHIP Delta",
     "spRecentDiff": "Starting Pitcher last-3-start ERA Delta",
@@ -191,6 +197,13 @@ def build_features(game: dict, state: dict) -> dict:
         "lineupWobaDiff": _edge((lineup_home or {}).get("woba"), (lineup_away or {}).get("woba")),
         "lineupIsoDiff": _edge((lineup_home or {}).get("iso"), (lineup_away or {}).get("iso")),
         "lineupHotDiff": _edge((lineup_home or {}).get("recentOps"), (lineup_away or {}).get("recentOps")),
+        # Matchup edges: career BvP OPS, season platoon OPS vs the starter's
+        # throwing hand, season OPS vs the opposing team — PA-saturated,
+        # slot-weighted means over the real starting 9 (0 + lineupKnown = 0
+        # when no boxscore lineup / opposing starter is known).
+        "bvpOpsDiff": _edge((lineup_home or {}).get("bvpOps"), (lineup_away or {}).get("bvpOps")),
+        "platoonOpsDiff": _edge((lineup_home or {}).get("platoonOps"), (lineup_away or {}).get("platoonOps")),
+        "vsTeamOpsDiff": _edge((lineup_home or {}).get("vsTeamOps"), (lineup_away or {}).get("vsTeamOps")),
         "spK9Diff": _edge((game.get("homePitcher") or {}).get("k9"), (game.get("awayPitcher") or {}).get("k9")),
         "spWhipDiff": _edge((game.get("homePitcher") or {}).get("whip"), (game.get("awayPitcher") or {}).get("whip"), True),
         "spRecentDiff": _edge((game.get("homePitcher") or {}).get("recentEra"), (game.get("awayPitcher") or {}).get("recentEra"), True),

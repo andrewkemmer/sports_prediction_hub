@@ -184,10 +184,20 @@ def parse_game(g: dict) -> dict | None:
         return rec
 
     def pitcher(side: dict) -> dict | None:
+        """Probable starter, keeping the throwing hand for platoon features."""
         pp = side.get("probablePitcher")
         if not pp or not pp.get("id"):
             return None
-        return {"id": pp["id"], "name": pp.get("fullName") or ""}
+        out = {"id": pp["id"], "name": pp.get("fullName") or ""}
+        code = ((pp.get("pitchHand") or {})).get("code") or ""
+        desc = ((pp.get("pitchHand") or {})).get("description") or ""
+        if code in ("L", "R"):
+            out["pitchHand"] = code
+        elif desc[:1].upper() == "L":
+            out["pitchHand"] = "L"
+        elif desc[:1].upper() == "R":
+            out["pitchHand"] = "R"
+        return out
 
     status = (g.get("status") or {}).get("abstractGameState") or "Scheduled"
     return {
@@ -1063,6 +1073,387 @@ def attach_lineups_as_of(games: list[dict], lineups: dict, batter_logs: dict) ->
             },
         })
     return out
+
+
+# ---------------------------------------------------------------------------
+# Batter-vs-pitcher matchups + platoon splits (vsPlayer / statSplits / vsTeam)
+#
+# Port of enrichWithMatchups / attachMatchups from src/convex/mlbActions.ts.
+# The three matchup edges (career BvP OPS, season OPS vs the starter's throwing
+# hand, season OPS vs the opposing team) only populate where a real boxscore
+# lineup AND the opposing starter are both known — the same fresh-window
+# pattern the lineup-strength features use, so there is no lookahead and no
+# junk values on older history.
+# ---------------------------------------------------------------------------
+
+SHRINK_PA = 15  # BvP PA count that pulls the blend halfway to season OPS
+
+
+def matchup_ops(stat) -> float | None:
+    """OPS from a statsapi hitting `stat` block (falls back to OBP + SLG)."""
+    if not stat:
+        return None
+    ops = stat_number(stat.get("ops"))
+    if ops is not None and ops > 0:
+        return round(ops, 3)
+    obp = stat_number(stat.get("obp"))
+    slg = stat_number(stat.get("slg"))
+    if (obp or 0) + (slg or 0) > 0:
+        return round((obp or 0) + (slg or 0), 3)
+    return None
+
+
+def matchup_pa(stat) -> float:
+    """Plate appearances from a statsapi hitting `stat` block."""
+    if not stat:
+        return 0.0
+    pa = stat_number(stat.get("plateAppearances"))
+    if pa is not None and pa > 0:
+        return pa
+    return (
+        (stat_number(stat.get("atBats")) or 0)
+        + (stat_number(stat.get("baseOnBalls")) or 0)
+        + (stat_number(stat.get("hitByPitch")) or 0)
+        + (stat_number(stat.get("sacFlies")) or 0)
+    )
+
+
+def fetch_bvp_stats(pairs: list[dict], cached: dict | None = None) -> dict:
+    """Career batter-vs-pitcher totals (`stats=vsPlayer`, no season -> career).
+
+    {batterId|pitcherId} -> {"pa", "ops"}; skips keys already in `cached`.
+    """
+    cached = cached or {}
+    seen: set[str] = set()
+    unique = []
+    for p in pairs:
+        key = f"{p['batterId']}|{p['pitcherId']}"
+        if p["batterId"] <= 0 or p["pitcherId"] <= 0 or key in seen or key in cached:
+            continue
+        seen.add(key)
+        unique.append(p)
+    out: dict = {}
+
+    def fetch(p):
+        key = f"{p['batterId']}|{p['pitcherId']}"
+        try:
+            data = fetch_json(
+                f"{MLB_BASE}/api/v1/people/{p['batterId']}/stats?stats=vsPlayer"
+                f"&opposingPlayerId={p['pitcherId']}&group=hitting"
+            )
+            stat = (((data.get("stats") or [{}])[0]).get("splits") or [{}])[0].get("stat")
+            ops = matchup_ops(stat)
+            pa = matchup_pa(stat)
+            if ops is not None and pa > 0:
+                out[key] = {"pa": pa, "ops": ops}
+        except Exception:  # noqa: BLE001 — individual matchups are non-fatal
+            pass
+
+    map_limit(unique, 20, fetch)
+    return out
+
+
+def fetch_platoon_splits(pairs: list[dict], cached: dict | None = None) -> dict:
+    """Season platoon splits (`stats=statSplits&sitCodes=vl,vr`).
+
+    {id|season} -> {"vsLeft": {"pa", "ops"}, "vsRight": {"pa", "ops"}}.
+    """
+    cached = cached or {}
+    seen: set[str] = set()
+    unique = []
+    for p in pairs:
+        key = f"{p['id']}|{p['season']}"
+        if p["id"] <= 0 or key in seen or key in cached:
+            continue
+        seen.add(key)
+        unique.append(p)
+    out: dict = {}
+
+    def fetch(p):
+        key = f"{p['id']}|{p['season']}"
+        try:
+            data = fetch_json(
+                f"{MLB_BASE}/api/v1/people/{p['id']}/stats?stats=statSplits"
+                f"&sitCodes=vl,vr&group=hitting&season={p['season']}"
+            )
+            entry: dict = {}
+            for s in (((data.get("stats") or [{}])[0]).get("splits") or []):
+                code = ((s.get("split") or {})).get("sitCode") or ""
+                ops = matchup_ops(s.get("stat"))
+                pa = matchup_pa(s.get("stat"))
+                if ops is None or pa <= 0:
+                    continue
+                stat = {"pa": pa, "ops": ops}
+                if code == "vl":
+                    entry["vsLeft"] = stat
+                elif code == "vr":
+                    entry["vsRight"] = stat
+            if entry.get("vsLeft") or entry.get("vsRight"):
+                out[key] = entry
+        except Exception:  # noqa: BLE001 — individual batters are non-fatal
+            pass
+
+    map_limit(unique, 20, fetch)
+    return out
+
+
+def fetch_vs_team_stats(pairs: list[dict], cached: dict | None = None) -> dict:
+    """Season batter-vs-team totals (`stats=vsTeam`).
+
+    {batterId|teamId|season} -> {"pa", "ops"}.
+    """
+    cached = cached or {}
+    seen: set[str] = set()
+    unique = []
+    for p in pairs:
+        key = f"{p['batterId']}|{p['teamId']}|{p['season']}"
+        if p["batterId"] <= 0 or p["teamId"] <= 0 or key in seen or key in cached:
+            continue
+        seen.add(key)
+        unique.append(p)
+    out: dict = {}
+
+    def fetch(p):
+        key = f"{p['batterId']}|{p['teamId']}|{p['season']}"
+        try:
+            data = fetch_json(
+                f"{MLB_BASE}/api/v1/people/{p['batterId']}/stats?stats=vsTeam"
+                f"&opposingTeamId={p['teamId']}&group=hitting&season={p['season']}"
+            )
+            stat = (((data.get("stats") or [{}])[0]).get("splits") or [{}])[0].get("stat")
+            ops = matchup_ops(stat)
+            pa = matchup_pa(stat)
+            if ops is not None and pa > 0:
+                out[key] = {"pa": pa, "ops": ops}
+        except Exception:  # noqa: BLE001 — individual matchups are non-fatal
+            pass
+
+    map_limit(unique, 20, fetch)
+    return out
+
+
+def fetch_pitcher_hands(ids: list[int]) -> dict:
+    """Throwing hand for starters the schedule hydrate didn't include."""
+    out: dict = {}
+    unique = sorted({pid for pid in ids if pid > 0})
+    if not unique:
+        return out
+
+    def fetch(pid):
+        try:
+            data = fetch_json(f"{MLB_BASE}/api/v1/people/{pid}")
+            person = (data.get("people") or [{}])[0]
+            code = ((person.get("pitchHand") or {})).get("code") or ""
+            desc = ((person.get("pitchHand") or {})).get("description") or ""
+            if code in ("L", "R"):
+                out[pid] = code
+            elif desc[:1].upper() == "L":
+                out[pid] = "L"
+            elif desc[:1].upper() == "R":
+                out[pid] = "R"
+        except Exception:  # noqa: BLE001 — non-fatal
+            pass
+
+    map_limit(unique, 12, fetch)
+    return out
+
+
+def matchup_lineup_mean(lineup: list[dict] | None, key: str, pa_key: str | None = None) -> float:
+    """Slot-weighted mean (slots 1-4 double) of a matchup stat across the
+    starting 9, with PA saturation so tiny BvP samples can't dominate.
+    Returns 0 when no batter in the order has data (the model reads
+    0 + lineupKnown = "no matchup data")."""
+    if not lineup:
+        return 0.0
+    total = 0.0
+    w = 0
+    for i, p in enumerate(lineup):
+        v = p.get(key)
+        if not isinstance(v, (int, float)):
+            continue
+        weight = 2 if i < 4 else 1
+        if pa_key:
+            pa = p.get(pa_key) or 0
+            weight *= min(1.0, pa / 20)
+        total += v * weight
+        w += weight
+    return round(total / w, 3) if w > 0 else 0.0
+
+
+def lineup_matchup_pa(lineup: list[dict] | None) -> float:
+    """Total career PA in the BvP matchup across the starting 9 (display only)."""
+    if not lineup:
+        return 0.0
+    return sum((p.get("bvpPA") or 0) for p in lineup)
+
+
+def attach_matchups(
+    games: list[dict],
+    batter_logs: dict,
+    bvp_cache: dict,
+    platoon_cache: dict,
+    vs_team_cache: dict,
+    pitcher_hands: dict,
+) -> list[dict]:
+    """Attach batter-vs-pitcher (career vsPlayer), platoon (vs the starter's
+    handedness) and batter-vs-team splits to games that have a real boxscore
+    lineup. BvP OPS is shrunk toward the batter's as-of season OPS (empirical-
+    Bayes style) so a handful of plate appearances can't dominate; the lineup
+    edge is the PA-saturated, slot-weighted mean over the starting 9."""
+    out = []
+    for g in games:
+        lu = g.get("lineups")
+        if not lu:
+            out.append(g)
+            continue
+        season = g.get("season") or ""
+        ymd = g.get("date") or ""
+
+        def map_batter(p, starter, opp_team_id):
+            season_ops = batter_ops_as_of(batter_logs.get(f"{p['id']}|{season}"), ymd)
+            bvp = bvp_cache.get(f"{p['id']}|{starter['id']}") if starter and starter.get("id") else None
+            bvp_ops = None
+            bvp_pa = None
+            if bvp and bvp.get("pa", 0) > 0:
+                bvp_pa = bvp["pa"]
+                if isinstance(season_ops, (int, float)):
+                    bvp_ops = (bvp["ops"] * bvp["pa"] + season_ops * SHRINK_PA) / (bvp["pa"] + SHRINK_PA)
+                else:
+                    bvp_ops = bvp["ops"]
+                bvp_ops = round(bvp_ops, 3)
+            hand = (starter or {}).get("pitchHand") if starter else None
+            if not hand and starter and starter.get("id"):
+                hand = pitcher_hands.get(starter["id"])
+            platoon = platoon_cache.get(f"{p['id']}|{season}") or {}
+            platoon_ops = None
+            if hand == "L":
+                platoon_ops = (platoon.get("vsLeft") or {}).get("ops")
+            elif hand == "R":
+                platoon_ops = (platoon.get("vsRight") or {}).get("ops")
+            if platoon_ops is not None:
+                platoon_ops = round(platoon_ops, 3)
+            vs_team = vs_team_cache.get(f"{p['id']}|{opp_team_id}|{season}") or {}
+            vs_team_ops = vs_team.get("ops")
+            if vs_team_ops is not None:
+                vs_team_ops = round(vs_team_ops, 3)
+            return {
+                **p,
+                "bvpOPS": bvp_ops,
+                "bvpPA": bvp_pa,
+                "platoonOPS": platoon_ops,
+                "vsTeamOPS": vs_team_ops,
+            }
+
+        def with_matchup(side, starter, opp_team_id):
+            if not side:
+                return side
+            return {
+                "battingOrder": [map_batter(p, starter, opp_team_id) for p in side["battingOrder"]],
+                "bench": [map_batter(p, starter, opp_team_id) for p in side["bench"]],
+            }
+
+        home = with_matchup(lu.get("home"), g.get("awayPitcher"), (g.get("away") or {}).get("id"))
+        away = with_matchup(lu.get("away"), g.get("homePitcher"), (g.get("home") or {}).get("id"))
+        if not g.get("lineupStats"):
+            out.append({**g, "lineups": {"home": home, "away": away}})
+            continue
+
+        def extend(side_stats, batters):
+            return {
+                **side_stats,
+                "bvpOps": matchup_lineup_mean(batters, "bvpOPS", "bvpPA"),
+                "bvpPA": lineup_matchup_pa(batters),
+                "platoonOps": matchup_lineup_mean(batters, "platoonOPS"),
+                "vsTeamOps": matchup_lineup_mean(batters, "vsTeamOPS"),
+            }
+
+        out.append({
+            **g,
+            "lineups": {"home": home, "away": away},
+            "lineupStats": {
+                "home": extend(g["lineupStats"].get("home") or {}, (home or {}).get("battingOrder")),
+                "away": extend(g["lineupStats"].get("away") or {}, (away or {}).get("battingOrder")),
+            },
+        })
+    return out
+
+
+def enrich_with_matchups(
+    games: list[dict],
+    batter_logs: dict,
+    bvp_cache: dict,
+    platoon_cache: dict,
+    vs_team_cache: dict,
+    season: str,
+) -> dict:
+    """Gather the matchup pairs implied by the games' real lineups, fetch the
+    missing statsapi data (career BvP always refetched; current-season splits
+    refetched, past-season totals reused from the cache) and attach everything.
+
+    Returns {"games", "bvpLogs", "platoonLogs", "vsTeamLogs", "pitcherHands"}.
+    """
+    bvp_pairs: list[dict] = []
+    platoon_pairs: list[dict] = []
+    vs_team_pairs: list[dict] = []
+    pitchers_needing_hand: list[int] = []
+    seen_bvp: set[str] = set()
+    seen_platoon: set[str] = set()
+    seen_vs_team: set[str] = set()
+    seen_hand: set[int] = set()
+    for g in games:
+        lu = g.get("lineups")
+        if not lu:
+            continue
+        s = g.get("season") or season
+        matchups = [
+            ((lu.get("home") or {}).get("battingOrder"), g.get("awayPitcher"), (g.get("away") or {}).get("id")),
+            ((lu.get("away") or {}).get("battingOrder"), g.get("homePitcher"), (g.get("home") or {}).get("id")),
+        ]
+        for batters, starter, opp_team_id in matchups:
+            if not batters:
+                continue
+            for p in batters:
+                if starter and starter.get("id"):
+                    b_key = f"{p['id']}|{starter['id']}"
+                    if b_key not in seen_bvp:
+                        seen_bvp.add(b_key)
+                        bvp_pairs.append({"batterId": p["id"], "pitcherId": starter["id"]})
+                    if not starter.get("pitchHand") and starter["id"] not in seen_hand:
+                        seen_hand.add(starter["id"])
+                        pitchers_needing_hand.append(starter["id"])
+                p_key = f"{p['id']}|{s}"
+                if p_key not in seen_platoon:
+                    seen_platoon.add(p_key)
+                    platoon_pairs.append({"id": p["id"], "season": s})
+                v_key = f"{p['id']}|{opp_team_id}|{s}"
+                if v_key not in seen_vs_team:
+                    seen_vs_team.add(v_key)
+                    vs_team_pairs.append({"batterId": p["id"], "teamId": opp_team_id, "season": s})
+
+    # Career BvP is always refetched for the window so repeat matchups stay
+    # fresh; season splits refetch for the current season (they change daily)
+    # and reuse cached totals for past seasons (they are complete).
+    new_bvp = fetch_bvp_stats(bvp_pairs, {})
+    merged_bvp = {**bvp_cache, **new_bvp}
+    cur_platoon = [p for p in platoon_pairs if p["season"] == season]
+    past_platoon = [p for p in platoon_pairs if p["season"] != season]
+    new_platoon = fetch_platoon_splits(cur_platoon, {})
+    reused_platoon = fetch_platoon_splits(past_platoon, platoon_cache)
+    merged_platoon = {**platoon_cache, **reused_platoon, **new_platoon}
+    cur_vs_team = [p for p in vs_team_pairs if p["season"] == season]
+    past_vs_team = [p for p in vs_team_pairs if p["season"] != season]
+    new_vs_team = fetch_vs_team_stats(cur_vs_team, {})
+    reused_vs_team = fetch_vs_team_stats(past_vs_team, vs_team_cache)
+    merged_vs_team = {**vs_team_cache, **reused_vs_team, **new_vs_team}
+    pitcher_hands = fetch_pitcher_hands(pitchers_needing_hand)
+
+    return {
+        "games": attach_matchups(games, batter_logs, merged_bvp, merged_platoon, merged_vs_team, pitcher_hands),
+        "bvpLogs": merged_bvp,
+        "platoonLogs": merged_platoon,
+        "vsTeamLogs": merged_vs_team,
+        "pitcherHands": pitcher_hands,
+    }
 
 
 # ---------------------------------------------------------------------------

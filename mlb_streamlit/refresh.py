@@ -19,6 +19,7 @@ from .data import (
     add_days,
     attach_as_of_stats,
     attach_lineups_as_of,
+    enrich_with_matchups,
     et_date_string,
     fetch_all_seasons,
     fetch_batter_game_logs,
@@ -502,6 +503,34 @@ def run_refresh(
     rep("Batter game logs loaded", 48, f"Cached {len(batter_log_cache)} batter-season logs.")
     enriched = attach_lineups_as_of(enriched, lineups, batter_log_cache)
 
+    # 6c. Matchup edges (BvP / platoon / vs-team): only for games in the fresh
+    #    window (real boxscore lineup + opposing starter both known), mirroring
+    #    the React engine's enrichWithMatchups — no lookahead and no junk
+    #    values on older history.
+    rep("Loading matchups", 54, "Fetching BvP & platoon splits…")
+    window_start = add_days(today, -2)
+    window_end = add_days(today, UPCOMING_WINDOW_DAYS)
+    window_games = [g for g in enriched if window_start <= (g.get("date") or "") <= window_end]
+    matchup = enrich_with_matchups(
+        window_games,
+        batter_log_cache,
+        cache.load_bvp_logs(),
+        cache.load_platoon_logs(),
+        cache.load_vs_team_logs(),
+        season,
+    )
+    enriched_by_pk = {g["gamePk"]: g for g in matchup["games"]}
+    enriched = [enriched_by_pk.get(g["gamePk"], g) for g in enriched]
+    bvp_log_cache = matchup["bvpLogs"]
+    platoon_log_cache = matchup["platoonLogs"]
+    vs_team_log_cache = matchup["vsTeamLogs"]
+    pitcher_hands_cache = matchup["pitcherHands"]
+    rep(
+        "Matchups loaded",
+        58,
+        f"BvP {len(bvp_log_cache)} · platoon {len(platoon_log_cache)} · vsTeam {len(vs_team_log_cache)}",
+    )
+
     completed_enriched = [g for g in enriched if g.get("winner") in ("home", "away")]
 
     # 7. Train / calibrate / select.
@@ -639,6 +668,10 @@ def run_refresh(
     cache.save_pitcher_logs(pitcher_log_cache)
     cache.save_team_logs(team_log_cache)
     cache.save_batter_logs(batter_log_cache)
+    cache.save_bvp_logs(bvp_log_cache)
+    cache.save_platoon_logs(platoon_log_cache)
+    cache.save_vs_team_logs(vs_team_log_cache)
+    cache.save_pitcher_hands(pitcher_hands_cache)
     cache.save_lineups(lineup_cache)
     cache.save_injury_snapshots(injury_cache)
 
@@ -723,6 +756,18 @@ def predict_date(date: str, state: dict | None = None) -> int:
         batter_log_cache.update(fresh_batter_logs)
     enriched = attach_lineups_as_of(enriched, lineups, batter_log_cache)
 
+    # Matchup edges (BvP / platoon / vs-team) for the selected date's real
+    # lineups, mirroring React's predictDate.
+    matchup = enrich_with_matchups(
+        enriched,
+        batter_log_cache,
+        cache.load_bvp_logs(),
+        cache.load_platoon_logs(),
+        cache.load_vs_team_logs(),
+        season,
+    )
+    enriched = matchup["games"]
+
     market_odds = fetch_market_odds()
 
     docs = []
@@ -751,6 +796,10 @@ def predict_date(date: str, state: dict | None = None) -> int:
     cache.save_pitcher_logs(pitcher_log_cache)
     cache.save_team_logs(team_log_cache)
     cache.save_batter_logs(batter_log_cache)
+    cache.save_bvp_logs(matchup["bvpLogs"])
+    cache.save_platoon_logs(matchup["platoonLogs"])
+    cache.save_vs_team_logs(matchup["vsTeamLogs"])
+    cache.save_pitcher_hands(matchup["pitcherHands"])
     docs_by_date = cache.load_docs_by_date()
     docs_by_date[date] = docs
     cache.save_docs_by_date(docs_by_date)
