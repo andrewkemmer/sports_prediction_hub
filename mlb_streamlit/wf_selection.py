@@ -29,7 +29,7 @@ from .engine.metrics import compute_auc, evaluate, spearman_rank
 from .engine.model import CANDIDATE_MIN_AUC, fit_candidate_pool, refit_logistic_model
 
 WF_SELECTION_FILE = "walk_forward_selection.json"
-WF_SELECTION_VERSION = 1
+WF_SELECTION_VERSION = 2
 WF_SELECTION_REFIT_DAYS = 3  # candidates share a fit within a block (matches calibration)
 MIN_PRIOR_GAMES = 40
 FEATURE_SIGNAL_EPS = 0.01  # |AUC - 0.5| threshold for a feature to stay active
@@ -39,10 +39,12 @@ CANDIDATE_NAMES = [
     "Elo rating",
     "Logistic regression",
     "Logistic regression (L2, λ=0.1)",
+    "Logistic regression (L2, λ=0.3)",
     "Logistic regression (L2, λ=1)",
     "Distance-weighted k-NN (k=21)",
     "Boosted decision stumps",
     "Neural network (MLP)",
+    "Gaussian naive Bayes",
     "Blended ensemble",
 ]
 
@@ -228,11 +230,16 @@ def build_walk_forward_selection(report=None, rows=None) -> dict:
                 best_single_name = c["name"]
 
     stacking = build_stacking_weights(eligible_preds, labels)
-    best_name = best_single_name
-    chosen_preds = eligible_preds[best_single_name]
-    if len(stacking["preds"]) > 0 and stacking["brier"] < best_brier - 0.0005:
-        best_name = "Stacked ensemble"
-        chosen_preds = stacking["preds"]
+    # The deployed scorer is the logistic + Elo blend — the only fully
+    # serializable ensemble that apply_model can serve. The walk-forward record
+    # still measures every candidate (and the greedy stacking) out-of-sample,
+    # but the model selected for deployment is chosen between the two deployable
+    # families: the blend when it matches or beats plain logistic on OOS Brier,
+    # else plain logistic. Everything else is reported as a diagnostic.
+    blend_eval = evaluate(accum["candPreds"]["Blended ensemble"], labels)
+    lr_eval = evaluate(accum["candPreds"]["Logistic regression"], labels)
+    best_name = "Blended ensemble" if blend_eval["brier"] <= lr_eval["brier"] else "Logistic regression"
+    chosen_preds = accum["candPreds"][best_name]
     for c in candidates:
         c["selected"] = c["name"] == best_name
 
@@ -264,13 +271,7 @@ def build_walk_forward_selection(report=None, rows=None) -> dict:
     is_correct = [1 if (p >= 0.5) == (y == 1) else 0 for p, y in zip(chosen_preds, labels)]
     high_conf = [c for p, c in zip(pick_probs, is_correct) if p >= 0.65]
 
-    stacked_count = sum(1 for w in stacking["weights"] if w["weight"] > 0)
-    if best_name == "Stacked ensemble":
-        description = (
-            f"Walk-forward stacked ensemble of {stacked_count} models "
-            f"(selected out-of-sample), isotonic-calibrated."
-        )
-    elif best_name == "Blended ensemble":
+    if best_name == "Blended ensemble":
         description = "Walk-forward blended ensemble (logistic + Elo), isotonic-calibrated."
     else:
         description = f"Walk-forward selected {best_name}, isotonic-calibrated."
@@ -390,18 +391,46 @@ def apply_walk_forward_selection(result: dict, model: dict, rows: list[dict], se
     result["bias"] = refit["bias"]
     result["featureStats"] = refit["featureStats"]
     result["isotonicPoints"] = refit["isotonicPoints"]
-    result["selectedModel"] = selection["selectedModel"]
-    result["modelDescription"] = selection["modelDescription"]
+    result["blendW"] = refit["blendW"]
+
+    # The deployed scorer is always the logistic + Elo blend (blendW), so the
+    # monitor's selectedModel and candidate-table highlight describe exactly
+    # what apply_model serves — never a non-deployable family that the
+    # walk-forward record merely measured out-of-sample.
+    blend_w = refit.get("blendW", 0.0)
+    if blend_w > 0:
+        deployed_name = "Blended ensemble"
+        deployed_description = (
+            f"Walk-forward blended ensemble: {1 - blend_w:.2f}·logistic + {blend_w:.2f}·Elo, "
+            f"isotonic-calibrated."
+        )
+    else:
+        deployed_name = "Logistic regression"
+        deployed_description = "Walk-forward selected logistic regression, isotonic-calibrated."
+    result["selectedModel"] = deployed_name
+    result["modelDescription"] = deployed_description
     result["featureImportances"] = feature_importances
     result["candidates"] = selection["candidates"]
+    for c in result["candidates"]:
+        c["selected"] = c["name"] == deployed_name
     result["stackingWeights"] = selection["stackingWeights"]
     result["crossValidation"] = selection["crossValidation"]
     result["optimizationParams"] = selection["optimizationParams"]
-    result["auc"] = selection["auc"]
-    result["brier"] = selection["brier"]
-    result["logLoss"] = selection["logLoss"]
-    result["ece"] = selection["ece"]
+
+    # Headline metrics reflect the deployed model's walk-forward out-of-sample
+    # record (the blend candidate), so the monitor never reports a different
+    # model's AUC/Brier than the one actually scoring today's games.
+    deployed_metrics = next(
+        (c for c in result["candidates"] if c["name"] == deployed_name), None
+    )
+    result["auc"] = deployed_metrics["auc"] if deployed_metrics else selection["auc"]
+    result["brier"] = deployed_metrics["brier"] if deployed_metrics else selection["brier"]
+    result["logLoss"] = deployed_metrics["logLoss"] if deployed_metrics else selection["logLoss"]
+    result["ece"] = deployed_metrics["ece"] if deployed_metrics else selection["ece"]
     result["bins"] = selection["bins"]
     result["confidenceDistribution"] = selection["confidenceDistribution"]
     result["calibrationCurve"] = selection["calibrationCurve"]
+    # Reflect the deployed family in the persisted walk-forward record too.
+    selection["selectedModel"] = deployed_name
+    selection["modelDescription"] = deployed_description
     result["walkForwardSelection"] = selection

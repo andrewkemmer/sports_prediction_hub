@@ -58,7 +58,7 @@ RUN_SIM_TRIALS = 10000
 RUN_CALIB_TRIALS = 500
 MIN_COMPLETED_GAMES = 40
 
-PREDICTION_VERSION = 4  # bump to force re-scoring of previously cached dates
+PREDICTION_VERSION = 5  # bump to force re-scoring of previously cached dates
 BACKTEST_STATES_FILE = "backtest_states.json"
 BACKTEST_CACHE_VERSION = cache.BACKTEST_CACHE_VERSION  # bump with PREDICTION_VERSION to invalidate stale backtest caches
 WF_REFIT_DAYS = 3  # refit the walk-forward model every N days (games in a block share a model)
@@ -586,6 +586,7 @@ def reconstruct_model(state: dict) -> dict:
         "monteCarloSigma": state.get("monteCarloSigma") or 0,
         "monteCarloEnabled": state.get("monteCarloEnabled") or False,
         "eloHfa": state.get("eloHfa") or 30,
+        "blendW": state.get("blendW", 0.0) or 0.0,
     }
 
 
@@ -950,6 +951,7 @@ def run_refresh(
         "featureStats": result["featureStats"],
         "isotonicPoints": result["isotonicPoints"],
         "eloHfa": result["eloHfa"],
+        "blendW": result.get("blendW", 0.0),
         "monteCarloEnabled": result["monteCarloEnabled"],
         "monteCarloTrials": result["monteCarloTrials"],
         "monteCarloSigma": result["monteCarloSigma"],
@@ -1094,6 +1096,7 @@ def _backtest_state(target: str, report=None) -> dict | None:
         "featureStats": result["featureStats"],
         "isotonicPoints": result["isotonicPoints"],
         "eloHfa": result["eloHfa"],
+        "blendW": result.get("blendW", 0.0),
         "monteCarloEnabled": result["monteCarloEnabled"],
         "monteCarloTrials": result["monteCarloTrials"],
         "monteCarloSigma": result["monteCarloSigma"],
@@ -1231,6 +1234,7 @@ def build_walk_forward_calibration_rows(report=None) -> list[dict]:
                 "monteCarloSigma": result["monteCarloSigma"],
                 "monteCarloEnabled": result["monteCarloEnabled"],
                 "eloHfa": result["eloHfa"],
+                "blendW": result.get("blendW", 0.0),
             }
             current_run_model = result["runModel"]
             current_run_line_iso = result["runLineCalibration"]

@@ -16,7 +16,7 @@ ELO_HFA_UPDATE = 30.0  # home advantage baked into Elo updates only
 
 # Bump whenever feature engineering changes so refresh fingerprints and every
 # cached prediction/backtest are invalidated and rebuilt point-in-time.
-FEATURE_VERSION = 4
+FEATURE_VERSION = 5
 
 # Canonical feature order (27 features). Every feature is computed as-of the
 # game's own date (no lookahead) and flows into the ML candidate set; greedy
@@ -53,6 +53,9 @@ FEATURE_KEYS = [
     "spRestWorkloadDiff",
     "lineupMomentumDiff",
     "lineupFatigueDiff",
+    "eloWinPctInteract",
+    "spFipRestInteract",
+    "lineupParkInteract",
 ]
 
 FEATURE_LABELS = {
@@ -87,6 +90,9 @@ FEATURE_LABELS = {
     "spRestWorkloadDiff": "Starter short-rest × workload interaction",
     "lineupMomentumDiff": "Starting-9 momentum (recent OPS vs season)",
     "lineupFatigueDiff": "Starting-9 fatigue (games in last 7 days)",
+    "eloWinPctInteract": "Elo edge × win-% edge (rating × record)",
+    "spFipRestInteract": "Starter FIP edge × rest advantage",
+    "lineupParkInteract": "Lineup OPS edge × ballpark factor",
 }
 
 
@@ -253,6 +259,11 @@ def build_features(game: dict, state: dict) -> dict:
         "spRestWorkloadDiff": _edge(_sp_fatigue(game.get("homePitcher")), _sp_fatigue(game.get("awayPitcher")), True),
         "lineupMomentumDiff": _edge((lineup_home or {}).get("momentum"), (lineup_away or {}).get("momentum")),
         "lineupFatigueDiff": _edge((lineup_home or {}).get("games7"), (lineup_away or {}).get("games7"), True),
+        # Interaction features (combinations of the point-in-time edges above,
+        # so they are themselves strictly prior to first pitch).
+        "eloWinPctInteract": ((home_elo - away_elo) / 100) * (home_wp - away_wp),
+        "spFipRestInteract": starter_delta(game.get("homePitcher"), game.get("awayPitcher"), "fip") * clamp(home_rest - away_rest, -4, 4),
+        "lineupParkInteract": lineup_ops_diff * (PARK_FACTORS.get(game["home"]["id"], 1.0) - 1.0),
     }
 
 

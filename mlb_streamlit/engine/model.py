@@ -28,6 +28,7 @@ from .logistic import (
     build_stacking_weights,
     cross_validate,
     logistic_logit,
+    naive_bayes_model,
     train_logistic,
 )
 from .metrics import (
@@ -62,6 +63,8 @@ KNN_TRAIN_CAP = 1500
 # selection / stacking, so every model the selector chooses among is strong.
 CANDIDATE_MIN_AUC = 0.70
 MC_GRID = [0.1, 0.15, 0.2, 0.3, 0.45, 0.6]
+# Ridge strengths tried for the deployed logistic (selected on the calibrate set).
+LAMBDA_GRID = [0.001, 0.01, 0.1, 0.3, 1.0]
 
 np = _np
 
@@ -75,10 +78,27 @@ def elo_prob(row: dict, hfa: float) -> float:
 
 
 def apply_model(model: dict, features: dict, home_elo: float, away_elo: float) -> dict:
-    """Apply a trained model to a feature vector -> full prediction object."""
+    """Apply a trained model to a feature vector -> full prediction object.
+
+    When `blendW` is set, the logistic logit is blended with the Elo logit in
+    logit space — an ensemble of the two strongest, fully serializable models.
+    """
     shap: list[dict] = []
     logit_v = logistic_logit(model, features, shap)
+    baseline = sigmoid(((home_elo + model["eloHfa"] - away_elo) / 400) * math.log(10))
+    blend_w = model.get("blendW", 0.0) or 0.0
+    if blend_w > 0:
+        elo_logit_v = logit(baseline)
+        shap.append({
+            "feature": "_eloBlend",
+            "label": "Elo rating blend",
+            "contribution": blend_w * elo_logit_v,
+            "value": baseline,
+        })
+        logit_v = (1 - blend_w) * logit_v + blend_w * elo_logit_v
     for s in shap:
+        if s["feature"] == "_eloBlend":
+            continue
         s["label"] = FEATURE_LABELS.get(s["feature"], s["feature"])
         s["value"] = features.get(s["feature"], 0.0)
     p = sigmoid(logit_v)
@@ -86,7 +106,6 @@ def apply_model(model: dict, features: dict, home_elo: float, away_elo: float) -
     if model.get("monteCarloEnabled") and (model.get("monteCarloSigma") or 0) > 0:
         p = monte_carlo_adjust(p, model["monteCarloSigma"], 10000)
     p = clamp(p, 0.01, 0.99)
-    baseline = sigmoid(((home_elo + model["eloHfa"] - away_elo) / 400) * math.log(10))
     edge = p - baseline
     shap.sort(key=lambda s: -abs(s["contribution"]))
     shap = shap[:5]
@@ -226,7 +245,7 @@ def fit_run_margin_calibration(rows: list[dict], model: dict) -> dict:
     xs: list[float] = []
     ys: list[float] = []
     for r in rows:
-        p = apply_isotonic(model["isotonicPoints"], sigmoid(logistic_logit(model, r["features"], None)))
+        p = apply_model(model, r["features"], r["homeElo"], r["awayElo"])["homeWinProb"]
         margin = (r["game"]["home"].get("score") or 0) - (r["game"]["away"].get("score") or 0)
         xs.append(logit(p))
         ys.append(margin)
@@ -423,7 +442,27 @@ def run_model(
                 if stagnation_rounds >= 2:
                     break
 
+    # 2b. Tune the logistic ridge strength on the calibrate set. A small grid
+    #     lets the selector trade bias for variance; the tuned model is the one
+    #     actually deployed (the old pipeline always deployed λ=0.001 even when
+    #     a different ridge scored better out-of-sample).
     lr_model = train_logistic(train, selected)
+    best_lambda = 0.001
+    if len(calib) >= 20 and len(train) >= 20:
+        best_lambda_score = score_fn(
+            [sigmoid(logistic_logit(lr_model, r["features"], None)) for r in calib],
+            calib_labels,
+        )
+        for lam in LAMBDA_GRID:
+            cand_model = train_logistic(train, selected, lambda_=lam)
+            s = score_fn(
+                [sigmoid(logistic_logit(cand_model, r["features"], None)) for r in calib],
+                calib_labels,
+            )
+            if s < best_lambda_score - 1e-6:
+                best_lambda_score = s
+                lr_model = cand_model
+                best_lambda = lam
 
     # 3. Tune Elo home-field advantage on the training set.
     elo_hfa = 30.0
@@ -461,19 +500,23 @@ def run_model(
     #    note for transparency.
     knn_train = train[-KNN_TRAIN_CAP:] if len(train) > KNN_TRAIN_CAP else train
     lr_strong = train_logistic(train, selected, lambda_=0.1)
+    lr_mid = train_logistic(train, selected, lambda_=0.3)
     lr_stronger = train_logistic(train, selected, lambda_=1.0)
     wknn = weighted_knn_model(knn_train, selected)
     boost = boosted_stumps_model(train, selected)
     nn = mlp_model(train, selected)
+    nb = naive_bayes_model(train, selected)
 
     cand_preds: dict[str, list[float]] = {
         "Elo rating": [elo_prob(r, elo_hfa) for r in calib],
         "Logistic regression": [sigmoid(logistic_logit(lr_model, r["features"], None)) for r in calib],
         "Logistic regression (L2, λ=0.1)": [sigmoid(logistic_logit(lr_strong, r["features"], None)) for r in calib],
+        "Logistic regression (L2, λ=0.3)": [sigmoid(logistic_logit(lr_mid, r["features"], None)) for r in calib],
         "Logistic regression (L2, λ=1)": [sigmoid(logistic_logit(lr_stronger, r["features"], None)) for r in calib],
         "Distance-weighted k-NN (k=21)": weighted_knn_calib_preds(knn_train, calib, selected, model=wknn),
         "Boosted decision stumps": [boost(r["features"]) for r in calib],
         "Neural network (MLP)": [nn(r["features"]) for r in calib],
+        "Gaussian naive Bayes": [nb(r["features"]) for r in calib],
         "Blended ensemble": [sigmoid((1 - blend_w) * l + blend_w * e) for l, e in zip(lr_logits, elo_logits)],
     }
 
@@ -535,11 +578,14 @@ def run_model(
         best_name = "Stacked ensemble"
         chosen_preds = stacking["preds"]
 
-    # 7. Isotonic calibration on the calibrate set.
-    order = sorted(zip(chosen_preds, calib_labels), key=lambda t: t[0])
+    # 7. Isotonic calibration on the calibrate set — fit on the exact blend
+    #    logits that apply_model serves (logistic + Elo), so calibration is
+    #    trained on the same distribution it is applied to (train == serve).
+    blend_preds = [sigmoid((1 - blend_w) * l + blend_w * e) for l, e in zip(lr_logits, elo_logits)]
+    order = sorted(zip(blend_preds, calib_labels), key=lambda t: t[0])
     isotonic_points = isotonic_regression([o[0] for o in order], [o[1] for o in order])
 
-    calibrated_calib = [apply_isotonic(isotonic_points, p) for p in chosen_preds]
+    calibrated_calib = [apply_isotonic(isotonic_points, p) for p in blend_preds]
 
     # 8. Monte Carlo decision: enable only if it reduces Brier meaningfully.
     #    The stochastic component is a 7-point Gauss-Hermite quadrature
@@ -584,6 +630,7 @@ def run_model(
         "monteCarloSigma": mc_sigma,
         "monteCarloEnabled": mc_enabled,
         "eloHfa": elo_hfa,
+        "blendW": blend_w,
     }
 
     # 9. Reconcile run-scoring model with win-probability model.
@@ -628,7 +675,7 @@ def run_model(
     cross_validation = cross_validate(rows, selected, 5)
     optimization_params = {
         "learningRate": 0,
-        "l2Lambda": 0.001,
+        "l2Lambda": best_lambda,
         "epochs": 20,
         "hfaGrid": list(HFA_GRID),
         "blendStep": 0.05,
@@ -703,27 +750,28 @@ def run_model(
         })
     power_rankings.sort(key=lambda r: -r["elo"])
 
-    # 16. Description.
-    stacked_count = sum(1 for w in stacking["weights"] if w["weight"] > 0)
-    if best_name == "Stacked ensemble":
-        description = (
-            f"Stacked ensemble of {stacked_count} models (greedy forward selection), "
-            f"isotonic-calibrated{' , Monte Carlo-smoothed' if mc_enabled else ''}."
-        )
-    elif best_name == "Blended ensemble":
+    # 16. Description — always describes the deployed scorer (the logistic +
+    #     Elo blend stored in blendW), so selectedModel and apply_model never
+    #     disagree about what is actually scoring today's games.
+    if blend_w > 0:
+        deployed_name = "Blended ensemble"
         description = (
             f"Ensemble: {(1 - blend_w):.2f}·logistic + {blend_w:.2f}·Elo, "
             f"isotonic-calibrated{', Monte Carlo-smoothed' if mc_enabled else ''}."
         )
     else:
-        description = f"{best_name}, isotonic-calibrated{', Monte Carlo-smoothed' if mc_enabled else ''}."
+        deployed_name = "Logistic regression"
+        description = (
+            f"Logistic regression (L2, λ={best_lambda}), "
+            f"isotonic-calibrated{', Monte Carlo-smoothed' if mc_enabled else ''}."
+        )
 
     result = {
         "season": season,
         "asOfDate": as_of_date,
         "gamesTrained": n,
         "holdoutCount": len(test),
-        "selectedModel": best_name,
+        "selectedModel": deployed_name,
         "modelDescription": description,
         "featureNames": selected,
         "weights": lr_model["weights"],
@@ -731,6 +779,7 @@ def run_model(
         "featureStats": lr_model["featureStats"],
         "isotonicPoints": isotonic_points,
         "eloHfa": elo_hfa,
+        "blendW": blend_w,
         "monteCarloEnabled": mc_enabled,
         "monteCarloTrials": 10000 if mc_enabled else 0,
         "monteCarloSigma": mc_sigma,
@@ -873,6 +922,7 @@ def run_model_light(
         "monteCarloSigma": 0.0,
         "monteCarloEnabled": False,
         "eloHfa": elo_hfa,
+        "blendW": blend_w,
     }
 
     run_margin_calibration = fit_run_margin_calibration(rows, model)
@@ -928,6 +978,7 @@ def run_model_light(
         "featureStats": lr_model["featureStats"],
         "isotonicPoints": isotonic_points,
         "eloHfa": elo_hfa,
+        "blendW": blend_w,
         "monteCarloEnabled": False,
         "monteCarloTrials": 0,
         "monteCarloSigma": 0.0,
@@ -962,10 +1013,12 @@ def fit_candidate_pool(train: list[dict], feature_names: list[str]) -> tuple[dic
                 "Elo rating": lambda f: prior,
                 "Logistic regression": lambda f: prior,
                 "Logistic regression (L2, λ=0.1)": lambda f: prior,
+                "Logistic regression (L2, λ=0.3)": lambda f: prior,
                 "Logistic regression (L2, λ=1)": lambda f: prior,
                 "Distance-weighted k-NN (k=21)": lambda f: prior,
                 "Boosted decision stumps": lambda f: prior,
                 "Neural network (MLP)": lambda f: prior,
+                "Gaussian naive Bayes": lambda f: prior,
                 "Blended ensemble": lambda f: prior,
             },
             30.0,
@@ -985,11 +1038,13 @@ def fit_candidate_pool(train: list[dict], feature_names: list[str]) -> tuple[dic
 
     lr_model = train_logistic(train, feature_names)
     lr_strong = train_logistic(train, feature_names, lambda_=0.1)
+    lr_mid = train_logistic(train, feature_names, lambda_=0.3)
     lr_stronger = train_logistic(train, feature_names, lambda_=1.0)
     knn_train = train[-KNN_TRAIN_CAP:] if n > KNN_TRAIN_CAP else train
     wknn = weighted_knn_model(knn_train, feature_names)
     boost = boosted_stumps_model(train, feature_names)
     nn = mlp_model(train, feature_names)
+    nb = naive_bayes_model(train, feature_names)
 
     # Blend weight tuned on the trailing 20% of the prior window (chronological
     # holdout) — mirrors run_model's calib-set blend tuning, but stays strictly
@@ -1017,10 +1072,12 @@ def fit_candidate_pool(train: list[dict], feature_names: list[str]) -> tuple[dic
         "Elo rating": lambda r: elo_prob(r, elo_hfa),
         "Logistic regression": lambda r: sigmoid(logistic_logit(lr_model, r["features"], None)),
         "Logistic regression (L2, λ=0.1)": lambda r: sigmoid(logistic_logit(lr_strong, r["features"], None)),
+        "Logistic regression (L2, λ=0.3)": lambda r: sigmoid(logistic_logit(lr_mid, r["features"], None)),
         "Logistic regression (L2, λ=1)": lambda r: sigmoid(logistic_logit(lr_stronger, r["features"], None)),
         "Distance-weighted k-NN (k=21)": lambda r: wknn(r["features"]),
         "Boosted decision stumps": lambda r: boost(r["features"]),
         "Neural network (MLP)": lambda r: nn(r["features"]),
+        "Gaussian naive Bayes": lambda r: nb(r["features"]),
         "Blended ensemble": lambda r: sigmoid(
             (1 - blend_w) * logistic_logit(lr_model, r["features"], None)
             + blend_w * logit(elo_prob(r, elo_hfa))
@@ -1036,17 +1093,48 @@ def refit_logistic_model(
     monte_carlo_enabled: bool = False,
     monte_carlo_sigma: float = 0.0,
 ) -> dict:
-    """Fit the production logistic model on ALL `rows` with `feature_names`.
+    """Fit the production logistic + Elo blend on ALL `rows` with `feature_names`.
 
     Used after walk-forward feature selection to rebuild today's deployed model
     on the complete training history using only the features the walk-forward
-    record selected. Isotonic calibration is fit on the same rows (the walk-
-    forward selection itself supplies the unbiased out-of-sample metrics).
+    record selected. The blend weight is tuned on a chronological holdout of
+    `rows` (never a future game) and isotonic calibration is fit on the blend
+    logits that apply_model actually serves, so train == serve. The walk-
+    forward selection itself supplies the unbiased out-of-sample metrics.
     """
+    n = len(rows)
     lr_model = train_logistic(rows, feature_names)
-    preds = [sigmoid(logistic_logit(lr_model, r["features"], None)) for r in rows]
+
+    # Blend weight (logistic + Elo logits) tuned on the trailing 20% of the
+    # chronological history — strictly inside prior data, mirroring
+    # fit_candidate_pool's blend tuning.
+    blend_w = 0.5
+    if n >= 40:
+        split = int(math.floor(n * 0.8))
+        blend_train = rows[:split]
+        blend_calib = rows[split:]
+        if len(blend_calib) >= 20 and len(blend_train) >= 20:
+            lr_blend = train_logistic(blend_train, feature_names)
+            lr_logits = [logistic_logit(lr_blend, r["features"], None) for r in blend_calib]
+            elo_logits = [logit(elo_prob(r, elo_hfa)) for r in blend_calib]
+            labels_holdout = [r["label"] for r in blend_calib]
+            best_brier = float("inf")
+            w = 0.0
+            while w <= 1.0001:
+                preds = [sigmoid((1 - w) * l + w * e) for l, e in zip(lr_logits, elo_logits)]
+                b = compute_brier(preds, labels_holdout)
+                if b < best_brier:
+                    best_brier = b
+                    blend_w = w
+                w += 0.05
+
+    # Calibrate on the blend logits the scorer serves (not a different model's
+    # outputs), so the isotonic map is fit on its own input distribution.
+    lr_logits_full = [logistic_logit(lr_model, r["features"], None) for r in rows]
+    elo_logits_full = [logit(elo_prob(r, elo_hfa)) for r in rows]
+    blend_preds = [sigmoid((1 - blend_w) * l + blend_w * e) for l, e in zip(lr_logits_full, elo_logits_full)]
     labels = [r["label"] for r in rows]
-    order = sorted(zip(preds, labels), key=lambda t: t[0])
+    order = sorted(zip(blend_preds, labels), key=lambda t: t[0])
     isotonic_points = isotonic_regression([o[0] for o in order], [o[1] for o in order])
     return {
         "featureNames": feature_names,
@@ -1057,4 +1145,5 @@ def refit_logistic_model(
         "monteCarloSigma": monte_carlo_sigma,
         "monteCarloEnabled": monte_carlo_enabled,
         "eloHfa": elo_hfa,
+        "blendW": blend_w,
     }
