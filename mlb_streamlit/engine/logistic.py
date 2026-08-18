@@ -56,7 +56,7 @@ def solve_linear_system(A: list[list[float]], b: list[float]) -> list[float]:
     return [row[n] for row in aug]
 
 
-def _train_logistic_vectorized(rows: list[dict], feature_names: list[str], iterations: int, w0: list[float] | None = None) -> dict | None:
+def _train_logistic_vectorized(rows: list[dict], feature_names: list[str], iterations: int, w0: list[float] | None = None, lambda_: float = 0.001) -> dict | None:
     """numpy IRLS — identical math to the pure-Python path below, ~50-100x faster.
 
     Returns None (so the caller falls back to the reference implementation) when
@@ -87,7 +87,6 @@ def _train_logistic_vectorized(rows: list[dict], feature_names: list[str], itera
     else:
         w = np.zeros(d)
         w[m] = math.log((pos + 1) / (n - pos + 1))
-    lambda_ = 0.001
 
     for _ in range(iterations):
         eta = Xaug @ w
@@ -118,18 +117,20 @@ def _train_logistic_vectorized(rows: list[dict], feature_names: list[str], itera
     }
 
 
-def train_logistic(rows: list[dict], feature_names: list[str], iterations: int = 20, w0: list[float] | None = None) -> dict:
+def train_logistic(rows: list[dict], feature_names: list[str], iterations: int = 20, w0: list[float] | None = None, lambda_: float = 0.001) -> dict:
     """Newton-Raphson / IRLS ridge logistic regression (standardized features).
 
     `w0` seeds the iteration with a previous fit's weights (same standardized
     feature space, intercept last); used by feature selection so each drop-one
     refit starts near the optimum and converges in a couple of iterations.
+    `lambda_` is the L2 ridge strength — the candidate pool trains several
+    strengths (0.001 / 0.1 / 1.0) so the selector can trade bias for variance.
     Convergence is detected exactly (max weight change < 1e-9), so fewer
     iterations never change the fitted model.
     """
     if _np is not None:
         try:
-            m = _train_logistic_vectorized(rows, feature_names, iterations, w0)
+            m = _train_logistic_vectorized(rows, feature_names, iterations, w0, lambda_)
             if m is not None:
                 return m
         except Exception:  # pragma: no cover - fall back to the reference on any edge case
@@ -155,7 +156,6 @@ def train_logistic(rows: list[dict], feature_names: list[str], iterations: int =
     else:
         w = [0.0] * d
         w[m] = math.log((pos + 1) / (n - pos + 1))
-    lambda_ = 0.001
 
     for _ in range(iterations):
         A = [[0.0] * d for _ in range(d)]

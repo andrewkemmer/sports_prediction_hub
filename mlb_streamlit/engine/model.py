@@ -22,12 +22,11 @@ import math
 import warnings
 
 from .features import FEATURE_KEYS, FEATURE_LABELS, build_features_for_game, compute_elo_and_features
+from .ensemble import boosted_stumps_model, weighted_knn_calib_preds, weighted_knn_model
 from .logistic import (
     build_stacking_weights,
     cross_validate,
-    knn_model,
     logistic_logit,
-    naive_bayes_model,
     train_logistic,
 )
 from .metrics import (
@@ -57,7 +56,10 @@ except Exception:  # pragma: no cover - fallback path
 ELO_INIT = 1500.0
 HFA_GRID = [0, 10, 20, 30, 40, 50, 60]
 KNN_TRAIN_CAP = 1500
-MC_GRID = [0.15, 0.3, 0.45]
+# AUC floor for the candidate pool: only models that clear it are eligible for
+# selection / stacking, so every model the selector chooses among is strong.
+CANDIDATE_MIN_AUC = 0.70
+MC_GRID = [0.1, 0.15, 0.2, 0.3, 0.45, 0.6]
 
 np = _np
 
@@ -447,46 +449,37 @@ def run_model(
                 blend_w = w
             w += 0.05
 
-    # 5. Candidate models.
+    # 5. Candidate models. The pool deliberately spans model families:
+    #    Elo (pure ratings), regularized logistic at three ridge strengths,
+    #    distance-weighted k-NN, L2-boosted decision stumps, and the blended
+    #    ensemble. Only candidates that clear the AUC floor (CANDIDATE_MIN_AUC)
+    #    are eligible for selection / stacking, so every model the selector
+    #    chooses among is strong; the rest stay visible with an "excluded"
+    #    note for transparency.
     knn_train = train[-KNN_TRAIN_CAP:] if len(train) > KNN_TRAIN_CAP else train
-    knn = knn_model(knn_train, selected)
-    nb = naive_bayes_model(train, selected)
-
-    def knn_calib_preds() -> list[float]:
-        if np is not None and len(calib) > 0:
-            # Vectorized k-NN (chunked per calib row) - much faster than the
-            # pure-Python nearest-neighbour scan on thousands of rows.
-            stats = {}
-            for f in selected:
-                vals = [r["features"][f] for r in knn_train]
-                stats[f] = {"mean": mean(vals), "std": std(vals) or 1}
-            z_train = np.array([[r["features"][f] for f in selected] for r in knn_train])
-            z_train = (z_train - np.array([stats[f]["mean"] for f in selected])) / np.array([stats[f]["std"] or 1 for f in selected])
-            labels = np.array([r["label"] for r in knn_train], dtype=float)
-            out = []
-            for r in calib:
-                z = np.array([r["features"][f] for f in selected], dtype=float)
-                z = (z - np.array([stats[f]["mean"] for f in selected])) / np.array([stats[f]["std"] or 1 for f in selected])
-                dist = ((z_train - z) ** 2).sum(axis=1)
-                idx = np.argpartition(dist, min(20, len(dist) - 1))[: min(21, len(dist))]
-                out.append(float(labels[idx].mean()))
-            return out
-        return [knn(r["features"]) for r in calib]
+    lr_strong = train_logistic(train, selected, lambda_=0.1)
+    lr_stronger = train_logistic(train, selected, lambda_=1.0)
+    wknn = weighted_knn_model(knn_train, selected)
+    boost = boosted_stumps_model(train, selected)
 
     cand_preds: dict[str, list[float]] = {
         "Elo rating": [elo_prob(r, elo_hfa) for r in calib],
         "Logistic regression": [sigmoid(logistic_logit(lr_model, r["features"], None)) for r in calib],
-        "k-NN (k=21)": knn_calib_preds(),
-        "Naive Bayes": [nb(r["features"]) for r in calib],
+        "Logistic regression (L2, λ=0.1)": [sigmoid(logistic_logit(lr_strong, r["features"], None)) for r in calib],
+        "Logistic regression (L2, λ=1)": [sigmoid(logistic_logit(lr_stronger, r["features"], None)) for r in calib],
+        "Distance-weighted k-NN (k=21)": weighted_knn_calib_preds(knn_train, calib, selected, model=wknn),
+        "Boosted decision stumps": [boost(r["features"]) for r in calib],
         "Blended ensemble": [sigmoid((1 - blend_w) * l + blend_w * e) for l, e in zip(lr_logits, elo_logits)],
     }
 
     candidates: list[dict] = []
+    eligible_preds: dict[str, list[float]] = {}
     best_single_name = "Blended ensemble"
     best_auc = -1.0
     best_brier = float("inf")
     for name, p in cand_preds.items():
         m = evaluate(p, calib_labels)
+        eligible = m["auc"] >= CANDIDATE_MIN_AUC
         candidates.append({
             "name": name,
             "auc": m["auc"],
@@ -494,8 +487,12 @@ def run_model(
             "logLoss": m["logLoss"],
             "ece": m["ece"],
             "selected": False,
-            "note": "",
+            "eligible": eligible,
+            "note": "" if eligible else f"Below {CANDIDATE_MIN_AUC:.2f} AUC floor — excluded from selection",
         })
+        if not eligible:
+            continue
+        eligible_preds[name] = p
         if m["auc"] > best_auc + 0.003:
             best_auc = m["auc"]
             best_brier = m["brier"]
@@ -503,14 +500,32 @@ def run_model(
         elif abs(m["auc"] - best_auc) <= 0.003 and m["brier"] < best_brier:
             best_brier = m["brier"]
             best_single_name = name
+    if not eligible_preds:
+        # Safety valve: if nothing clears the floor (e.g. a pathological small
+        # calibration set), relax it and re-run best-single selection over the
+        # full pool so the chosen model is genuinely the best of what exists.
+        for c in candidates:
+            c["eligible"] = True
+            c["note"] = "AUC floor relaxed — no candidate cleared 0.70"
+            eligible_preds[c["name"]] = cand_preds[c["name"]]
+        best_auc = -1.0
+        best_brier = float("inf")
+        for c in candidates:
+            if c["auc"] > best_auc + 0.003:
+                best_auc = c["auc"]
+                best_brier = c["brier"]
+                best_single_name = c["name"]
+            elif abs(c["auc"] - best_auc) <= 0.003 and c["brier"] < best_brier:
+                best_brier = c["brier"]
+                best_single_name = c["name"]
     for c in candidates:
         c["selected"] = c["name"] == best_single_name
 
-    # 6. Stacking ensemble (greedy forward selection).
-    stacking = build_stacking_weights(cand_preds, calib_labels)
+    # 6. Stacking ensemble (greedy forward selection over eligible models only).
+    stacking = build_stacking_weights(eligible_preds, calib_labels)
 
     best_name = best_single_name
-    chosen_preds = cand_preds[best_single_name]
+    chosen_preds = eligible_preds[best_single_name]
     if len(stacking["preds"]) > 0 and stacking["brier"] < best_brier - 0.0005:
         best_name = "Stacked ensemble"
         chosen_preds = stacking["preds"]
@@ -522,25 +537,38 @@ def run_model(
     calibrated_calib = [apply_isotonic(isotonic_points, p) for p in chosen_preds]
 
     # 8. Monte Carlo decision: enable only if it reduces Brier meaningfully.
+    #    The stochastic component is a 7-point Gauss-Hermite quadrature
+    #    expectation (O(1) per probability), evaluated at every σ in the grid
+    #    over the calibration set; the best-scoring σ is reported even when
+    #    it does not clear the improvement bar, so the rationale is exact.
     mc_sigma = 0.0
     mc_enabled = False
     base_brier = compute_brier(calibrated_calib, calib_labels)
     best_mc_brier = base_brier
+    best_sigma = 0.0
     for s in MC_GRID:
         preds = [monte_carlo_adjust(p, s, 10000) for p in calibrated_calib]
         b = compute_brier(preds, calib_labels)
-        if b < best_mc_brier - 0.0005:
+        if b < best_mc_brier:
+            best_mc_brier = b
+            best_sigma = s
+        if b < base_brier - 0.0005:
             best_mc_brier = b
             mc_sigma = s
     if mc_sigma > 0:
         mc_enabled = True
-    mc_rationale = (
-        f"Monte Carlo enabled: σ={mc_sigma} reduces calibration-set Brier "
-        f"{base_brier:.4f} → {best_mc_brier:.4f} (calibration error shrinks toward the mean)."
-        if mc_enabled else
-        f"Monte Carlo disabled: no stochastic σ in {{0.1..0.6}} reduced calibration-set Brier "
-        f"below {base_brier:.4f}. Deterministic point estimates are kept."
-    )
+    grid_text = ", ".join(f"{s}" for s in MC_GRID)
+    if mc_enabled:
+        mc_rationale = (
+            f"Monte Carlo enabled: σ={mc_sigma} (grid {{{grid_text}}}) reduces calibration-set Brier "
+            f"{base_brier:.4f} → {best_mc_brier:.4f} (calibration error shrinks toward the mean)."
+        )
+    else:
+        mc_rationale = (
+            f"Monte Carlo disabled: no stochastic σ in {{{grid_text}}} reduced calibration-set Brier "
+            f"below {base_brier:.4f} (best {best_mc_brier:.4f} at σ={best_sigma}). "
+            "Deterministic point estimates are kept."
+        )
 
     model: dict = {
         "featureNames": selected,
@@ -603,6 +631,7 @@ def run_model(
         "cvFolds": 5,
         "isotonicMethod": "Isotonic (PAV)",
         "featureSelection": "Greedy backward elimination (L2 logistic, IRLS)",
+        "minCandidateAuc": CANDIDATE_MIN_AUC,
     }
 
     # 14. Run-scoring model + run-line calibration.

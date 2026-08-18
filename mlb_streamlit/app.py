@@ -1384,7 +1384,7 @@ def _automl_panel(ms: dict) -> None:
         f"<p style='margin:8px 0 0;font-size:13px;color:{ui.MUTED};line-height:1.6;max-width:720px;'>"
         f"Machine Learning algorithms automatically assess feature predictive signal (via L2-regularized logistic regression "
         f"with greedy backward elimination) and solve for optimal ensemble weights by minimizing calibration-set Brier loss to "
-        f"maximize out-of-sample AUC (&gt; 0.60) while enforcing monotonic probability calibration.</p></div></div></div>",
+        f"maximize out-of-sample AUC (&gt; 0.70 floor) while enforcing monotonic probability calibration.</p></div></div></div>",
         unsafe_allow_html=True,
     )
     if st.button("🔄 Run Auto-ML Optimization", type="primary", key="automl_btn"):
@@ -1394,8 +1394,8 @@ def _automl_panel(ms: dict) -> None:
 
     cards = [
         ("Ensemble AUC-ROC", f"{ensemble_auc:.3f}", ui.CYAN,
-         "> 0.60 Target Met" if ensemble_auc >= 0.6 else "Below 0.60 target",
-         ui.EMERALD if ensemble_auc >= 0.6 else ui.AMBER,
+         "> 0.75 Goal Met" if ensemble_auc >= 0.75 else "Below 0.75 goal",
+         ui.EMERALD if ensemble_auc >= 0.75 else ui.AMBER,
          "High single-game MLB separation"),
         ("Ensemble Brier Loss", f"{ensemble_brier:.3f}", ui.EMERALD,
          f"{ensemble_brier - 0.25:+.3f} vs naive baseline", ui.EMERALD,
@@ -1465,6 +1465,7 @@ def _automl_panel(ms: dict) -> None:
                 f"<div style='display:flex;align-items:center;gap:8px;'>"
                 f"<span style='font-size:13px;font-weight:500;color:{ui.TEXT}'>{c['name']}</span>"
                 + (ui.pill("Best single", ui.EMERALD, "rgba(52,211,153,0.15)") if c.get("selected") else "")
+                + (ui.pill("Excluded", ui.AMBER, "rgba(252,211,77,0.12)") if not c.get("eligible") else "")
                 + f"</div>"
                 f"<div style='display:flex;gap:12px;font-size:12px;color:{ui.MUTED};font-variant-numeric:tabular-nums;'>"
                 f"<span>AUC {c['auc']:.3f}</span><span>Brier {c['brier']:.3f}</span>"
@@ -1484,6 +1485,7 @@ def _automl_panel(ms: dict) -> None:
         params = ms.get("optimizationParams") or {}
         param_rows = [
             ("Feature selection", params.get("featureSelection", "—")),
+            ("Candidate pool floor", f"AUC ≥ {params.get('minCandidateAuc', '—')}"),
             ("Regularization", f"L2 λ = {params.get('l2Lambda', '—')}"),
             ("Optimizer", f"Newton–Raphson (IRLS) · {params.get('epochs', '—')} iterations"),
             ("Home-field grid", ", ".join(str(x) for x in params.get("hfaGrid", []))),
@@ -1570,7 +1572,7 @@ def _ensemble_panel(ms: dict) -> None:
     candidates = ms.get("candidates") or []
     steps = [
         f"{len(ms.get('featureImportances') or ms.get('featureNames') or [])} Features",
-        "5 Candidate Models",
+        f"{max(1, len([c for c in candidates if c.get('eligible')]))} Candidate Models",
         "Stacked Ensemble",
         "Isotonic Calibration",
         "Monte Carlo",
@@ -1591,7 +1593,12 @@ def _ensemble_panel(ms: dict) -> None:
 
     cand_rows = []
     for c in candidates:
-        status = ui.pill("Selected", ui.EMERALD, "rgba(52,211,153,0.15)") if c.get("selected") else "<span style='color:#8b939f;font-size:12px'>—</span>"
+        if c.get("selected"):
+            status = ui.pill("Selected", ui.EMERALD, "rgba(52,211,153,0.15)")
+        elif not c.get("eligible"):
+            status = ui.pill("Excluded (<0.70)", ui.AMBER, "rgba(252,211,77,0.12)")
+        else:
+            status = "<span style='color:#8b939f;font-size:12px'>—</span>"
         cand_rows.append([
             f"<b style='color:{ui.TEXT}'>{c['name']}</b>",
             f"<span style='color:{ui.TEXT};font-variant-numeric:tabular-nums'>{c['auc']:.3f}</span>",

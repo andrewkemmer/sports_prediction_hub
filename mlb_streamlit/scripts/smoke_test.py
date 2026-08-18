@@ -761,6 +761,74 @@ def test_automl_pipeline() -> None:
           and r2["crossValidation"] == result["crossValidation"],
           "parallelized pipeline drifted between identical runs")
 
+    # Candidate pool floor: every eligible model clears 0.70 AUC (or the floor
+    # was relaxed because nothing cleared it on this synthetic data), selection
+    # always comes from the eligible pool, and the stronger families are in it.
+    relaxed = any(c.get("note", "").startswith("AUC floor relaxed") for c in result["candidates"])
+    check("candidate floor: eligible >= 0.70 / excluded < 0.70 (or relaxed)",
+          relaxed or all((c["auc"] >= 0.70) == bool(c.get("eligible")) for c in result["candidates"]),
+          f"{[(c['name'], round(c['auc'], 3), c.get('eligible')) for c in result['candidates']]}")
+    sel_c = next((c for c in result["candidates"] if c.get("selected")), None)
+    check("selected model eligible (or relaxed)",
+          sel_c is not None and (relaxed or bool(sel_c.get("eligible"))))
+    pool_names = [c["name"] for c in result["candidates"]]
+    for want in ("Distance-weighted k-NN (k=21)", "Boosted decision stumps", "Logistic regression (L2, λ=1)"):
+        check(f"candidate pool includes {want}", want in pool_names, f"{pool_names}")
+    check("mc rationale reports the actual sigma grid",
+          "0.1" in result["monteCarloRationale"] and "0.6" in result["monteCarloRationale"],
+          f"{result['monteCarloRationale'][:140]}")
+    check("mc trials consistent with toggle",
+          result["monteCarloTrials"] == (10000 if result["monteCarloEnabled"] else 0))
+
+
+def test_ensemble_models() -> None:
+    print("ensemble model families")
+    from mlb_streamlit.engine.ensemble import (
+        boosted_stumps_model,
+        weighted_knn_calib_preds,
+        weighted_knn_model,
+    )
+
+    games = make_games(500, seed=21)
+    rows = compute_elo_and_features(games, None, "2026-08-15")["rows"]
+    train = rows[: int(len(rows) * 0.7)]
+    calib = rows[int(len(rows) * 0.7): int(len(rows) * 0.85)]
+    labels = [r["label"] for r in calib]
+
+    # Boosted stumps: deterministic (fixed seed), valid probabilities, and
+    # real signal on the synthetic season.
+    b1 = boosted_stumps_model(train, FEATURE_KEYS, n_trees=30, seed=11)
+    b2 = boosted_stumps_model(train, FEATURE_KEYS, n_trees=30, seed=11)
+    p1 = [b1(r["features"]) for r in calib]
+    check("boosted stumps deterministic", p1 == [b2(r["features"]) for r in calib])
+    check("boosted stumps probabilities in (0,1)", all(0 < p < 1 for p in p1))
+    check("boosted stumps AUC > 0.6", compute_auc(p1, labels) > 0.6,
+          f"{compute_auc(p1, labels):.3f}")
+
+    # Tiny training sets fall back to the prior (degenerate-case guard).
+    tiny = boosted_stumps_model(train[:15], FEATURE_KEYS, n_trees=10)
+    tp = [tiny(r["features"]) for r in calib[:5]]
+    check("boosted stumps tiny-train prior fallback",
+          all(abs(v - 0.5) < 0.15 for v in tp), f"{tp}")
+
+    # Distance-weighted k-NN: deterministic, valid, batch == scalar path.
+    w1 = weighted_knn_model(train, FEATURE_KEYS, k=11)
+    w2 = weighted_knn_model(train, FEATURE_KEYS, k=11)
+    q1 = [w1(r["features"]) for r in calib]
+    check("weighted kNN deterministic", q1 == [w2(r["features"]) for r in calib])
+    check("weighted kNN probabilities in (0,1)", all(0 < p < 1 for p in q1))
+    check("weighted kNN calib batch matches scalar",
+          weighted_knn_calib_preds(train, calib, FEATURE_KEYS, k=11, model=w1) == q1)
+
+    # Regularization strengths produce distinct-but-valid fits (candidate
+    # pool diversity), with stronger ridge shrinking the coefficients.
+    m_low = train_logistic(train, FEATURE_KEYS, iterations=10)
+    m_high = train_logistic(train, FEATURE_KEYS, iterations=10, lambda_=1.0)
+    check("lambda_ fit is a valid model",
+          all(k in m_high for k in ("featureNames", "weights", "bias", "featureStats")))
+    check("stronger lambda shrinks weights",
+          sum(abs(w) for w in m_high["weights"]) < sum(abs(w) for w in m_low["weights"]) + 1e-9)
+
 
 def test_parallel_refresh() -> None:
     print("parallel refresh paths")
@@ -985,6 +1053,7 @@ def main() -> int:
     test_data_layer()
     test_market_odds()
     test_automl_pipeline()
+    test_ensemble_models()
     test_parallel_refresh()
     test_cache_roundtrip()
     print(f"\nAll {_CHECKS} checks passed.")
