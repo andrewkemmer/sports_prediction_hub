@@ -51,12 +51,6 @@ def _tanh(x: float) -> float:
     return (e2 - 1) / (e2 + 1)
 
 
-def _clip_grad(g: float, norm: float, max_norm: float) -> float:
-    if norm > max_norm:
-        return g * (max_norm / norm)
-    return g
-
-
 def _fit_numpy(
     X: list[list[float]],
     y: list[int],
@@ -113,10 +107,12 @@ def _fit_numpy(
         z = h2 @ W3.T + b3
         return h1, h2, z
 
+    def _stable_sigmoid(z):
+        return np.where(z >= 0, 1.0 / (1.0 + np.exp(-z)), np.exp(z) / (1.0 + np.exp(z)))
+
     def val_loss() -> float:
         _, _, z = forward(va)
-        p = 1.0 / (1.0 + np.exp(-z))
-        p = np.clip(p, 1e-7, 1 - 1e-7)
+        p = np.clip(_stable_sigmoid(z), 1e-7, 1 - 1e-7)
         loss = -np.mean(va_y * np.log(p) + (1 - va_y) * np.log(1 - p))
         reg = l2 * 0.5 * (np.sum(W1 * W1) + np.sum(W2 * W2) + np.sum(W3 * W3)) / m
         return float(loss + reg)
@@ -130,8 +126,7 @@ def _fit_numpy(
             Xb = tr[b]
             yb = tr_y[b]
             h1, h2, z = forward(Xb)
-            p = 1.0 / (1.0 + np.exp(-z))
-            p = np.clip(p, 1e-7, 1 - 1e-7)
+            p = np.clip(_stable_sigmoid(z), 1e-7, 1 - 1e-7)
             dz = (p - yb.reshape(-1, 1)) / len(b)  # mean over the batch
             gW3 = dz.T @ h2 + (l2 / m) * W3
             gb3 = dz.sum(axis=0)
@@ -175,6 +170,24 @@ def _fit_numpy(
     }
 
 
+def _mm(A: list[list[float]], B: list[list[float]]) -> list[list[float]]:
+    """Dense matmul (k×n @ n×m) with zip-based dot products."""
+    BT = list(zip(*B))
+    return [[sum(a * b for a, b in zip(row, col)) for col in BT] for row in A]
+
+
+def _add_row(A: list[list[float]], b: list[float]) -> list[list[float]]:
+    return [[v + bias for v, bias in zip(row, b)] for row in A]
+
+
+def _apply_row(A: list[list[float]], fn) -> list[list[float]]:
+    return [[fn(v) for v in row] for row in A]
+
+
+def _row_sums(A: list[list[float]]) -> list[float]:
+    return [sum(row) for row in A]
+
+
 def _fit_pure(
     X: list[list[float]],
     y: list[int],
@@ -188,6 +201,8 @@ def _fit_pure(
     patience: int,
     rng: random.Random,
 ) -> dict:
+    """Pure-Python twin of _fit_numpy: same batches, same math, batch matmuls
+    via list comprehensions. Slower than numpy but correct and deterministic."""
     n = len(X)
     val_n = max(1, int(round(n * val_frac)))
     tr = X[: n - val_n]
@@ -213,6 +228,9 @@ def _fit_pure(
     vb1 = [0.0] * h1n
     vb2 = [0.0] * h2n
     vb3 = [0.0]
+    W1T = list(zip(*W1))
+    W2T = list(zip(*W2))
+    W3T = list(zip(*W3))
 
     m = len(tr)
     best = None
@@ -221,71 +239,50 @@ def _fit_pure(
     max_norm = 5.0
     lr2 = l2 / m
 
+    def forward(Xb: list[list[float]]) -> tuple[list[list[float]], list[list[float]], list[float]]:
+        h1 = _apply_row(_add_row(_mm(Xb, W1T), b1), _tanh)
+        h2 = _apply_row(_add_row(_mm(h1, W2T), b2), _tanh)
+        z = [row[0] for row in _add_row(_mm(h2, W3T), b3)]
+        return h1, h2, z
+
+    def val_loss() -> float:
+        _, _, z = forward(va)
+        loss = 0.0
+        for i, zv in enumerate(z):
+            p = min(1 - 1e-7, max(1e-7, sigmoid(zv)))
+            loss += -(va_y[i] * math.log(p) + (1 - va_y[i]) * math.log(1 - p))
+        reg = 0.0
+        for row in W1:
+            for v in row:
+                reg += v * v
+        for row in W2:
+            for v in row:
+                reg += v * v
+        for v in W3[0]:
+            reg += v * v
+        return loss / len(va) + l2 * 0.5 * reg / m
+
     for _ in range(epochs):
         order = list(range(m))
         rng.shuffle(order)
         for s in range(0, m, batch):
             b = order[s:s + batch]
             n_b = len(b)
-            # Forward: accumulate hidden activations for the batch.
-            h1s = []
-            h2s = []
-            zs = []
-            for i in b:
-                a1 = [b1[j] for j in range(h1n)]
-                for j in range(h1n):
-                    wj = W1[j]
-                    xi = tr[i]
-                    acc = b1[j]
-                    for k in range(d0):
-                        acc += wj[k] * xi[k]
-                    a1[j] = acc
-                h1 = [_tanh(a) for a in a1]
-                a2 = [b2[j] for j in range(h2n)]
-                for j in range(h2n):
-                    wj = W2[j]
-                    acc = b2[j]
-                    for k in range(h1n):
-                        acc += wj[k] * h1[k]
-                    a2[j] = acc
-                h2 = [_tanh(a) for a in a2]
-                z = b3[0]
-                w3 = W3[0]
-                for k in range(h2n):
-                    z += w3[k] * h2[k]
-                h1s.append(h1)
-                h2s.append(h2)
-                zs.append(z)
-            # Backward: accumulate gradients over the batch (mean-scaled).
-            gW1 = [[0.0] * d0 for _ in range(h1n)]
-            gW2 = [[0.0] * h1n for _ in range(h2n)]
-            gW3 = [0.0] * h2n
-            gb1 = [0.0] * h1n
-            gb2 = [0.0] * h2n
-            gb3 = 0.0
-            for t, i in enumerate(b):
-                yb = tr_y[i]
-                p = sigmoid(zs[t])
-                dz = (p - yb) / n_b
-                gb3 += dz
-                for k in range(h2n):
-                    gW3[k] += dz * h2s[t][k]
-                for j in range(h2n):
-                    dh2 = dz * W3[0][j] * (1 - h2s[t][j] * h2s[t][j])
-                    gb2[j] += dh2
-                    h1t = h1s[t]
-                    for k in range(h1n):
-                        gW2[j][k] += dh2 * h1t[k]
-                for j in range(h1n):
-                    dh1 = 0.0
-                    for k2 in range(h2n):
-                        dh1 += (dz * W3[0][k2] * (1 - h2s[t][k2] * h2s[t][k2])) * W2[k2][j]
-                    da1 = dh1 * (1 - h1s[t][j] * h1s[t][j])
-                    gb1[j] += da1
-                    xi = tr[i]
-                    wj = gW1[j]
-                    for k in range(d0):
-                        wj[k] += da1 * xi[k]
+            Xb = [tr[i] for i in b]
+            yb = [tr_y[i] for i in b]
+            h1, h2, z = forward(Xb)
+            # Backward (mean-scaled over the batch, matching numpy).
+            dz = [[(sigmoid(zv) - yv) / n_b] for zv, yv in zip(z, yb)]
+            gW3 = [[sum(dzi[0] * h2i[k] for dzi, h2i in zip(dz, h2)) for k in range(h2n)]]
+            gb3 = [sum(dzi[0] for dzi in dz)]
+            dh2 = [[dzi[0] * W3[0][j] * (1 - h2i[j] * h2i[j]) for j in range(h2n)] for dzi, h2i in zip(dz, h2)]
+            da2 = dh2
+            gW2 = [[sum(da2i[j] * h1i[k] for da2i, h1i in zip(da2, h1)) for k in range(h1n)] for j in range(h2n)]
+            gb2 = _row_sums(da2)
+            dh1 = _mm(da2, W2)
+            da1 = [[dh1i[j] * (1 - h1i[j] * h1i[j]) for j in range(h1n)] for dh1i, h1i in zip(dh1, h1)]
+            gW1 = [[sum(da1i[j] * Xb_i[k] for da1i, Xb_i in zip(da1, Xb)) for k in range(d0)] for j in range(h1n)]
+            gb1 = _row_sums(da1)
             for j in range(h1n):
                 for k in range(d0):
                     gW1[j][k] += lr2 * W1[j][k]
@@ -293,11 +290,11 @@ def _fit_pure(
                 for k in range(h1n):
                     gW2[j][k] += lr2 * W2[j][k]
             for k in range(h2n):
-                gW3[k] += lr2 * W3[0][k]
+                gW3[0][k] += lr2 * W3[0][k]
             # Gradient clipping + momentum step. Gradients are mean-scaled
             # over the batch (dz includes 1/n_b), so the step is exactly
             # v = momentum*v - lr*g — the same update as the numpy path.
-            for g in (gW1, gW2, [gW3], [gb1], [gb2], [gb3]):
+            for g in (gW1, gW2, gW3, [gb1], [gb2], [gb3]):
                 norm = 0.0
                 for row in g:
                     for v in row:
@@ -316,35 +313,17 @@ def _fit_pure(
                     vW2[j][k] = momentum * vW2[j][k] - lr * gW2[j][k]
                     W2[j][k] += vW2[j][k]
             for k in range(h2n):
-                vW3[k] = momentum * vW3[k] - lr * gW3[k]
-                W3[0][k] += vW3[k]
+                vW3[0][k] = momentum * vW3[0][k] - lr * gW3[0][k]
+                W3[0][k] += vW3[0][k]
             for j in range(h1n):
                 vb1[j] = momentum * vb1[j] - lr * gb1[j]
                 b1[j] += vb1[j]
             for j in range(h2n):
                 vb2[j] = momentum * vb2[j] - lr * gb2[j]
                 b2[j] += vb2[j]
-            vb3[0] = momentum * vb3[0] - lr * gb3
+            vb3[0] = momentum * vb3[0] - lr * gb3[0]
             b3[0] += vb3[0]
-        # Validation loss (binary cross-entropy + L2 on train weights).
-        loss = 0.0
-        for i in range(len(va)):
-            h1 = [_tanh(b1[j] + sum(W1[j][k] * va[i][k] for k in range(d0))) for j in range(h1n)]
-            h2 = [_tanh(b2[j] + sum(W2[j][k] * h1[k] for k in range(h1n))) for j in range(h2n)]
-            z = b3[0] + sum(W3[0][k] * h2[k] for k in range(h2n))
-            p = sigmoid(z)
-            p = min(1 - 1e-7, max(1e-7, p))
-            loss += -(va_y[i] * math.log(p) + (1 - va_y[i]) * math.log(1 - p))
-        reg = 0.0
-        for row in W1:
-            for v in row:
-                reg += v * v
-        for row in W2:
-            for v in row:
-                reg += v * v
-        for v in W3[0]:
-            reg += v * v
-        vl = loss / len(va) + l2 * 0.5 * reg / m
+        vl = val_loss()
         if vl < best_val - 1e-6:
             best_val = vl
             stagnant = 0
@@ -362,9 +341,9 @@ def _fit_pure(
 
 
 def _predict_pure(params: dict, x: list[float], h1n: int, h2n: int) -> float:
-    h1 = [_tanh(params["b1"][j] + sum(params["W1"][j][k] * x[k] for k in range(len(x)))) for j in range(h1n)]
-    h2 = [_tanh(params["b2"][j] + sum(params["W2"][j][k] * h1[k] for k in range(h1n))) for j in range(h2n)]
-    z = params["b3"] + sum(params["W3"][k] * h2[k] for k in range(h2n))
+    h1 = [_tanh(params["b1"][j] + sum(a * b for a, b in zip(params["W1"][j], x))) for j in range(h1n)]
+    h2 = [_tanh(params["b2"][j] + sum(a * b for a, b in zip(params["W2"][j], h1))) for j in range(h2n)]
+    z = params["b3"] + sum(a * b for a, b in zip(params["W3"], h2))
     p = sigmoid(z)
     return min(0.9999, max(0.0001, p))
 

@@ -72,13 +72,22 @@ Any date the user picks in the Games tab is predicted on demand via
 
 ## The model (Auto-ML)
 
-- **Features** (16): Elo gap, win %, recent form, rest, IL counts, home field,
-  starting-pitcher FIP/ERA, team OPS/ERA/fielding, park factor, temperature,
-  wind, lineup-known and lineup OPS.
+- **Features** (31): Elo gap, win %, recent form, rest, IL counts, home field,
+  starting-pitcher FIP/ERA/K9/WHIP/last-3 ERA, team OPS/ERA/K9/WHIP/fielding,
+  park factor, temperature, wind, lineup OPS/wOBA/ISO/hot streak, BvP /
+  platoon / vs-team matchup edges — plus trajectory features from the cached
+  game logs: starter FIP trend slope, starter short-rest × workload
+  interaction, lineup batter momentum (recent OPS vs season) and 7-day
+  fatigue. Trajectory features populate only where real data exists (same
+  fresh-window gating as lineups), so older history never gets junk values.
 - **Feature selection**: L2-regularized logistic regression (Newton–Raphson /
   IRLS) with greedy backward elimination on a calibration split.
-- **Candidates**: Elo, logistic regression, k-NN (k=21), naive Bayes, and a
-  blended ensemble with an Elo-weight tuned on the calibration set.
+- **Candidates**: Elo, logistic regression (3 ridge strengths), distance-
+  weighted k-NN, L2-boosted decision stumps, a compact two-hidden-layer
+  neural network (MLP, deterministic seed, L2 + early stopping), and a
+  blended ensemble with an Elo-weight tuned on the calibration set. Only
+  candidates clearing a 0.70 calibration AUC floor are eligible for
+  selection/stacking.
 - **Stacking**: greedy forward selection solves convex combination weights that
   minimize calibration-set Brier loss (high AUC, low risk).
 - **Calibration**: isotonic regression (PAV) enforced monotonic on the
@@ -93,7 +102,7 @@ Any date the user picks in the Games tab is predicted on demand via
 ## Testing
 
 ```bash
-python3 mlb_streamlit/scripts/smoke_test.py          # engine + data pipeline (114 checks)
+python3 mlb_streamlit/scripts/smoke_test.py          # engine + data pipeline (233 checks)
 python3 mlb_streamlit/scripts/ui_render_test.py       # Streamlit UI panels with stubbed streamlit/plotly
 ```
 

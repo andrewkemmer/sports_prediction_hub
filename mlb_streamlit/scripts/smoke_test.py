@@ -354,6 +354,50 @@ def test_lineups() -> None:
     f_none = build_features_for_game(g24, st)
     check("no lineup -> feature 0", f_none["lineupOpsDiff"] == 0.0 and f_none["lineupKnown"] == 0)
 
+    # Trajectory: batter momentum (recent-10 OPS minus season OPS) and 7-day
+    # fatigue, gated on >= 5 prior games, attached per-batter and
+    # slot-weighted into the lineup features (no lookahead).
+    def mk_traj(cold: bool, d: str) -> dict:
+        h = 1 if cold else 3
+        tb = 1 if cold else 7
+        return {"d": d, "ab": 4, "h": h, "bb": 0, "ibb": 0, "hbp": 0, "sf": 0,
+                "tb": tb, "2b": 0, "3b": 0, "hr": 0 if cold else 1}
+
+    home_days = [(date(2026, 5, 1) + timedelta(days=i)).isoformat() for i in range(14)]  # 05-01..05-14
+    away_days = [(date(2026, 4, 20) + timedelta(days=i)).isoformat() for i in range(14)]  # 04-20..05-03
+    traj_logs = {}
+    # Home batters: 9 cold games then 5 hot (05-10..05-14) -> positive
+    # momentum; games7 = 2 (05-13/05-14 inside the 7-day window).
+    for pid in (11, 12):
+        traj_logs[f"{pid}|2026"] = [mk_traj(True, d) for d in home_days[:9]] + [mk_traj(False, d) for d in home_days[9:]]
+    # Away batters: 14 cold games all before 05-03 -> momentum 0, games7 = 0.
+    for pid in (21, 22):
+        traj_logs[f"{pid}|2026"] = [mk_traj(True, d) for d in away_days]
+    traj_lineup = {
+        "home": {"battingOrder": [{"id": 11, "name": "H1"}, {"id": 12, "name": "H2"}], "bench": []},
+        "away": {"battingOrder": [{"id": 21, "name": "A1"}, {"id": 22, "name": "A2"}], "bench": []},
+    }
+    tg = {"gamePk": 9, "date": "2026-05-20", "season": "2026",
+          "home": {"id": 119}, "away": {"id": 108}}
+    attached_t = attach_lineups_as_of([tg], {9: traj_lineup}, traj_logs)[0]
+    hs = attached_t["lineupStats"]["home"]
+    as_ = attached_t["lineupStats"]["away"]
+    check("lineup momentum positive (heating up)", hs["momentum"] == 0.286, f"{hs['momentum']}")
+    check("lineup momentum flat for cold team", as_["momentum"] == 0.0, f"{as_['momentum']}")
+    check("lineup fatigue games7 (2 games in window)", hs["games7"] == 2.0, f"{hs['games7']}")
+    check("lineup fatigue 0 for rested team", as_["games7"] == 0.0, f"{as_['games7']}")
+    feats_t = build_features_for_game(attached_t, new_state())
+    check("lineupMomentumDiff = home - away", feats_t["lineupMomentumDiff"] == 0.286,
+          f"{feats_t['lineupMomentumDiff']}")
+    check("lineupFatigueDiff = away - home (lower-better)", feats_t["lineupFatigueDiff"] == -2.0,
+          f"{feats_t['lineupFatigueDiff']}")
+    # Gating: fewer than 5 prior games -> momentum stays 0 (no junk values).
+    sparse = {f"{pid}|2026": [mk_traj(True, d) for d in home_days[:3]] for pid in (11, 12, 21, 22)}
+    sparse_lu = attach_lineups_as_of([tg], {9: traj_lineup}, sparse)[0]
+    check("momentum gated on >= 5 prior games",
+          sparse_lu["lineupStats"]["home"]["momentum"] == 0.0
+          and sparse_lu["lineupStats"]["away"]["momentum"] == 0.0)
+
     # Lineups cache round-trip preserves None (completed games with no boxscore lineups).
     marker = "_smoke_lineups.json"
     try:
@@ -607,6 +651,24 @@ def test_as_of_stats() -> None:
     r_ip = 5 + 7 + 4
     r_er = 3 + 0 + 4
     check("pitcher_as_of recentEra (last 3 starts)", a["recentEra"] == round(r_er * 9 / r_ip, 2), f"{a}")
+
+    # Trajectory fields: rest since the last start, workload (IP, last 3
+    # starts) and the FIP trend slope over the last 5 starts (>= 3 required) —
+    # all strictly before the target date, from the same cached log.
+    check("pitcher_as_of restDays (last start 04-14 vs 04-15)", a.get("restDays") == 1, f"{a.get('restDays')}")
+    check("pitcher_as_of workload (IP last 3 starts)", a.get("workload") == 16.0, f"{a.get('workload')}")
+    check("pitcher_as_of trendFip present", isinstance(a.get("trendFip"), (int, float)))
+    check("pitcher_as_of trendFip sign (terrible final start -> worsening)", a.get("trendFip", 0) > 0,
+          f"{a.get('trendFip')}")
+    improving = [
+        {"d": "2026-04-01", "ip": 6.0, "er": 3, "so": 4, "bb": 2, "hbp": 0, "hr": 2, "h": 6},
+        {"d": "2026-04-06", "ip": 6.0, "er": 2, "so": 5, "bb": 2, "hbp": 0, "hr": 1, "h": 5},
+        {"d": "2026-04-11", "ip": 6.0, "er": 1, "so": 6, "bb": 1, "hbp": 0, "hr": 0, "h": 4},
+        {"d": "2026-04-16", "ip": 6.0, "er": 0, "so": 8, "bb": 1, "hbp": 0, "hr": 0, "h": 2},
+    ]
+    b = data.pitcher_as_of(improving, "2026-04-20")
+    check("pitcher_as_of trendFip negative when improving", (b.get("trendFip") or 0) < 0, f"{b.get('trendFip')}")
+    check("pitcher_as_of restDays when well rested", b.get("restDays") == 4, f"{b.get('restDays')}")
     check("pitcher_as_of empty", data.pitcher_as_of([], "2026-04-15") == {})
     check("pitcher_as_of no prior games", data.pitcher_as_of(log, "2026-04-01") == {})
 
@@ -772,7 +834,7 @@ def test_automl_pipeline() -> None:
     check("selected model eligible (or relaxed)",
           sel_c is not None and (relaxed or bool(sel_c.get("eligible"))))
     pool_names = [c["name"] for c in result["candidates"]]
-    for want in ("Distance-weighted k-NN (k=21)", "Boosted decision stumps", "Logistic regression (L2, λ=1)"):
+    for want in ("Distance-weighted k-NN (k=21)", "Boosted decision stumps", "Neural network (MLP)", "Logistic regression (L2, λ=1)"):
         check(f"candidate pool includes {want}", want in pool_names, f"{pool_names}")
     check("mc rationale reports the actual sigma grid",
           "0.1" in result["monteCarloRationale"] and "0.6" in result["monteCarloRationale"],
@@ -810,6 +872,19 @@ def test_ensemble_models() -> None:
     tp = [tiny(r["features"]) for r in calib[:5]]
     check("boosted stumps tiny-train prior fallback",
           all(abs(v - 0.5) < 0.15 for v in tp), f"{tp}")
+
+    # Neural network (MLP): deterministic (fixed seed), valid probabilities,
+    # and real signal on the synthetic season.
+    from mlb_streamlit.engine.nn import mlp_model
+    n1 = mlp_model(train, FEATURE_KEYS, seed=31)
+    n2 = mlp_model(train, FEATURE_KEYS, seed=31)
+    qn1 = [n1(r["features"]) for r in calib]
+    check("mlp deterministic", qn1 == [n2(r["features"]) for r in calib])
+    check("mlp probabilities in (0,1)", all(0 < p < 1 for p in qn1))
+    check("mlp AUC > 0.6", compute_auc(qn1, labels) > 0.6, f"{compute_auc(qn1, labels):.3f}")
+    tiny_nn = mlp_model(train[:15], FEATURE_KEYS)
+    tnn = [tiny_nn(r["features"]) for r in calib[:5]]
+    check("mlp tiny-train prior fallback", all(abs(v - 0.5) < 0.15 for v in tnn), f"{tnn}")
 
     # Distance-weighted k-NN: deterministic, valid, batch == scalar path.
     w1 = weighted_knn_model(train, FEATURE_KEYS, k=11)

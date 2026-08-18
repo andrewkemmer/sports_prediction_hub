@@ -5,8 +5,9 @@ Faithful port of `runModel` from src/convex/ml/model.ts. The pipeline is:
   1. Chronological Elo ratings + as-of-game-time features (no lookahead).
   2. Chronological 70/15/15 split: train / calibrate / test.
   3. Feature selection via greedy backward elimination on the calibrate set.
-  4. Candidate models: Elo, logistic regression, k-NN, Naive Bayes, blended
-     ensemble, and a greedy-forward-selection stacked ensemble.
+  4. Candidate models: Elo, logistic regression, k-NN, boosted stumps, a
+     compact neural network (MLP), the blended ensemble, and a
+     greedy-forward-selection stacked ensemble.
   5. Model selection: maximize AUC, then minimize Brier among near-best.
   6. Isotonic calibration (PAV) to reduce Brier / calibration error.
   7. Monte Carlo decision: enable the stochastic component only if it
@@ -45,6 +46,7 @@ from .metrics import (
     sigmoid,
     std,
 )
+from .nn import mlp_model
 from .runs import expected_margin, expected_total, fit_run_model, simulate_runs
 from .teams import team_meta
 
@@ -451,9 +453,10 @@ def run_model(
 
     # 5. Candidate models. The pool deliberately spans model families:
     #    Elo (pure ratings), regularized logistic at three ridge strengths,
-    #    distance-weighted k-NN, L2-boosted decision stumps, and the blended
-    #    ensemble. Only candidates that clear the AUC floor (CANDIDATE_MIN_AUC)
-    #    are eligible for selection / stacking, so every model the selector
+    #    distance-weighted k-NN, L2-boosted decision stumps, a compact
+    #    two-hidden-layer neural network (MLP), and the blended ensemble.
+    #    Only candidates that clear the AUC floor (CANDIDATE_MIN_AUC) are
+    #    eligible for selection / stacking, so every model the selector
     #    chooses among is strong; the rest stay visible with an "excluded"
     #    note for transparency.
     knn_train = train[-KNN_TRAIN_CAP:] if len(train) > KNN_TRAIN_CAP else train
@@ -461,6 +464,7 @@ def run_model(
     lr_stronger = train_logistic(train, selected, lambda_=1.0)
     wknn = weighted_knn_model(knn_train, selected)
     boost = boosted_stumps_model(train, selected)
+    nn = mlp_model(train, selected)
 
     cand_preds: dict[str, list[float]] = {
         "Elo rating": [elo_prob(r, elo_hfa) for r in calib],
@@ -469,6 +473,7 @@ def run_model(
         "Logistic regression (L2, λ=1)": [sigmoid(logistic_logit(lr_stronger, r["features"], None)) for r in calib],
         "Distance-weighted k-NN (k=21)": weighted_knn_calib_preds(knn_train, calib, selected, model=wknn),
         "Boosted decision stumps": [boost(r["features"]) for r in calib],
+        "Neural network (MLP)": [nn(r["features"]) for r in calib],
         "Blended ensemble": [sigmoid((1 - blend_w) * l + blend_w * e) for l, e in zip(lr_logits, elo_logits)],
     }
 
@@ -632,6 +637,11 @@ def run_model(
         "isotonicMethod": "Isotonic (PAV)",
         "featureSelection": "Greedy backward elimination (L2 logistic, IRLS)",
         "minCandidateAuc": CANDIDATE_MIN_AUC,
+        "nnHidden": [20, 10],
+        "nnEpochs": 40,
+        "nnLr": 0.03,
+        "nnL2": 1e-4,
+        "nnEarlyStopPatience": 6,
     }
 
     # 14. Run-scoring model + run-line calibration.

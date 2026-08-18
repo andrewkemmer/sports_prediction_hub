@@ -432,7 +432,15 @@ def pitcher_as_of(entries: list[dict] | None, ymd: str, recent_starts: int = 3) 
 
     No lookahead: only games with date < ymd count. `recentEra` covers the
     pitcher's last `recent_starts` starts before the target date (hot/cold
-    starter signal).
+    starter signal). Trajectory fields are also derived from the same log:
+
+      * `restDays`   — days since the starter's last outing (0..14, clamped),
+        only present when he has started before the target date.
+      * `workload`   — innings over the last 3 starts (fatigue context for
+        the short-rest interaction).
+      * `trendFip`   — least-squares slope of per-start FIP over the last 5
+        starts (>= 3 required), so a *direction* of change is available, not
+        just a level. Negative = improving. Missing on thin logs.
     """
     if not entries:
         return {}
@@ -463,7 +471,32 @@ def pitcher_as_of(entries: list[dict] | None, ymd: str, recent_starts: int = 3) 
     r_er = sum(r["er"] for r in recent)
     if r_ip > 0:
         out["recentEra"] = round(r_er * 9 / r_ip, 2)
+    if recent:
+        last = recent[-1]["d"]
+        try:
+            rest = (date.fromisoformat(ymd) - date.fromisoformat(last)).days
+        except ValueError:
+            rest = 14
+        out["restDays"] = max(0, min(14, rest))
+        out["workload"] = round(sum(r["ip"] for r in recent), 2)
+    trend = recent[-5:]
+    if len(trend) >= 3:
+        n_t = len(trend)
+        mean_x = (n_t - 1) / 2
+        mean_fip = 0.0
+        for i, e in enumerate(trend):
+            mean_fip += (13 * e["hr"] + 3 * (e["bb"] + e["hbp"]) - 2 * e["so"]) / e["ip"] + FIP_CONSTANT
+        mean_fip /= n_t
+        sxy = 0.0
+        sxx = 0.0
+        for i, e in enumerate(trend):
+            f = (13 * e["hr"] + 3 * (e["bb"] + e["hbp"]) - 2 * e["so"]) / e["ip"] + FIP_CONSTANT
+            sxy += (i - mean_x) * (f - mean_fip)
+            sxx += (i - mean_x) * (i - mean_x)
+        if sxx > 0:
+            out["trendFip"] = round(sxy / sxx, 3)
     return out
+
 
 
 # ---------------------------------------------------------------------------
@@ -1021,6 +1054,35 @@ def batter_recent_ops_as_of(entries: list[dict] | None, ymd: str, window: int = 
     return round(v, 3) if v is not None else None
 
 
+def batter_momentum_as_of(entries: list[dict] | None, ymd: str, window: int = 10, min_games: int = 5) -> float | None:
+    """Batter momentum: recent-window OPS minus season OPS, strictly before `ymd`.
+
+    Positive = heating up vs his own season baseline; negative = cooling off.
+    Requires at least `min_games` prior games so a 2-3 game sample never
+    manufactures a junk momentum value; None otherwise (the feature stays 0).
+    """
+    if not entries:
+        return None
+    if sum(1 for e in entries if e["d"] < ymd) < min_games:
+        return None
+    ops = batter_ops_as_of(entries, ymd)
+    recent = batter_recent_ops_as_of(entries, ymd, window)
+    if ops is None or recent is None:
+        return None
+    return round(recent - ops, 3)
+
+
+def batter_games7_as_of(entries: list[dict] | None, ymd: str) -> int:
+    """Games played in the 7 days before `ymd` (fatigue signal, no lookahead)."""
+    if not entries:
+        return 0
+    try:
+        cutoff = (date.fromisoformat(ymd) - timedelta(days=7)).isoformat()
+    except ValueError:
+        return 0
+    return sum(1 for e in entries if cutoff <= e["d"] < ymd)
+
+
 def attach_lineups_as_of(games: list[dict], lineups: dict, batter_logs: dict) -> list[dict]:
     """Attach lineups with each batter's OPS as-of the game's own date (no lookahead)."""
     out = []
@@ -1044,6 +1106,8 @@ def attach_lineups_as_of(games: list[dict], lineups: dict, batter_logs: dict) ->
                 "woba": batter_woba_as_of(log, ymd),
                 "iso": batter_iso_as_of(log, ymd),
                 "recentOps": recent,
+                "momentum": batter_momentum_as_of(log, ymd),
+                "games7": batter_games7_as_of(log, ymd),
             }
 
         def with_ops(side):
@@ -1070,6 +1134,8 @@ def attach_lineups_as_of(games: list[dict], lineups: dict, batter_logs: dict) ->
                     "woba": _lineup_weighted(home["battingOrder"], "woba") if home_known else 0.0,
                     "iso": _lineup_weighted(home["battingOrder"], "iso") if home_known else 0.0,
                     "recentOps": _lineup_weighted(home["battingOrder"], "recentOps") if home_known else 0.0,
+                    "momentum": _lineup_weighted(home["battingOrder"], "momentum") if home_known else 0.0,
+                    "games7": _lineup_weighted(home["battingOrder"], "games7") if home_known else 0.0,
                 },
                 "away": {
                     "known": away_known,
@@ -1077,6 +1143,8 @@ def attach_lineups_as_of(games: list[dict], lineups: dict, batter_logs: dict) ->
                     "woba": _lineup_weighted(away["battingOrder"], "woba") if away_known else 0.0,
                     "iso": _lineup_weighted(away["battingOrder"], "iso") if away_known else 0.0,
                     "recentOps": _lineup_weighted(away["battingOrder"], "recentOps") if away_known else 0.0,
+                    "momentum": _lineup_weighted(away["battingOrder"], "momentum") if away_known else 0.0,
+                    "games7": _lineup_weighted(away["battingOrder"], "games7") if away_known else 0.0,
                 },
             },
         })

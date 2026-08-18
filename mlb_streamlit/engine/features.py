@@ -45,6 +45,10 @@ FEATURE_KEYS = [
     "spRecentDiff",
     "teamK9Diff",
     "teamWhipDiff",
+    "spTrendDiff",
+    "spRestWorkloadDiff",
+    "lineupMomentumDiff",
+    "lineupFatigueDiff",
 ]
 
 FEATURE_LABELS = {
@@ -75,6 +79,10 @@ FEATURE_LABELS = {
     "spRecentDiff": "Starting Pitcher last-3-start ERA Delta",
     "teamK9Diff": "Staff K/9 edge",
     "teamWhipDiff": "Staff WHIP edge",
+    "spTrendDiff": "Starter recent-form trajectory (FIP slope)",
+    "spRestWorkloadDiff": "Starter short-rest × workload interaction",
+    "lineupMomentumDiff": "Starting-9 momentum (recent OPS vs season)",
+    "lineupFatigueDiff": "Starting-9 fatigue (games in last 7 days)",
 }
 
 
@@ -134,6 +142,21 @@ def _edge(home, away, lower_better: bool = False) -> float:
     if not isinstance(home, (int, float)) or not isinstance(away, (int, float)):
         return 0.0
     return (away - home) if lower_better else (home - away)
+
+
+def _sp_fatigue(pitcher) -> float:
+    """Short-rest × workload interaction for one starter.
+
+    Penalty = max(0, 5 - restDays) * inningsInLast3Starts — a well-rested
+    starter (restDays >= 5) pays nothing regardless of workload, and a
+    starter on short rest only pays when he has actually been throwing a lot.
+    0 when either piece is missing (no prior starts -> no fatigue signal).
+    """
+    rest = (pitcher or {}).get("restDays")
+    workload = (pitcher or {}).get("workload")
+    if not isinstance(rest, (int, float)) or not isinstance(workload, (int, float)):
+        return 0.0
+    return max(0.0, 5.0 - rest) * workload
 
 
 def build_features(game: dict, state: dict) -> dict:
@@ -209,6 +232,14 @@ def build_features(game: dict, state: dict) -> dict:
         "spRecentDiff": _edge((game.get("homePitcher") or {}).get("recentEra"), (game.get("awayPitcher") or {}).get("recentEra"), True),
         "teamK9Diff": _edge(home_k9, away_k9),
         "teamWhipDiff": _edge(home_whip, away_whip, True),
+        # Trajectory features from the cached game logs (no lookahead, and
+        # only populated where the underlying data really exists): starter
+        # FIP trend slope (lower = improving), the short-rest x workload
+        # interaction, and lineup-level batter momentum / fatigue.
+        "spTrendDiff": _edge((game.get("homePitcher") or {}).get("trendFip"), (game.get("awayPitcher") or {}).get("trendFip"), True),
+        "spRestWorkloadDiff": _edge(_sp_fatigue(game.get("homePitcher")), _sp_fatigue(game.get("awayPitcher")), True),
+        "lineupMomentumDiff": _edge((lineup_home or {}).get("momentum"), (lineup_away or {}).get("momentum")),
+        "lineupFatigueDiff": _edge((lineup_home or {}).get("games7"), (lineup_away or {}).get("games7"), True),
     }
 
 
