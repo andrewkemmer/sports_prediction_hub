@@ -1086,6 +1086,97 @@ def _backtest_state(target: str, report=None) -> dict | None:
     return state
 
 
+CALIBRATION_WF_FILE = "calibration_rows_wf.json"
+
+
+def build_walk_forward_calibration_rows(report=None) -> list[dict]:
+    """Strict walk-forward calibration rows — the true point-in-time backtest.
+
+    Every completed game on date D is scored with a model trained ONLY on
+    games strictly before D (cached per date via `_backtest_state`), using
+    features/elo replayed chronologically as-of D. Each row records the date
+    its scoring model was trained through, so a row's game date is always
+    >= its model's training cutoff (the game was never in the training set).
+
+    Per-date results are cached keyed by a fingerprint of (games < D plus
+    games on D), so later calls re-score only new/changed dates — a refresh
+    that only adds later games reuses every earlier day's cached rows. Dates
+    with fewer than MIN_COMPLETED_GAMES prior games are skipped (no history
+    to train on).
+    """
+    def rep(stage, pct, msg):
+        if report:
+            report(stage, pct, msg)
+
+    cached = cache.load_games()
+    completed = [
+        g for g in cached
+        if g.get("winner") in ("home", "away")
+        and (g.get("home") or {}).get("id") and (g.get("away") or {}).get("id")
+    ]
+    today = et_date_string()
+    pitcher_log_cache = cache.load_pitcher_logs()
+    team_log_cache = cache.load_team_logs()
+    enriched = attach_as_of_stats(completed, pitcher_log_cache, team_log_cache)
+    lineups = {}
+    for pk, lu in (cache.load_lineups() or {}).items():
+        if lu:
+            try:
+                lineups[int(pk)] = lu
+            except (TypeError, ValueError):
+                pass
+    enriched = attach_lineups_as_of(enriched, lineups, cache.load_batter_logs())
+    enriched = [g for g in enriched if (g.get("date") or "") < today]
+    if not enriched:
+        return []
+
+    # One chronological replay gives every game's features/elo as-of itself.
+    fe = compute_elo_and_features(enriched, cache.load_injury_snapshots(), today)
+    rows_by_date: dict[str, list[dict]] = {}
+    for r in fe["rows"]:
+        rows_by_date.setdefault(r["game"]["date"], []).append(r)
+
+    by_date: dict[str, list[dict]] = {}
+    for g in enriched:
+        by_date.setdefault(g["date"], []).append(g)
+
+    existing = cache.load_json(CALIBRATION_WF_FILE, {}) or {}
+    out: dict[str, dict] = {}
+    dates = sorted(by_date)
+    for i, d in enumerate(dates):
+        prior = [g for g in enriched if g["date"] < d]
+        fp = _data_fingerprint(prior + by_date[d], {})
+        cached_day = existing.get(d)
+        if cached_day and cached_day.get("fp") == fp:
+            out[d] = cached_day
+            continue
+        st = _backtest_state(d, report)
+        if st is None:
+            continue
+        day_rows = rows_by_date.get(d) or []
+        if not day_rows:
+            continue
+        model = reconstruct_model(st)
+        cal_rows = build_calibration_rows(
+            day_rows,
+            model,
+            st["runModel"],
+            st["runLineCalibration"] or [],
+            st["runMarginCalibration"] or {"slope": 0, "intercept": 0},
+        )
+        for r in cal_rows:
+            r["trainedThrough"] = st["trainedThrough"]
+        out[d] = {"fp": fp, "rows": cal_rows}
+        rep("Walk-forward", 30 + int(65 * (i + 1) / max(1, len(dates))),
+            f"Scored {len(cal_rows)} game(s) on {d} with a model trained on {len(prior)} prior game(s)…")
+    cache.save_json(CALIBRATION_WF_FILE, out)
+    flat: list[dict] = []
+    for d in sorted(out):
+        flat.extend(out[d]["rows"])
+    rep("Walk-forward", 100, f"Walk-forward calibration ready ({len(flat)} games scored point-in-time).")
+    return flat
+
+
 def _team_state_as_of(date: str) -> dict | None:
     """Rebuild elo/form/records/injuries exactly as they were before `date`.
 
@@ -1272,9 +1363,13 @@ def load_bundle() -> dict | None:
     state = cache.load_model_state()
     if not state:
         return None
+    wf_days = cache.load_calibration_rows_wf()
     return {
         "model_state": state,
         "docs_by_date": cache.load_docs_by_date(),
         "calibration_rows": cache.load_calibration_rows(),
+        "calibration_rows_wf": [
+            r for d in sorted(wf_days) for r in wf_days[d].get("rows", [])
+        ],
         "calibration_summary": state.get("calibrationSummary"),
     }

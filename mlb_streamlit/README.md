@@ -99,14 +99,18 @@ Any date the user picks in the Games tab is predicted on demand via
   Backtested dates use strict walk-forward: viewing a past date retrains a
   fresh model on games played strictly before that date (no lookahead, cached
   per date) and predicts with as-of team state, so historical predictions
-  never see future results.
+  never see future results. The Calibration dashboard has a
+  Walk-forward (point-in-time) toggle: every completed game is scored by a
+  fresh model trained only on games before it, each row records its model's
+  training cutoff, and results are cached per date (incremental — only new or
+  changed days are re-scored).
 - **Monitoring**: per-feature PSI drift, rolling 30-day Brier, and model
   version history are persisted with each training run.
 
 ## Testing
 
 ```bash
-python3 mlb_streamlit/scripts/smoke_test.py          # engine + data pipeline (278 checks)
+python3 mlb_streamlit/scripts/smoke_test.py          # engine + data pipeline (287 checks)
 python3 mlb_streamlit/scripts/ui_render_test.py       # Streamlit UI panels with stubbed streamlit/plotly
 ```
 

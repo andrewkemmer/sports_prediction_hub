@@ -350,6 +350,89 @@ def test_backtest_guards() -> None:
         refresh.run_model = real_run_model
         cache.CACHE_DIR = old_dir2
         shutil.rmtree(tmp2, ignore_errors=True)
+    # Strict walk-forward calibration rows (see test_walk_forward_calibration;
+    # invoked here because the file tail / main() is outside the patch tool's
+    # index).
+    test_walk_forward_calibration()
+
+
+def test_walk_forward_calibration() -> None:
+    print("walk-forward calibration")
+    import shutil
+    import tempfile
+    from mlb_streamlit import refresh
+    from mlb_streamlit.data import et_date_string
+    import mlb_streamlit.engine.model as emod
+
+    real_run_model = refresh.run_model
+    real_min_games = refresh.MIN_COMPLETED_GAMES
+    real_sim = emod.simulate_runs_batch
+    calls = {"n": 0}
+
+    def stub_run_model(completed, season, as_of_date, injury_snapshots=None):
+        calls["n"] += 1
+        return {
+            "result": {
+                "season": season, "asOfDate": as_of_date,
+                "gamesTrained": len(completed), "holdoutCount": 0,
+                "selectedModel": "stub", "modelDescription": "stub",
+                "featureNames": [], "weights": [], "bias": 0.0,
+                "featureStats": {}, "isotonicPoints": [], "eloHfa": 30,
+                "monteCarloEnabled": False, "monteCarloTrials": 0,
+                "monteCarloSigma": 0.0, "auc": 0.5, "brier": 0.25,
+                "logLoss": 0.69, "ece": 0.0, "powerRankings": [],
+                "runModel": {"parkFactor": {}, "leagueRuns": 4.5,
+                              "teamOffense": {}, "teamDefense": {}},
+                "runLineCalibration": [],
+                "runMarginCalibration": {"slope": 0.0, "intercept": 0.0},
+            }
+        }
+
+    def fast_sim(state, home_ids, away_ids, totals, margins, trials):
+        return [{"total": 8.5, "homeRunLineProb": 0.52} for _ in home_ids]
+
+    tmp3 = tempfile.mkdtemp(prefix="mlb_cache_wf_")
+    old_dir3 = cache.CACHE_DIR
+    cache.CACHE_DIR = Path(tmp3)
+    refresh.MIN_COMPLETED_GAMES = 5
+    refresh.run_model = stub_run_model
+    emod.simulate_runs_batch = fast_sim
+    try:
+        wf_games = make_games(48, seed=13)
+        for g in wf_games:
+            g["status"] = {"abstractGameState": "Final", "detailedState": "Final"}
+            g["dayNight"] = "day"
+        cache.save_games(wf_games)
+        today = et_date_string()
+        rows1 = refresh.build_walk_forward_calibration_rows()
+        check("walk-forward rows produced", len(rows1) > 0, f"{len(rows1)}")
+        check("walk-forward only past completed dates",
+              all(r["date"] < today for r in rows1))
+        check("walk-forward every row records its model cutoff",
+              all(r.get("trainedThrough") for r in rows1))
+        # THE leak invariant: the scoring model for date D was trained on
+        # games strictly before D, so the game's own date is never inside the
+        # training set (game date >= trainedThrough).
+        check("walk-forward leak-free (game never in its scoring model)",
+              all(r["date"] >= r["trainedThrough"] for r in rows1),
+              f"{min((r['date'], r['trainedThrough']) for r in rows1)}")
+        all_dates = sorted({g["date"] for g in wf_games})
+        check("walk-forward skips thin-history dates",
+              all(r["date"] > all_dates[0] for r in rows1))
+        check("walk-forward rows sorted by date",
+              [r["date"] for r in rows1] == sorted(r["date"] for r in rows1))
+        n1 = calls["n"]
+        rows2 = refresh.build_walk_forward_calibration_rows()
+        check("walk-forward cached (no retrain/re-score on rebuild)",
+              calls["n"] == n1, f"{calls['n']} vs {n1}")
+        check("walk-forward deterministic", rows1 == rows2)
+        check("walk-forward persisted to cache", len(cache.load_calibration_rows_wf()) > 0)
+    finally:
+        refresh.run_model = real_run_model
+        refresh.MIN_COMPLETED_GAMES = real_min_games
+        emod.simulate_runs_batch = real_sim
+        cache.CACHE_DIR = old_dir3
+        shutil.rmtree(tmp3, ignore_errors=True)
 
 
 def test_logistic() -> None:

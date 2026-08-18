@@ -39,6 +39,7 @@ from mlb_streamlit.engine.teams import team_meta
 from mlb_streamlit.refresh import (
     PREDICTION_VERSION,
     SEASON_START,
+    build_walk_forward_calibration_rows,
     load_bundle,
     predict_date,
     run_refresh,
@@ -934,10 +935,9 @@ def rankings_tab(bundle) -> None:
 # Tab 3 — Calibration
 # ---------------------------------------------------------------------------
 
-def _calibration_range(bundle) -> tuple[_dt.date, _dt.date]:
-    rows = bundle["calibration_rows"]
+def _calibration_range(rows: list[dict], fallback: str) -> tuple[_dt.date, _dt.date]:
     if not rows:
-        return _dt.date.fromisoformat(bundle["model_state"]["asOfDate"]), _dt.date.fromisoformat(bundle["model_state"]["asOfDate"])
+        return _dt.date.fromisoformat(fallback), _dt.date.fromisoformat(fallback)
     dates = sorted(r["date"] for r in rows)
     return _dt.date.fromisoformat(dates[0]), _dt.date.fromisoformat(dates[-1])
 
@@ -1077,8 +1077,20 @@ def _game_history_rows(view: str, rows: list[dict]) -> tuple[list[str], list[lis
 
 def calibration_tab(bundle) -> None:
     ms = bundle["model_state"]
-    rows = bundle["calibration_rows"]
-    min_date, max_date = _calibration_range(bundle)
+    rows_in = bundle["calibration_rows"]
+    rows_wf = bundle.get("calibration_rows_wf") or []
+
+    # Method toggle: full-season (in-sample) vs strict walk-forward backtest.
+    if "cal_method" not in st.session_state:
+        st.session_state.cal_method = "Walk-forward (point-in-time)" if rows_wf else "Full-season (in-sample)"
+    st.segmented_control(
+        "Method",
+        ["Full-season (in-sample)", "Walk-forward (point-in-time)"],
+        key="cal_method",
+        default=st.session_state.cal_method,
+    )
+    method = st.session_state.cal_method
+    rows = rows_wf if method == "Walk-forward (point-in-time)" else rows_in
     total_games = len(rows)
 
     # Header: title → n pill → subtitle (mirrors the React calibration header)
@@ -1088,16 +1100,51 @@ def calibration_tab(bundle) -> None:
         f"Model Calibration Dashboard</h2>",
         unsafe_allow_html=True,
     )
-    st.markdown(
-        f"<div style='margin-top:10px;'>{ui.pill(f'n = {fmt_number(total_games)} games in range · Trained {trained_at} ET', ui.MUTED, 'rgba(255,255,255,0.05)')}</div>",
-        unsafe_allow_html=True,
-    )
+    if method == "Walk-forward (point-in-time)":
+        st.markdown(
+            f"<div style='margin-top:10px;'>{ui.pill(f'n = {fmt_number(len(rows_wf))} games scored point-in-time · each day trained on prior games only', ui.ACCENT, 'rgba(77,125,255,0.15)')}</div>",
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown(
+            f"<div style='margin-top:10px;'>{ui.pill(f'n = {fmt_number(total_games)} games in range · Trained {trained_at} ET', ui.MUTED, 'rgba(255,255,255,0.05)')}</div>",
+            unsafe_allow_html=True,
+        )
     st.markdown(
         f"<p style='margin:10px 0 0;font-size:13px;color:{ui.MUTED};line-height:1.5'>"
         "Assessing prediction reliability and accuracy for moneyline, game totals, and run lines — "
         "computed on one side per game.</p>",
         unsafe_allow_html=True,
     )
+
+    # First run of the walk-forward backtest: build it on demand (cached).
+    if method == "Walk-forward (point-in-time)" and not rows_wf:
+        st.markdown(
+            f"<div style='background:{ui._card_bg()};border:1px solid {ui.BORDER};border-radius:16px;"
+            f"padding:16px;margin-top:12px;'>"
+            f"<h3 style='margin:0;font-size:14px;font-weight:600;color:{ui.TEXT}'>Build the true backtest</h3>"
+            f"<p style='margin:6px 0 0;font-size:13px;color:{ui.MUTED};line-height:1.5'>"
+            f"Every completed game gets scored by a fresh model trained only on games before it — "
+            f"no game is ever predicted by a model that saw its result. Runs once (cached per date, "
+            f"incremental afterwards); the first build takes a few minutes.</p></div>",
+            unsafe_allow_html=True,
+        )
+        if st.button("Build walk-forward calibration", key="cal_build_wf", type="primary", use_container_width=True):
+            progress = st.progress(0, text="Building walk-forward calibration…")
+            try:
+                build_walk_forward_calibration_rows(
+                    report=lambda stage, pct, msg: progress.progress(
+                        max(0, min(int(pct), 99)), text=msg or stage
+                    ),
+                )
+            except Exception as e:  # noqa: BLE001
+                st.warning(f"Walk-forward build failed: {e}")
+            finally:
+                progress.empty()
+            st.session_state.bundle = load_bundle()
+            st.rerun()
+
+    min_date, max_date = _calibration_range(rows, ms.get("asOfDate") or "")
 
     if "cal_view" not in st.session_state:
         st.session_state.cal_view = "Moneyline"

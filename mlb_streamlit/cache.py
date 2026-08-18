@@ -22,6 +22,7 @@ CACHE_DIR = Path(__file__).resolve().parent / "cache"
 _GAMES = "games.json"
 _MODEL_STATE = "model_state.json"
 _CALIBRATION = "calibration_rows.json"
+_CALIBRATION_WF = "calibration_rows_wf.json"  # {date: {"fp": ..., "rows": [...]}}
 _PITCHER_STATS = "pitcher_stats.json"
 _TEAM_STATS = "team_stats.json"
 _PLAYER_OPS = "player_ops.json"
@@ -108,6 +109,15 @@ def load_calibration_rows() -> list[dict]:
 
 def save_calibration_rows(rows: list[dict]) -> None:
     save_json(_CALIBRATION, rows)
+
+
+def load_calibration_rows_wf() -> dict:
+    """Walk-forward calibration cache: date -> {"fp", "rows"}."""
+    return load_json(_CALIBRATION_WF, {}) or {}
+
+
+def save_calibration_rows_wf(days: dict) -> None:
+    save_json(_CALIBRATION_WF, days)
 
 
 def load_pitcher_stats() -> dict:
