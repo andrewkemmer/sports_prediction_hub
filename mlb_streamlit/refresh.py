@@ -34,7 +34,7 @@ from .data import (
     market_odds_enabled,
     market_odds_for_game,
 )
-from .engine.features import build_features_for_game
+from .engine.features import build_features_for_game, compute_elo_and_features
 from .engine.metrics import (
     apply_isotonic,
     calibration_curve_points,
@@ -994,14 +994,54 @@ def run_refresh(
     }
 
 
+def _team_state_as_of(date: str) -> dict | None:
+    """Rebuild elo/form/records/injuries exactly as they were before `date`.
+
+    Backtest dates must never see post-date knowledge. The stored power
+    rankings reflect the latest training run (today), so for any requested
+    date before today we replay the cached completed games chronologically
+    and keep the state at the last game strictly before that date; injuries
+    come from the as-of snapshots. Returns None (caller falls back to the
+    stored state) for today/future dates or when history is too thin.
+    """
+    if date >= et_date_string():
+        return None  # stored state is already current for today/future
+    cached = cache.load_games()
+    prior = [
+        g for g in cached
+        if g.get("winner") in ("home", "away")
+        and (g.get("date") or "") < date
+        and (g.get("home") or {}).get("id") and (g.get("away") or {}).get("id")
+    ]
+    if len(prior) < MIN_COMPLETED_GAMES:
+        return None
+    fe = compute_elo_and_features(prior, cache.load_injury_snapshots(), date)
+    return fe["teamState"]
+
+
+def _matchups_allowed(date: str) -> bool:
+    """Current-season platoon / vs-team splits are season-to-date, so they may
+    only be attached inside the recent/fresh window. Attaching them to an
+    older backtest date would silently absorb games played AFTER that date
+    (data leakage); the statsapi splits endpoint has no as-of-date filter.
+    """
+    return date >= add_days(et_date_string(), -RECENT_WINDOW_DAYS)
+
+
 def predict_date(date: str, state: dict | None = None) -> int:
     """On-demand prediction for an arbitrary date in the season (port of
-    mlbActions.predictDate). Uses the stored model; fetches only that day."""
+    mlbActions.predictDate). Uses the stored model; fetches only that day.
+
+    Backtest safety: for dates before today the team state (elo / form /
+    records / injuries) is rebuilt strictly from games played before that
+    date, and current-season matchup splits are only attached inside the
+    recent window — no post-date knowledge leaks into a historical pick.
+    """
     state = state or cache.load_model_state()
     if not state:
         raise RuntimeError("Model has not been trained yet. Click refresh first.")
     model = reconstruct_model(state)
-    team_state = reconstruct_team_state(state.get("powerRankings") or [])
+    team_state = _team_state_as_of(date) or reconstruct_team_state(state.get("powerRankings") or [])
     run_model_state = state.get("runModel")
     run_line_iso = state.get("runLineCalibration") or []
     run_margin_cal = state.get("runMarginCalibration") or {"slope": 0, "intercept": 0}
@@ -1055,21 +1095,27 @@ def predict_date(date: str, state: dict | None = None) -> int:
 
     # Matchup edges (BvP / platoon / vs-team) for the selected date's real
     # lineups, mirroring React's predictDate. Market odds are independent and
-    # I/O-bound, so the two fetch concurrently.
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        f_matchup = pool.submit(
-            enrich_with_matchups,
-            enriched,
-            batter_log_cache,
-            cache.load_bvp_logs(),
-            cache.load_platoon_logs(),
-            cache.load_vs_team_logs(),
-            season,
-        )
-        f_odds = pool.submit(fetch_market_odds)
-        matchup = f_matchup.result()
-        market_odds = f_odds.result()
-    enriched = matchup["games"]
+    # I/O-bound, so the two fetch concurrently. Current-season splits are
+    # only valid inside the recent window (see _matchups_allowed); older
+    # dates skip the matchup fetch and those features stay 0.
+    if _matchups_allowed(date):
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            f_matchup = pool.submit(
+                enrich_with_matchups,
+                enriched,
+                batter_log_cache,
+                cache.load_bvp_logs(),
+                cache.load_platoon_logs(),
+                cache.load_vs_team_logs(),
+                season,
+            )
+            f_odds = pool.submit(fetch_market_odds)
+            matchup = f_matchup.result()
+            market_odds = f_odds.result()
+        enriched = matchup["games"]
+    else:
+        market_odds = fetch_market_odds()
+        matchup = {"games": enriched, "bvpLogs": {}, "platoonLogs": {}, "vsTeamLogs": {}, "pitcherHands": {}}
 
     docs = []
     for g in enriched:

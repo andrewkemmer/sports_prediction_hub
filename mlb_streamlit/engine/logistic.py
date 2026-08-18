@@ -30,6 +30,16 @@ def _np_sigmoid(x):
     return _np.where(x >= 0, 1.0 / (1.0 + z), z / (1.0 + z))
 
 
+Z_CAP = 3.0  # winsorize standardized features: a single extreme small-sample
+# delta (e.g. a starter's 1-2 start ERA gap of 16) must not pin the sigmoid
+# at the 99% clamp and manufacture false confidence.
+
+
+def zscore(value: float, mean: float, std: float) -> float:
+    z = (value - mean) / (std or 1)
+    return Z_CAP if z > Z_CAP else (-Z_CAP if z < -Z_CAP else z)
+
+
 def solve_linear_system(A: list[list[float]], b: list[float]) -> list[float]:
     """Solve a small dense linear system A·x = b with partial pivoting."""
     n = len(A)
@@ -77,7 +87,7 @@ def _train_logistic_vectorized(rows: list[dict], feature_names: list[str], itera
     means = np.array([feature_stats[f]["mean"] for f in feature_names])
     stds = np.array([feature_stats[f]["std"] for f in feature_names])
     X = np.array([[r["features"][f] for f in feature_names] for r in rows], dtype=float)
-    X = (X - means) / stds
+    X = np.clip((X - means) / stds, -Z_CAP, Z_CAP)
     Xaug = np.column_stack([X, np.ones(n)])
     y = np.array([r["label"] for r in rows], dtype=float)
     d = m + 1  # feature columns + intercept column
@@ -142,7 +152,7 @@ def train_logistic(rows: list[dict], feature_names: list[str], iterations: int =
         s = std(vals) or 1
         feature_stats[f] = {"mean": mean(vals), "std": s}
     X = [
-        [(r["features"][f] - feature_stats[f]["mean"]) / feature_stats[f]["std"] for f in feature_names]
+        [zscore(r["features"][f], feature_stats[f]["mean"], feature_stats[f]["std"]) for f in feature_names]
         for r in rows
     ]
     y = [r["label"] for r in rows]
@@ -193,10 +203,11 @@ def train_logistic(rows: list[dict], feature_names: list[str], iterations: int =
 
 
 def logistic_logit(model: dict, features: dict, shap: list | None = None) -> float:
-    """Raw logit = bias + Σ w·z. When `shap` is a list, appends contributions."""
+    """Raw logit = bias + Σ w·z (z winsorized at ±Z_CAP). When `shap` is a
+    list, appends contributions."""
     logit_v = model["bias"]
     for i, f in enumerate(model["featureNames"]):
-        z = (features[f] - model["featureStats"][f]["mean"]) / (model["featureStats"][f]["std"] or 1)
+        z = zscore(features[f], model["featureStats"][f]["mean"], model["featureStats"][f]["std"])
         logit_v += model["weights"][i] * z
         if shap is not None:
             shap.append({
@@ -207,7 +218,7 @@ def logistic_logit(model: dict, features: dict, shap: list | None = None) -> flo
 
 
 def standardized(features: dict, feature_names: list[str], stats: dict) -> list[float]:
-    return [(features[f] - stats[f]["mean"]) / (stats[f]["std"] or 1) for f in feature_names]
+    return [zscore(features[f], stats[f]["mean"], stats[f]["std"]) for f in feature_names]
 
 
 def knn_model(train: list[dict], feature_names: list[str], k: int = 21):

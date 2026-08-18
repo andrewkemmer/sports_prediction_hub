@@ -214,6 +214,84 @@ def test_metrics() -> None:
     check("monte-carlo monotone", mc_hi > mc_lo, f"{mc_lo} vs {mc_hi}")
     check("american odds sign", american_odds(0.6) < 0 and american_odds(0.4) > 0,
           f"fav={american_odds(0.6)} dog={american_odds(0.4)}")
+    # Backtest leakage guards: winsorized z-scores, as-of team state, and
+    # matchup recency gating (see test_backtest_guards below; invoked here
+    # because the file tail / main() is outside the patch tool's index).
+    test_backtest_guards()
+
+
+def test_backtest_guards() -> None:
+    print("backtest leakage guards")
+    import shutil
+    import tempfile
+    from mlb_streamlit import refresh
+    from mlb_streamlit.data import add_days, et_date_string
+    from mlb_streamlit.engine.logistic import logistic_logit, train_logistic
+
+    # 1. Winsorized z-scores: a single extreme small-sample delta (e.g. a
+    #    starter's 1-2 start ERA gap of 16) must not saturate the sigmoid
+    #    and pin the display at the 99% clamp.
+    m = {"featureNames": ["x"], "weights": [1.0], "bias": 0.0,
+         "featureStats": {"x": {"mean": 0.0, "std": 1.0}}}
+    check("zscore capped at +3", logistic_logit(m, {"x": 10.0}, None) == 3.0)
+    check("zscore capped at -3", logistic_logit(m, {"x": -10.0}, None) == -3.0)
+    m2 = {"featureNames": ["x"], "weights": [1.0], "bias": 0.0,
+          "featureStats": {"x": {"mean": 0.0, "std": 0.5}}}
+    check("tiny-std feature capped too", logistic_logit(m2, {"x": 16.0}, None) == 3.0)
+    # Training and prediction use the same transform (fit/predict consistent).
+    rng = random.Random(7)
+    rows = []
+    for _ in range(200):
+        x = rng.uniform(-2, 2)
+        y = 1 if rng.random() < (0.5 + 0.3 * x) else 0
+        rows.append({"features": {"x": x}, "label": y})
+    trained = train_logistic(rows, ["x"])
+    logit_999 = logistic_logit(trained, {"x": 999.0}, None)
+    logit_10 = logistic_logit(trained, {"x": 10.0}, None)
+    check("extreme input clipped to 3-sigma (999 == 10)", logit_999 == logit_10,
+          f"{logit_999} vs {logit_10}")
+    p_hi = sigmoid(logit_999)
+    p_lo = sigmoid(logistic_logit(trained, {"x": -999.0}, None))
+    check("single-feature cap leaves headroom (not pinned at clamp)", p_hi < 0.9999 and p_lo > 0.0001,
+          f"{p_hi} / {p_lo}")
+
+    # 2. As-of team state: replaying cached games strictly before a date must
+    #    never include post-date results (elo / records / lastGameDate).
+    completed = make_games(120, seed=3)
+    for g in completed:
+        g["status"] = {"abstractGameState": "Final", "detailedState": "Final"}
+        g["dayNight"] = "day"
+    dates = sorted({g["date"] for g in completed})
+    target = dates[len(dates) // 2]
+    tmp = tempfile.mkdtemp(prefix="mlb_cache_")
+    old_dir = cache.CACHE_DIR
+    cache.CACHE_DIR = Path(tmp)
+    try:
+        cache.save_games(completed)
+        state_asof = refresh._team_state_as_of(target)
+    finally:
+        cache.CACHE_DIR = old_dir
+        shutil.rmtree(tmp, ignore_errors=True)
+    check("as-of state built for historical date", state_asof is not None)
+    prior = [g for g in completed if g["date"] < target]
+    prior_state = compute_elo_and_features(prior)["teamState"]
+    for tid in (108, 119):
+        check(f"as-of elo == prior-only replay ({tid})",
+              state_asof["elo"].get(tid) == prior_state["elo"].get(tid),
+              f"{state_asof['elo'].get(tid)} vs {prior_state['elo'].get(tid)}")
+        check(f"as-of records == prior-only replay ({tid})",
+              state_asof["records"].get(tid) == prior_state["records"].get(tid))
+    check("as-of lastGameDate <= target",
+          all(v <= target for v in state_asof["lastGameDate"].values() if v))
+    future_state = refresh._team_state_as_of(et_date_string())
+    check("today/future date keeps stored state", future_state is None)
+
+    # 3. Matchup recency gating: current-season splits may only attach inside
+    #    the recent window (older dates would leak games played after them).
+    today = et_date_string()
+    check("matchups allowed today", refresh._matchups_allowed(today))
+    check("matchups allowed 1 day back", refresh._matchups_allowed(add_days(today, -1)))
+    check("matchups blocked 30 days back", not refresh._matchups_allowed(add_days(today, -30)))
 
 
 def test_logistic() -> None:
