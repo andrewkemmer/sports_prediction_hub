@@ -203,6 +203,10 @@ def build_features(game: dict, state: dict) -> dict:
     home_lineup_known = 1 if (lineup_home or {}).get("known") is True else 0
     away_lineup_known = 1 if (lineup_away or {}).get("known") is True else 0
     lineup_known = 1 if home_lineup_known == 1 and away_lineup_known == 1 else 0
+    # Matchup splits (BvP / platoon / vs-team) are fetched as-of *now* with no
+    # as-of filter. A decided game must never consume them, or its own (and
+    # later) results would leak into the prediction.
+    matchup_known = game.get("winner") not in ("home", "away")
     if isinstance((lineup_home or {}).get("ops"), (int, float)) and isinstance((lineup_away or {}).get("ops"), (int, float)):
         lineup_ops_diff = lineup_home["ops"] - lineup_away["ops"]
     else:
@@ -231,10 +235,11 @@ def build_features(game: dict, state: dict) -> dict:
         # Matchup edges: career BvP OPS, season platoon OPS vs the starter's
         # throwing hand, season OPS vs the opposing team — PA-saturated,
         # slot-weighted means over the real starting 9 (0 + lineupKnown = 0
-        # when no boxscore lineup / opposing starter is known).
-        "bvpOpsDiff": _edge((lineup_home or {}).get("bvpOps"), (lineup_away or {}).get("bvpOps")),
-        "platoonOpsDiff": _edge((lineup_home or {}).get("platoonOps"), (lineup_away or {}).get("platoonOps")),
-        "vsTeamOpsDiff": _edge((lineup_home or {}).get("vsTeamOps"), (lineup_away or {}).get("vsTeamOps")),
+        # when no boxscore lineup / opposing starter is known). Zeroed for
+        # decided games so as-of-now splits can never leak a result back in.
+        "bvpOpsDiff": _edge((lineup_home or {}).get("bvpOps"), (lineup_away or {}).get("bvpOps")) if matchup_known else 0.0,
+        "platoonOpsDiff": _edge((lineup_home or {}).get("platoonOps"), (lineup_away or {}).get("platoonOps")) if matchup_known else 0.0,
+        "vsTeamOpsDiff": _edge((lineup_home or {}).get("vsTeamOps"), (lineup_away or {}).get("vsTeamOps")) if matchup_known else 0.0,
         "spK9Diff": _edge((game.get("homePitcher") or {}).get("k9"), (game.get("awayPitcher") or {}).get("k9")),
         "spWhipDiff": _edge((game.get("homePitcher") or {}).get("whip"), (game.get("awayPitcher") or {}).get("whip"), True),
         "spRecentDiff": _edge((game.get("homePitcher") or {}).get("recentEra"), (game.get("awayPitcher") or {}).get("recentEra"), True),

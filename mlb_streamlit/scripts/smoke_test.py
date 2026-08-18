@@ -820,6 +820,14 @@ def test_matchups() -> None:
     check("platoonOpsDiff = home - away", feats["platoonOpsDiff"] == 0.85, f"{feats['platoonOpsDiff']}")
     check("vsTeamOpsDiff = home - away", feats["vsTeamOpsDiff"] == 0.9, f"{feats['vsTeamOpsDiff']}")
 
+    # Decided games must not consume as-of-now matchup splits — season-to-date
+    # splits/career BvP would leak that game's own (and later) results back in.
+    decided = {**attached, "winner": "home"}
+    df = build_features_for_game(decided, new_state())
+    check("decided game zeroes matchup edges (no same-day leak)",
+          df["bvpOpsDiff"] == 0.0 and df["platoonOpsDiff"] == 0.0 and df["vsTeamOpsDiff"] == 0.0,
+          f"{df['bvpOpsDiff']}/{df['platoonOpsDiff']}/{df['vsTeamOpsDiff']}")
+
     # No opposing starter known -> BvP / platoon stay 0 (vsTeam still works).
     no_starter = {
         **game,
