@@ -282,7 +282,7 @@ def test_features_and_elo() -> None:
     check("home field present", feats["homeField"] == 1.0)
 
 
-def test_lineups() -> None:  # noqa: E999-probe
+def test_lineups() -> None:
     print("lineups")
     # lineup_ops: batting-order slots 1-4 carry 2x weight.
     lu = [
@@ -624,7 +624,7 @@ def test_matchups() -> None:
     finally:
         data.fetch_json = orig_json
 
-def test_as_of_stats() -> None:  # probe4
+def test_as_of_stats() -> None:
     print("as-of-date stats")
     import mlb_streamlit.data as data
 
@@ -737,9 +737,407 @@ def test_as_of_stats() -> None:  # probe4
     check("attach as-of team ops differs by date", g1["home"]["ops"] != g2["home"]["ops"],
           f"{g1['home'].get('ops')} vs {g2['home'].get('ops')}")
     check("attach as-of keeps team ids", g1["home"]["id"] == 119 and g1["away"]["id"] == 108)
+    # Optimization regression coverage — the pointer-based as-of attachment,
+    # the data fingerprint, and the no-retrain fast refresh path. Invoked
+    # from here because the file tail (main) is outside the patch tool's
+    # index; each test reports through the shared check() counter.
+    test_as_of_pointer_equiv()
+    test_data_fingerprint()
+    test_refresh_fast_path()
 
 
-def test_runs_model() -> None:  # probe5
+def test_as_of_pointer_equiv() -> None:
+    print("as-of pointer equivalence")
+    import mlb_streamlit.data as data
+
+    def mk_game(pk: int, ymd: str, hp: int, ap: int) -> dict:
+        return {
+            "gamePk": pk,
+            "date": ymd,
+            "gameDate": f"{ymd}T18:00:00Z",
+            "season": "2026",
+            "home": {"id": 119, "name": "Dodgers", "abbrev": "LAD", "score": 3},
+            "away": {"id": 108, "name": "Angels", "abbrev": "LAA", "score": 2},
+            "homePitcher": {"id": hp, "name": f"SP{hp}"},
+            "awayPitcher": {"id": ap, "name": f"SP{ap}"},
+            "winner": "home",
+        }
+
+    games = [
+        mk_game(1, "2026-04-01", 11, 21),
+        mk_game(2, "2026-04-03", 11, 22),
+        mk_game(3, "2026-04-05", 12, 21),
+        mk_game(4, "2026-04-08", 12, 22),
+        mk_game(5, "2026-04-10", 11, 21),
+    ]
+    games = [games[4], games[1], games[3], games[0], games[2]]  # unsorted input
+
+    pitcher_logs: dict[str, list[dict]] = {}
+    for pid in (11, 12, 21, 22):
+        pitcher_logs[f"{pid}|2026"] = [
+            {"d": "2026-03-26", "ip": 6.0, "er": 2, "so": 5, "bb": 2, "hbp": 0, "hr": 1, "h": 3},
+            {"d": "2026-03-31", "ip": 7.0, "er": 1, "so": 8, "bb": 1, "hbp": 1, "hr": 0, "h": 2},
+            {"d": "2026-04-04", "ip": 5.0, "er": 3, "so": 4, "bb": 3, "hbp": 0, "hr": 1, "h": 5},
+            {"d": "2026-04-07", "ip": 6.0, "er": 4, "so": 6, "bb": 2, "hbp": 0, "hr": 2, "h": 6},
+        ]
+    team_logs: dict[str, dict] = {}
+    for tid in (108, 119):
+        team_logs[f"{tid}|2026"] = {
+            "hitting": [
+                {"d": "2026-03-26", "ab": 34, "h": 9, "bb": 3, "hbp": 1, "sf": 1, "tb": 14},
+                {"d": "2026-03-31", "ab": 36, "h": 10, "bb": 2, "hbp": 0, "sf": 0, "tb": 16},
+                {"d": "2026-04-04", "ab": 35, "h": 8, "bb": 4, "hbp": 0, "sf": 1, "tb": 12},
+            ],
+            "pitching": [
+                {"d": "2026-03-26", "ip": 9.0, "er": 3, "so": 8, "bb": 2, "h": 7},
+                {"d": "2026-03-31", "ip": 9.0, "er": 2, "so": 9, "bb": 1, "h": 5},
+                {"d": "2026-04-04", "ip": 9.0, "er": 4, "so": 7, "bb": 3, "h": 8},
+            ],
+            "fielding": [
+                {"d": "2026-03-26", "po": 27, "a": 9, "e": 1},
+                {"d": "2026-03-31", "po": 27, "a": 10, "e": 0},
+                {"d": "2026-04-04", "po": 27, "a": 8, "e": 2},
+            ],
+        }
+
+    def naive_attach(games: list[dict]) -> list[dict]:
+        out = []
+        for g in games:
+            season = g.get("season")
+            hp = g.get("homePitcher")
+            ap = g.get("awayPitcher")
+            if hp and hp.get("id"):
+                hp = {**hp, **data.pitcher_as_of(pitcher_logs.get(f"{hp['id']}|{season}"), g["date"])}
+            if ap and ap.get("id"):
+                ap = {**ap, **data.pitcher_as_of(pitcher_logs.get(f"{ap['id']}|{season}"), g["date"])}
+            out.append({
+                **g,
+                "awayPitcher": ap,
+                "homePitcher": hp,
+                "home": {**g["home"], **data.team_as_of(team_logs.get(f"{g['home']['id']}|{season}"), g["date"])},
+                "away": {**g["away"], **data.team_as_of(team_logs.get(f"{g['away']['id']}|{season}"), g["date"])},
+            })
+        return out
+
+    ptr = data.attach_as_of_stats([dict(g) for g in games], pitcher_logs, team_logs)
+    naive = naive_attach(games)
+    check("as-of stats: pointer == naive on unsorted games", ptr == naive, "output mismatch")
+
+    def batter(bid: int) -> dict:
+        return {"id": bid, "name": f"B{bid}", "pos": "OF"}
+
+    home9 = [batter(1001 + i) for i in range(9)]
+    away9 = [batter(2001 + i) for i in range(9)]
+    lineups = {
+        1: {"home": {"battingOrder": home9, "bench": [batter(3001)]}, "away": {"battingOrder": away9, "bench": []}},
+        4: {"home": {"battingOrder": home9, "bench": []}, "away": {"battingOrder": away9, "bench": []}},
+    }
+    batter_logs: dict[str, list[dict]] = {}
+    for bid in list(range(1001, 1010)) + list(range(2001, 2010)) + [3001]:
+        batter_logs[f"{bid}|2026"] = [
+            {"d": "2026-03-26", "ab": 4, "h": 1, "bb": 0, "hbp": 0, "sf": 0, "tb": 1, "ibb": 0, "2b": 0, "3b": 0, "hr": 0},
+            {"d": "2026-03-28", "ab": 4, "h": 2, "bb": 0, "hbp": 0, "sf": 0, "tb": 3, "ibb": 0, "2b": 1, "3b": 0, "hr": 0},
+            {"d": "2026-03-30", "ab": 3, "h": 1, "bb": 1, "hbp": 0, "sf": 0, "tb": 1, "ibb": 0, "2b": 0, "3b": 0, "hr": 0},
+            {"d": "2026-04-02", "ab": 4, "h": 1, "bb": 0, "hbp": 0, "sf": 0, "tb": 4, "ibb": 0, "2b": 0, "3b": 0, "hr": 1},
+            {"d": "2026-04-05", "ab": 4, "h": 0, "bb": 0, "hbp": 0, "sf": 0, "tb": 0, "ibb": 0, "2b": 0, "3b": 0, "hr": 0},
+        ]
+
+    def batter_stats(bid: int, ymd: str) -> dict:
+        log = batter_logs.get(f"{bid}|2026")
+        return {
+            "ops": data.batter_ops_as_of(log, ymd),
+            "woba": data.batter_woba_as_of(log, ymd),
+            "iso": data.batter_iso_as_of(log, ymd),
+            "recentOps": data.batter_recent_ops_as_of(log, ymd),
+            "momentum": data.batter_momentum_as_of(log, ymd),
+            "games7": data.batter_games7_as_of(log, ymd),
+        }
+
+    def naive_lineups(games: list[dict]) -> list[dict]:
+        out = []
+        for g in games:
+            lu = lineups.get(g["gamePk"])
+            if not lu:
+                out.append(g)
+                continue
+
+            def with_ops(side):
+                if not side:
+                    return side
+                return {
+                    "battingOrder": [{**p, **batter_stats(p["id"], g["date"])} for p in side["battingOrder"]],
+                    "bench": [{**p, **batter_stats(p["id"], g["date"])} for p in side["bench"]],
+                }
+
+            home = with_ops(lu.get("home"))
+            away = with_ops(lu.get("away"))
+            home_ops = data.lineup_ops(home["battingOrder"]) if home else 0.0
+            away_ops = data.lineup_ops(away["battingOrder"]) if away else 0.0
+            home_known = home_ops > 0
+            away_known = away_ops > 0
+
+            def ls(order, known):
+                return {
+                    "known": known,
+                    "ops": data.lineup_ops(order) if known else 0.0,
+                    "woba": data._lineup_weighted(order, "woba") if known else 0.0,
+                    "iso": data._lineup_weighted(order, "iso") if known else 0.0,
+                    "recentOps": data._lineup_weighted(order, "recentOps") if known else 0.0,
+                    "momentum": data._lineup_weighted(order, "momentum") if known else 0.0,
+                    "games7": data._lineup_weighted(order, "games7") if known else 0.0,
+                }
+
+            out.append({
+                **g,
+                "lineups": {"home": home, "away": away},
+                "lineupStats": {
+                    "home": ls(home["battingOrder"] if home else None, home_known),
+                    "away": ls(away["battingOrder"] if away else None, away_known),
+                },
+            })
+        return out
+
+    ptr_lu = data.attach_lineups_as_of([dict(g) for g in games], lineups, batter_logs)
+    naive_lu = naive_lineups(games)
+    check("lineup as-of: pointer == naive on unsorted games", ptr_lu == naive_lu, "output mismatch")
+
+
+def test_data_fingerprint() -> None:
+    print("data fingerprint")
+    from mlb_streamlit import refresh
+
+    ga = {"gamePk": 1, "date": "2026-04-05", "winner": "home", "home": {"score": 5}, "away": {"score": 2}}
+    gb = {"gamePk": 2, "date": "2026-04-06", "winner": "away", "home": {"score": 3}, "away": {"score": 4}}
+    injuries = {108: 1, 119: 0}
+    fp = refresh._data_fingerprint([ga, gb], dict(injuries))
+    check("fingerprint stable across runs", fp == refresh._data_fingerprint([dict(ga), dict(gb)], dict(injuries)))
+    check("fingerprint order-invariant", fp == refresh._data_fingerprint([gb, ga], dict(injuries)))
+    changed = dict(ga)
+    changed["home"] = {"score": 6}
+    check("fingerprint sensitive to score", fp != refresh._data_fingerprint([changed, gb], dict(injuries)))
+    check("fingerprint sensitive to injury counts", fp != refresh._data_fingerprint([ga, gb], {108: 2, 119: 0}))
+    changed = dict(ga)
+    changed["winner"] = "away"
+    check("fingerprint sensitive to winner", fp != refresh._data_fingerprint([changed, gb], dict(injuries)))
+    check("fingerprint sensitive to game set", fp != refresh._data_fingerprint([ga], dict(injuries)))
+    check("fingerprint is a hex digest", len(fp) == 64 and all(c in "0123456789abcdef" for c in fp))
+
+
+def test_refresh_fast_path() -> None:
+    print("refresh fast path")
+    import shutil
+    import tempfile
+    import mlb_streamlit.data as data
+    from mlb_streamlit import refresh
+
+    completed = make_games(60, seed=3)
+    for g in completed:
+        g["status"] = {"abstractGameState": "Final", "detailedState": "Final"}
+        g["dayNight"] = "day"
+    today = (date.fromisoformat(max(g["date"] for g in completed)) + timedelta(days=1)).isoformat()
+    upcoming_pk = 2026099901
+    upcoming = {
+        "gamePk": upcoming_pk,
+        "date": today,
+        "gameDate": f"{today}T18:00:00Z",
+        "season": "2026",
+        "status": {"abstractGameState": "Preview", "detailedState": "Scheduled"},
+        "dayNight": "night",
+        "home": {"id": 119, "name": "Dodgers", "abbrev": "LAD", "score": None},
+        "away": {"id": 108, "name": "Angels", "abbrev": "LAA", "score": None},
+        "homePitcher": {"id": 11901, "name": "LAD SP"},
+        "awayPitcher": {"id": 10802, "name": "LAA SP"},
+        "weather": {"tempF": 78, "windMph": 6},
+    }
+    team_ids = sorted({tid for g in completed for tid in (g["home"]["id"], g["away"]["id"]) if tid > 0})
+    injury_snapshot = {tid: 0 for tid in team_ids}
+    fp = refresh._data_fingerprint(completed, injury_snapshot)
+
+    lineup = {
+        upcoming_pk: {
+            "home": {"battingOrder": [{"id": 1001 + i, "name": f"H{i}", "pos": "OF"} for i in range(9)], "bench": []},
+            "away": {"battingOrder": [{"id": 2001 + i, "name": f"A{i}", "pos": "OF"} for i in range(9)], "bench": []},
+        }
+    }
+
+    def rel(days_back: int) -> str:
+        return (date.fromisoformat(today) - timedelta(days=days_back)).isoformat()
+
+    pitcher_logs = {
+        "11901|2026": [
+            {"d": rel(25), "ip": 6.0, "er": 2, "so": 5, "bb": 2, "hbp": 0, "hr": 1, "h": 3},
+            {"d": rel(19), "ip": 7.0, "er": 1, "so": 8, "bb": 1, "hbp": 1, "hr": 0, "h": 2},
+            {"d": rel(12), "ip": 5.0, "er": 3, "so": 4, "bb": 3, "hbp": 0, "hr": 1, "h": 5},
+            {"d": rel(5), "ip": 6.0, "er": 4, "so": 6, "bb": 2, "hbp": 0, "hr": 2, "h": 6},
+        ],
+        "10802|2026": [
+            {"d": rel(24), "ip": 6.0, "er": 3, "so": 4, "bb": 2, "hbp": 0, "hr": 1, "h": 4},
+            {"d": rel(18), "ip": 5.0, "er": 2, "so": 6, "bb": 1, "hbp": 0, "hr": 0, "h": 3},
+            {"d": rel(11), "ip": 7.0, "er": 3, "so": 7, "bb": 2, "hbp": 0, "hr": 1, "h": 5},
+            {"d": rel(4), "ip": 6.0, "er": 2, "so": 5, "bb": 1, "hbp": 0, "hr": 1, "h": 4},
+        ],
+    }
+    team_logs: dict[str, dict] = {}
+    for tid in (108, 119):
+        team_logs[f"{tid}|2026"] = {
+            "hitting": [
+                {"d": rel(24), "ab": 34, "h": 9, "bb": 3, "hbp": 1, "sf": 1, "tb": 14},
+                {"d": rel(16), "ab": 36, "h": 10, "bb": 2, "hbp": 0, "sf": 0, "tb": 16},
+                {"d": rel(8), "ab": 35, "h": 8, "bb": 4, "hbp": 0, "sf": 1, "tb": 12},
+            ],
+            "pitching": [
+                {"d": rel(24), "ip": 9.0, "er": 3, "so": 8, "bb": 2, "h": 7},
+                {"d": rel(16), "ip": 9.0, "er": 2, "so": 9, "bb": 1, "h": 5},
+                {"d": rel(8), "ip": 9.0, "er": 4, "so": 7, "bb": 3, "h": 8},
+            ],
+            "fielding": [
+                {"d": rel(24), "po": 27, "a": 9, "e": 1},
+                {"d": rel(16), "po": 27, "a": 10, "e": 0},
+                {"d": rel(8), "po": 27, "a": 8, "e": 2},
+            ],
+        }
+    batter_logs: dict[str, list[dict]] = {}
+    for bid in list(range(1001, 1010)) + list(range(2001, 2010)):
+        batter_logs[f"{bid}|2026"] = [
+            {"d": rel(20), "ab": 4, "h": 1, "bb": 0, "hbp": 0, "sf": 0, "tb": 1, "ibb": 0, "2b": 0, "3b": 0, "hr": 0},
+            {"d": rel(17), "ab": 4, "h": 2, "bb": 0, "hbp": 0, "sf": 0, "tb": 3, "ibb": 0, "2b": 1, "3b": 0, "hr": 0},
+            {"d": rel(14), "ab": 3, "h": 1, "bb": 1, "hbp": 0, "sf": 0, "tb": 1, "ibb": 0, "2b": 0, "3b": 0, "hr": 0},
+            {"d": rel(11), "ab": 4, "h": 1, "bb": 0, "hbp": 0, "sf": 0, "tb": 4, "ibb": 0, "2b": 0, "3b": 0, "hr": 1},
+            {"d": rel(8), "ab": 4, "h": 0, "bb": 0, "hbp": 0, "sf": 0, "tb": 0, "ibb": 0, "2b": 0, "3b": 0, "hr": 0},
+        ]
+
+    state = {
+        "dataFingerprint": fp,
+        "featureNames": [],
+        "weights": [],
+        "bias": 0.0,
+        "featureStats": {},
+        "isotonicPoints": [],
+        "monteCarloEnabled": False,
+        "monteCarloSigma": 0,
+        "eloHfa": 30,
+        "powerRankings": [
+            {"teamId": 119, "elo": 1520.0, "last10WinPct": 0.6, "lastGameDate": today, "wins": 32, "losses": 20, "injuries": 0},
+            {"teamId": 108, "elo": 1490.0, "last10WinPct": 0.5, "lastGameDate": today, "wins": 27, "losses": 25, "injuries": 0},
+        ],
+        "runModel": {
+            "leagueRuns": 4.5,
+            "teamOffense": {tid: 1.0 for tid in TIDS},
+            "teamDefense": {tid: 1.0 for tid in TIDS},
+            "parkFactor": {tid: 1.0 for tid in TIDS},
+        },
+        "runLineCalibration": [],
+        "runMarginCalibration": {"slope": 0, "intercept": 0},
+        "gamesTrained": 120,
+        "holdoutCount": 20,
+        "auc": 0.62,
+        "brier": 0.23,
+        "logLoss": 0.66,
+        "ece": 0.02,
+        "selectedModel": "Logistic regression",
+        "asOfDate": "2026-08-15",
+        "trainedAt": 1,
+    }
+
+    tmp = tempfile.mkdtemp(prefix="mlb_cache_")
+    old_dir = cache.CACHE_DIR
+    cache.CACHE_DIR = Path(tmp)
+    cache.save_games(completed)
+    cache.save_model_state(state)
+    cache.save_lineups(lineup)
+    cache.save_pitcher_logs(pitcher_logs)
+    cache.save_team_logs(team_logs)
+    cache.save_batter_logs(batter_logs)
+
+    calls = {"schedule": 0, "injury": 0, "lineups": 0, "pitcher": 0, "team": 0, "batter": 0}
+    stages: list[str] = []
+    originals: dict[str, object] = {}
+
+    def patch(name, fn):
+        originals[name] = getattr(refresh, name)
+        setattr(refresh, name, fn)
+
+    def patch_data(name, fn):
+        originals[f"data.{name}"] = getattr(data, name)
+        setattr(data, name, fn)
+
+    def fake_schedule(start, end):
+        calls["schedule"] += 1
+        return [upcoming]
+
+    def fake_injury(team_ids, d, season):
+        calls["injury"] += 1
+        return {tid: 0 for tid in team_ids}
+
+    def fake_lineups(targets, concurrency=16):
+        calls["lineups"] += 1
+        out = {}
+        for g in targets:
+            if g["gamePk"] == upcoming_pk:
+                out[g["gamePk"]] = lineup[upcoming_pk]
+        return out
+
+    def fake_pitcher(pairs, cached=None):
+        calls["pitcher"] += 1
+        return {}
+
+    def fake_team(pairs, cached=None):
+        calls["team"] += 1
+        return {}
+
+    def fake_batter(ids, season, cached=None):
+        calls["batter"] += 1
+        return {}
+
+    try:
+        patch("fetch_schedule_range", fake_schedule)
+        patch("fetch_current_injury_snapshot", fake_injury)
+        patch("fetch_lineups_for_games", fake_lineups)
+        patch("fetch_pitcher_game_logs", fake_pitcher)
+        patch("fetch_team_game_logs", fake_team)
+        patch("fetch_batter_game_logs", fake_batter)
+        patch("fetch_market_odds", lambda: {})
+        patch_data("fetch_bvp_stats", lambda pairs, cached=None: {})
+        patch_data("fetch_platoon_splits", lambda pairs, cached=None: {})
+        patch_data("fetch_vs_team_stats", lambda pairs, cached=None: {})
+        patch_data("fetch_pitcher_hands", lambda ids: {})
+
+        summary = refresh.run_refresh(report=lambda stage, pct, msg: stages.append(stage))
+        docs = cache.load_docs_by_date()
+        new_state = cache.load_model_state()
+    finally:
+        for name, fn in originals.items():
+            if name.startswith("data."):
+                setattr(data, name[len("data."):], fn)
+            else:
+                setattr(refresh, name, fn)
+        cache.CACHE_DIR = old_dir
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    check("fast path skips retraining", "Training model" not in stages, str(stages))
+    check("fast path fetch budget: schedule once", calls["schedule"] == 1, str(calls))
+    check("fast path fetch budget: injuries once", calls["injury"] == 1, str(calls))
+    check("fast path fetch budget: window lineups once", calls["lineups"] == 1, str(calls))
+    check("fast path fetch budget: no pitcher logs", calls["pitcher"] == 0, str(calls))
+    check("fast path fetch budget: no team logs", calls["team"] == 0, str(calls))
+    check("fast path fetch budget: no batter logs", calls["batter"] == 0, str(calls))
+    check("fast path summary: stored metrics reused", summary.get("gamesTrained") == 120 and summary.get("auc") == 0.62,
+          f"{summary.get('gamesTrained')}, {summary.get('auc')}")
+    check("fast path summary: selected model preserved", summary.get("selectedModel") == "Logistic regression",
+          str(summary.get("selectedModel")))
+    check("fast path summary: one game scored", summary.get("storedGames") == 1, str(summary.get("storedGames")))
+    day_docs = docs.get(today) or []
+    check("fast path writes fresh docs", len(day_docs) == 1 and day_docs[0]["gamePk"] == upcoming_pk, f"{day_docs}")
+    check("fast path doc has prediction", isinstance(day_docs[0].get("homeWinProb"), float),
+          f"{day_docs[0].get('homeWinProb')}")
+    check("fast path refreshes as-of date", isinstance(new_state.get("asOfDate"), str)
+          and new_state.get("asOfDate") != "2026-08-15", str(new_state.get("asOfDate")))
+    check("fast path keeps fingerprint", new_state.get("dataFingerprint") == fp)
+    check("fast path keeps state lean (no embedded logs)",
+          "pitcherLogs" not in new_state and "teamLogs" not in new_state and "batterLogs" not in new_state)
+
+
+def test_runs_model() -> None:
     print("runs")
     games = make_games(120, seed=5)
     rm = fit_run_model(games)
@@ -754,7 +1152,7 @@ def test_runs_model() -> None:  # probe5
     check("sim probs sum ~ 1", abs(sim["overProb"] + sim["underProb"] - 1.0) < 1e-6)
 
 
-def test_automl_pipeline() -> None:  # probe6
+def test_automl_pipeline() -> None:
     print("auto-ml pipeline")
     # 500 games keeps the calibration/test splits large enough that the
     # isotonic fit does not saturate (matches real-season sample sizes).

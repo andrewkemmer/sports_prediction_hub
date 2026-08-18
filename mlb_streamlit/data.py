@@ -446,6 +446,7 @@ def pitcher_as_of(entries: list[dict] | None, ymd: str, recent_starts: int = 3) 
         return {}
     ip = er = so = bb = hbp = hr = h = 0.0
     recent: list[dict] = []
+    trend_entries: list[dict] = []
     for e in entries:  # date-sorted; stop at the first game on/after the target date
         if e["d"] >= ymd:
             break
@@ -459,6 +460,9 @@ def pitcher_as_of(entries: list[dict] | None, ymd: str, recent_starts: int = 3) 
         recent.append(e)
         if len(recent) > recent_starts:
             recent.pop(0)
+        trend_entries.append(e)
+        if len(trend_entries) > 5:
+            trend_entries.pop(0)
     if ip <= 0:
         return {}
     out = {
@@ -479,7 +483,7 @@ def pitcher_as_of(entries: list[dict] | None, ymd: str, recent_starts: int = 3) 
             rest = 14
         out["restDays"] = max(0, min(14, rest))
         out["workload"] = round(sum(r["ip"] for r in recent), 2)
-    trend = recent[-5:]
+    trend = trend_entries  # last 5 starts (recent is capped at recent_starts)
     if len(trend) >= 3:
         n_t = len(trend)
         mean_x = (n_t - 1) / 2
