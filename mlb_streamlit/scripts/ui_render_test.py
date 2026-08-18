@@ -351,6 +351,7 @@ def _game_docs() -> dict[str, list[dict]]:
         "2026-08-16": [
             {
                 "gamePk": 750001,
+                "predictionVersion": app.PREDICTION_VERSION, "trainedThrough": "2026-08-16",
                 "status": "Final",
                 "dayNight": "night",
                 "gameDate": "2026-08-16T19:05:00Z",
@@ -371,6 +372,7 @@ def _game_docs() -> dict[str, list[dict]]:
             },
             {
                 "gamePk": 750002,
+                "predictionVersion": app.PREDICTION_VERSION, "trainedThrough": "2026-08-16",
                 "status": "Preview",
                 "dayNight": "day",
                 "gameDate": "2026-08-17T13:05:00Z",
@@ -392,6 +394,7 @@ def _game_docs() -> dict[str, list[dict]]:
 
 
 BUNDLE = {"model_state": MS, "calibration_rows": _cal_rows(), "docs_by_date": _game_docs()}
+WF_BUNDLE = {**BUNDLE, "calibration_rows_wf": _cal_rows()}
 
 # ---------------------------------------------------------------------------
 # Regression 2: panels with segmented_control returning None (fresh session)
@@ -415,12 +418,21 @@ check("monitor_tab renders on fresh session (no crash, correct default panel)")
 _MARKDOWN.clear()
 _SS.clear()
 _DATE_INPUTS.clear()
-app.calibration_tab(BUNDLE)
+app.calibration_tab(WF_BUNDLE)
 assert _SS.get("cal_view") == "Moneyline", "cal_view should default to Moneyline"
+assert _SS.get("cal_method") == "Walk-forward (point-in-time)", "cal_method should default to walk-forward"
 assert any("Model Calibration Dashboard" in h for h in _MARKDOWN), "calibration header rendered"
-assert any("Calibration Curve" in h for h in _MARKDOWN), "calibration curve section rendered"
+assert any("Calibration Curve" in h for h in _MARKDOWN), "calibration curve section rendered (walk-forward default)"
 _assert_date_input_formats_valid()
-check("calibration_tab renders Moneyline view on fresh session (no crash, valid date format)")
+check("calibration_tab renders Moneyline walk-forward view on fresh session (no crash, valid date format)")
+
+_MARKDOWN.clear()
+_SS.clear()
+_DATE_INPUTS.clear()
+app.calibration_tab(BUNDLE)
+assert _SS.get("cal_method") == "Walk-forward (point-in-time)", "cal_method defaults to walk-forward even before the build"
+assert any("No point-in-time results in this range" in h for h in _MARKDOWN), "unbuilt walk-forward shows empty state, not a crash"
+check("calibration_tab handles unbuilt walk-forward gracefully (empty state, no crash)")
 
 # ---------------------------------------------------------------------------
 # Regression 3: layout parity — header nav, games tab, power rankings

@@ -51,7 +51,7 @@ RUN_SIM_TRIALS = 10000
 RUN_CALIB_TRIALS = 500
 MIN_COMPLETED_GAMES = 40
 
-PREDICTION_VERSION = 2  # bump to force re-scoring of previously cached dates
+PREDICTION_VERSION = 3  # bump to force re-scoring of previously cached dates
 BACKTEST_STATES_FILE = "backtest_states.json"
 
 SEASON_START = "2022-03-15"  # earliest calibration-range date (UI default)
@@ -484,6 +484,7 @@ def _refresh_fast(fresh: list[dict], all_games: list[dict], cached_state: dict, 
                 {"home": team_state["injuries"].get(g["home"]["id"], 0), "away": team_state["injuries"].get(g["away"]["id"], 0)},
                 proj_by_pk.get(g["gamePk"]),
                 odds,
+                today,
             )
         )
     for g, pred, odds in up_solo:
@@ -503,6 +504,7 @@ def _refresh_fast(fresh: list[dict], all_games: list[dict], cached_state: dict, 
                     run_margin_cal,
                 ),
                 odds,
+                today,
             )
         )
 
@@ -877,7 +879,7 @@ def run_refresh(
 
     fresh_docs: list[dict] = []
     for g, pred in comp:
-        fresh_docs.append(build_game_doc(g, pred, None, proj_by_pk.get(g["gamePk"]), None))
+        fresh_docs.append(build_game_doc(g, pred, None, proj_by_pk.get(g["gamePk"]), None, today))
     for g, pred, odds in up_batch:
         fresh_docs.append(
             build_game_doc(
@@ -886,6 +888,7 @@ def run_refresh(
                 {"home": team_state["injuries"].get(g["home"]["id"], 0), "away": team_state["injuries"].get(g["away"]["id"], 0)},
                 proj_by_pk.get(g["gamePk"]),
                 odds,
+                today,
             )
         )
     for g, pred, odds in up_solo:
@@ -905,6 +908,7 @@ def run_refresh(
                     run_margin_cal,
                 ),
                 odds,
+                today,
             )
         )
 
@@ -1211,6 +1215,21 @@ def _matchups_allowed(date: str) -> bool:
     return date >= add_days(et_date_string(), -RECENT_WINDOW_DAYS)
 
 
+def power_rankings_as_of(date: str) -> list[dict] | None:
+    """Point-in-time power rankings: the Elo table as it stood before `date`.
+
+    Reuses the cached walk-forward model for that date (which carries its own
+    as-of power rankings); returns None for today/future or when history is
+    too thin, so the caller falls back to the stored (current) rankings.
+    """
+    if date >= et_date_string():
+        return None
+    bs = _backtest_state(date)
+    if bs is None:
+        return None
+    return bs.get("powerRankings") or []
+
+
 def predict_date(date: str, state: dict | None = None, report=None) -> int:
     """On-demand prediction for an arbitrary date in the season (port of
     mlbActions.predictDate). Uses the stored model; fetches only that day.
@@ -1228,8 +1247,13 @@ def predict_date(date: str, state: dict | None = None, report=None) -> int:
     state = state or cache.load_model_state()
     if not state:
         raise RuntimeError("Model has not been trained yet. Click refresh first.")
-    backtest = date < et_date_string()
-    trained_through = date if backtest else None
+    today = et_date_string()
+    backtest = date < today
+    # Point-in-time contract: a doc for date D must record the training
+    # cutoff of the model that scored it — D itself for walk-forward backtest
+    # dates, the deployed model's asOfDate for today/future. The UI refuses
+    # to display any doc whose trainedThrough doesn't match its date.
+    trained_through = date if backtest else (state.get("asOfDate") or today)
     if backtest:
         bs = _backtest_state(date, report)
         if bs is not None:

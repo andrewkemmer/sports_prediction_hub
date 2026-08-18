@@ -103,14 +103,20 @@ Any date the user picks in the Games tab is predicted on demand via
   Walk-forward (point-in-time) toggle: every completed game is scored by a
   fresh model trained only on games before it, each row records its model's
   training cutoff, and results are cached per date (incremental — only new or
-  changed days are re-scored).
+  changed days are re-scored). Walk-forward is now the DEFAULT: the
+  Calibration dashboard auto-builds it on first open, and the Games tab
+  refuses to display any doc whose `trainedThrough` doesn't match its date
+  (walk-forward for past dates, the deployed model's as-of date for today) —
+  legacy/stale predictions, including old clamped 99% results, are re-scored
+  point-in-time on view. Power Rankings gained an "As of date" selector that
+  shows the Elo table as it stood before any past date (cached walk-forward).
 - **Monitoring**: per-feature PSI drift, rolling 30-day Brier, and model
   version history are persisted with each training run.
 
 ## Testing
 
 ```bash
-python3 mlb_streamlit/scripts/smoke_test.py          # engine + data pipeline (288 checks)
+python3 mlb_streamlit/scripts/smoke_test.py          # engine + data pipeline (296 checks)
 python3 mlb_streamlit/scripts/ui_render_test.py       # Streamlit UI panels with stubbed streamlit/plotly
 ```
 

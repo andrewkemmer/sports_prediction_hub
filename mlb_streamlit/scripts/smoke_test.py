@@ -346,6 +346,14 @@ def test_backtest_guards() -> None:
         refresh._backtest_state(bt_target)
         check("backtest state retrains when prior games change", calls["n"] == 2, f"{calls['n']}")
         check("backtest today/future returns None", refresh._backtest_state(today) is None)
+        pr = refresh.power_rankings_as_of(bt_target)
+        check("rankings as-of past date built", pr is not None and len(pr) > 0,
+              f"{len(pr) if pr else 0}")
+        check("rankings as-of today/future is None", refresh.power_rankings_as_of(today) is None)
+        check("rankings as-of sorted by elo desc",
+              [r["elo"] for r in pr] == sorted((r["elo"] for r in pr), reverse=True))
+        check("rankings as-of lastGameDate < target",
+              all((r.get("lastGameDate") or "") < bt_target for r in pr))
     finally:
         refresh.run_model = real_run_model
         cache.CACHE_DIR = old_dir2
@@ -433,6 +441,98 @@ def test_walk_forward_calibration() -> None:
         emod.simulate_runs_batch = real_sim
         cache.CACHE_DIR = old_dir3
         shutil.rmtree(tmp3, ignore_errors=True)
+    # Point-in-time doc contract (see test_point_in_time_docs; invoked here
+    # because the file tail / main() is outside the patch tool's index).
+    test_point_in_time_docs()
+
+
+def test_point_in_time_docs() -> None:
+    print("point-in-time docs")
+    import shutil
+    import tempfile
+    from mlb_streamlit import refresh
+    from mlb_streamlit.data import et_date_string
+    from mlb_streamlit.refresh import PREDICTION_VERSION
+
+    real_run_model = refresh.run_model
+    real_sim_runs = refresh.simulate_runs
+    real_min_games = refresh.MIN_COMPLETED_GAMES
+    real_sched = refresh.fetch_schedule_range
+    real_lineups = refresh.fetch_lineups_for_games
+    real_pitcher = refresh.fetch_pitcher_game_logs
+    real_team = refresh.fetch_team_game_logs
+    real_batter = refresh.fetch_batter_game_logs
+    real_odds = refresh.fetch_market_odds
+
+    def stub_run_model(completed, season, as_of_date, injury_snapshots=None):
+        return {
+            "result": {
+                "season": season, "asOfDate": as_of_date,
+                "gamesTrained": len(completed), "holdoutCount": 0,
+                "selectedModel": "stub", "modelDescription": "stub",
+                "featureNames": [], "weights": [], "bias": 0.0,
+                "featureStats": {}, "isotonicPoints": [], "eloHfa": 30,
+                "monteCarloEnabled": False, "monteCarloTrials": 0,
+                "monteCarloSigma": 0.0, "auc": 0.5, "brier": 0.25,
+                "logLoss": 0.69, "ece": 0.0, "powerRankings": [],
+                "runModel": {"parkFactor": {}, "leagueRuns": 4.5,
+                              "teamOffense": {}, "teamDefense": {}},
+                "runLineCalibration": [],
+                "runMarginCalibration": {"slope": 0.0, "intercept": 0.0},
+            }
+        }
+
+    def stub_sim_runs(run_model_state, home_id, away_id, line=0.0, trials=10000,
+                      run_line=1.5, margin_shift=0.0):
+        return {"total": 8.5, "homeScore": 4.3, "awayScore": 4.2,
+                "overProb": 0.5, "underProb": 0.5, "homeRunLineProb": 0.5}
+
+    tmp4 = tempfile.mkdtemp(prefix="mlb_cache_docs_")
+    old_dir4 = cache.CACHE_DIR
+    cache.CACHE_DIR = Path(tmp4)
+    refresh.MIN_COMPLETED_GAMES = 5
+    refresh.run_model = stub_run_model
+    refresh.simulate_runs = stub_sim_runs
+    refresh.fetch_lineups_for_games = lambda targets, concurrency=16: {}
+    refresh.fetch_pitcher_game_logs = lambda pairs, cached=None: {}
+    refresh.fetch_team_game_logs = lambda pairs, cached=None: {}
+    refresh.fetch_batter_game_logs = lambda ids, season, cached=None: {}
+    refresh.fetch_market_odds = lambda: {}
+    try:
+        games = make_games(60, seed=7)
+        for g in games:
+            g["status"] = {"abstractGameState": "Final", "detailedState": "Final"}
+            g["dayNight"] = "day"
+        cache.save_games(games)
+        today = et_date_string()
+        cache.save_model_state({"season": "2026", "asOfDate": today})
+        dates = sorted({g["date"] for g in games})
+        past = dates[len(dates) // 2]
+        refresh.fetch_schedule_range = lambda start, end: [
+            g for g in cache.load_games() if start <= (g["date"] or "") <= end
+        ]
+        n = refresh.predict_date(past)
+        check("predict_date backtest wrote docs", n == 1, f"{n}")
+        docs = (cache.load_docs_by_date() or {}).get(past, [])
+        check("point-in-time doc: version + trainedThrough == date",
+              len(docs) == 1
+              and docs[0].get("predictionVersion") == PREDICTION_VERSION
+              and docs[0].get("trainedThrough") == past,
+              f"{docs[0].get('trainedThrough') if docs else None}")
+        check("point-in-time doc has probability",
+              isinstance(docs[0].get("homeWinProb"), float))
+    finally:
+        refresh.run_model = real_run_model
+        refresh.simulate_runs = real_sim_runs
+        refresh.MIN_COMPLETED_GAMES = real_min_games
+        refresh.fetch_schedule_range = real_sched
+        refresh.fetch_lineups_for_games = real_lineups
+        refresh.fetch_pitcher_game_logs = real_pitcher
+        refresh.fetch_team_game_logs = real_team
+        refresh.fetch_batter_game_logs = real_batter
+        refresh.fetch_market_odds = real_odds
+        cache.CACHE_DIR = old_dir4
+        shutil.rmtree(tmp4, ignore_errors=True)
 
 
 def test_logistic() -> None:
@@ -1349,6 +1449,9 @@ def test_refresh_fast_path() -> None:
     check("fast path writes fresh docs", len(day_docs) == 1 and day_docs[0]["gamePk"] == upcoming_pk, f"{day_docs}")
     check("fast path doc has prediction", isinstance(day_docs[0].get("homeWinProb"), float),
           f"{day_docs[0].get('homeWinProb')}")
+    check("fast path doc point-in-time (trainedThrough = model asOfDate)",
+          day_docs[0].get("trainedThrough") == new_state.get("asOfDate"),
+          f"{day_docs[0].get('trainedThrough')} vs {new_state.get('asOfDate')}")
     check("fast path refreshes as-of date", isinstance(new_state.get("asOfDate"), str)
           and new_state.get("asOfDate") != "2026-08-15", str(new_state.get("asOfDate")))
     check("fast path keeps fingerprint", new_state.get("dataFingerprint") == fp)

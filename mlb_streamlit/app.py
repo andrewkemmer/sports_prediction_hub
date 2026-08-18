@@ -41,6 +41,7 @@ from mlb_streamlit.refresh import (
     SEASON_START,
     build_walk_forward_calibration_rows,
     load_bundle,
+    power_rankings_as_of,
     predict_date,
     run_refresh,
 )
@@ -438,19 +439,33 @@ def _filter_games(games: list[dict], f: str) -> list[dict]:
     return games
 
 
+def _doc_is_point_in_time(doc: dict, ymd: str, today: str) -> bool:
+    """A doc for date D is only displayable when the model that scored it was
+    trained exactly through D (walk-forward) — or through today for D itself.
+    Anything else (legacy 99% docs, fresh-window in-sample writes, older
+    pipeline versions) is never shown."""
+    expected = ymd if ymd < today else today
+    return bool(doc) and doc.get("predictionVersion") == PREDICTION_VERSION \
+        and doc.get("trainedThrough") == expected
+
+
 def _ensure_games_for_date(bundle) -> None:
-    """On-demand prediction for the selected date (port of predictDate)."""
+    """On-demand prediction for the selected date (port of predictDate).
+
+    Every doc shown for a date must be point-in-time: scored by a model
+    trained only on games before that date (walk-forward), or by the deployed
+    model for today. Docs that fail the contract — older pipeline versions,
+    in-sample fresh-window writes, stale 99% results — are re-scored on view.
+    """
     ms = bundle["model_state"]
+    today = ms.get("asOfDate") or et_date_string()
+    ymd = st.session_state.games_date.isoformat()
+    cached_docs = bundle["docs_by_date"].get(ymd)
+    if cached_docs and all(_doc_is_point_in_time(d, ymd, today) for d in cached_docs):
+        return
     if "requested_dates" not in st.session_state:
         st.session_state.requested_dates = set()
-    ymd = st.session_state.games_date.isoformat()
     if ymd in st.session_state.requested_dates:
-        return
-    # Stale docs (written before PREDICTION_VERSION) are re-scored on view —
-    # e.g. backtest dates now get a walk-forward model trained only on games
-    # before that date, instead of the leaked full-season model.
-    cached_docs = bundle["docs_by_date"].get(ymd)
-    if cached_docs and all(d.get("predictionVersion") == PREDICTION_VERSION for d in cached_docs):
         return
     st.session_state.requested_dates.add(ymd)
     progress = st.progress(0, text=f"Building predictions for {fmt_date_long(ymd)}…")
@@ -784,6 +799,9 @@ def games_tab(bundle) -> None:
 
     ymd = st.session_state.games_date.isoformat()
     games = _games_for_date(bundle, ymd)
+    # Never display a prediction that isn't point-in-time (stale docs survive
+    # only if regeneration failed; the warning was already shown above).
+    games = [g for g in games if _doc_is_point_in_time(g, ymd, today)]
     filtered = _filter_games(games, str(st.session_state.games_filter).split(" (")[0])
     night_count = sum(1 for g in games if g["dayNight"] == "night")
     record = ms.get("todaysRecord") or {}
@@ -895,10 +913,45 @@ def games_tab(bundle) -> None:
 
 def rankings_tab(bundle) -> None:
     ms = bundle["model_state"]
-    rankings = ms.get("powerRankings") or []
+    today = ms["asOfDate"]
+    if "rank_date" not in st.session_state:
+        st.session_state.rank_date = _dt.date.fromisoformat(today)
+    if st.session_state.rank_date > _dt.date.fromisoformat(today):
+        st.session_state.rank_date = _dt.date.fromisoformat(today)
+    sel = st.session_state.rank_date.isoformat()
+    if sel < today:
+        # Point-in-time rankings: the Elo table as it stood before that date
+        # (cached walk-forward model for that date); stored rankings as fallback.
+        asof = power_rankings_as_of(sel)
+        rankings = asof if asof else (ms.get("powerRankings") or [])
+        label = (f"As of {fmt_date_long(sel)} · point-in-time (trained only on prior games)"
+                 if asof else f"As of {fmt_date_long(sel)} · back to current (insufficient history)")
+    else:
+        rankings = ms.get("powerRankings") or []
+        label = f"As of {fmt_date_long(today)} · current"
+    with st.container(border=True):
+        c_lab, c_pick, c_info = st.columns([1.2, 2.0, 5.0], vertical_alignment="center")
+        with c_lab:
+            st.markdown(
+                f"<span style='font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.08em;"
+                f"color:{ui.MUTED}'>As of date</span>",
+                unsafe_allow_html=True,
+            )
+        with c_pick:
+            st.date_input(
+                "Rankings as of",
+                key="rank_date",
+                max_value=_dt.date.fromisoformat(today),
+                label_visibility="collapsed",
+            )
+        with c_info:
+            st.markdown(
+                f"<span style='font-size:12px;color:{ui.MUTED}'>{label}</span>",
+                unsafe_allow_html=True,
+            )
     ui.section(
         "Power Rankings",
-        f"Current Elo-based power rankings · As of {fmt_date_long(ms['asOfDate'])} · All {len(rankings)} teams",
+        f"Elo-based power rankings · {label} · All {len(rankings)} teams",
     )
     rows = []
     for i, r in enumerate(rankings):
@@ -1082,7 +1135,9 @@ def calibration_tab(bundle) -> None:
 
     # Method toggle: full-season (in-sample) vs strict walk-forward backtest.
     if "cal_method" not in st.session_state:
-        st.session_state.cal_method = "Walk-forward (point-in-time)" if rows_wf else "Full-season (in-sample)"
+        # Point-in-time is the default: every prediction shown must have been
+        # made with only prior knowledge (walk-forward), not the in-sample fit.
+        st.session_state.cal_method = "Walk-forward (point-in-time)"
     st.segmented_control(
         "Method",
         ["Full-season (in-sample)", "Walk-forward (point-in-time)"],
@@ -1117,8 +1172,26 @@ def calibration_tab(bundle) -> None:
         unsafe_allow_html=True,
     )
 
-    # First run of the walk-forward backtest: build it on demand (cached).
+    # First run of the walk-forward backtest: build automatically once per
+    # session (cached per date afterwards), with a manual fallback button.
     if method == "Walk-forward (point-in-time)" and not rows_wf:
+        if not st.session_state.get("cal_wf_attempted", False):
+            st.session_state.cal_wf_attempted = True
+            progress = st.progress(0, text="Building walk-forward calibration (first time only)...")
+            try:
+                build_walk_forward_calibration_rows(
+                    report=lambda stage, pct, msg: progress.progress(
+                        max(0, min(int(pct), 99)), text=msg or stage
+                    ),
+                )
+            except Exception as e:  # noqa: BLE001
+                st.warning(f"Walk-forward build failed: {e}")
+            finally:
+                progress.empty()
+            nb = load_bundle()
+            if nb is not None:
+                st.session_state.bundle = nb
+            st.rerun()
         st.markdown(
             f"<div style='background:{ui._card_bg()};border:1px solid {ui.BORDER};border-radius:16px;"
             f"padding:16px;margin-top:12px;'>"
@@ -1141,7 +1214,9 @@ def calibration_tab(bundle) -> None:
                 st.warning(f"Walk-forward build failed: {e}")
             finally:
                 progress.empty()
-            st.session_state.bundle = load_bundle()
+            nb = load_bundle()
+            if nb is not None:
+                st.session_state.bundle = nb
             st.rerun()
 
     min_date, max_date = _calibration_range(rows, ms.get("asOfDate") or "")
@@ -1216,6 +1291,14 @@ def calibration_tab(bundle) -> None:
     start_ymd = st.session_state.cal_start.isoformat()
     end_ymd = st.session_state.cal_end.isoformat()
     in_range = [r for r in rows if start_ymd <= r["date"] <= end_ymd]
+    if not in_range:
+        st.markdown(
+            f"<div style='text-align:center;padding:28px 0;color:{ui.MUTED};font-size:13px;'>"
+            f"No point-in-time results in this range. Build the walk-forward backtest above, "
+            f"or widen the date range.</div>",
+            unsafe_allow_html=True,
+        )
+        return
 
     # Today's record card
     record = ms.get("todaysRecord") or {}
