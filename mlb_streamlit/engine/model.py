@@ -940,3 +940,121 @@ def run_model_light(
         "runMarginCalibration": run_margin_calibration,
         "model": model,
     }
+
+
+def fit_candidate_pool(train: list[dict], feature_names: list[str]) -> tuple[dict, float, float]:
+    """Fit the full candidate model pool on `train` (chronological, prior-only).
+
+    Used by the walk-forward selection pass: every model family is fit on games
+    strictly before a target day, then scored on that day out-of-sample.
+
+    Returns (predictors, elo_hfa, blend_w):
+      predictors — name -> predict(features dict) -> probability
+      elo_hfa    — home-field advantage tuned on `train`
+      blend_w    — logistic/Elo blend weight tuned on a chronological holdout
+                   of `train` (never the scored day), so nothing leaks.
+    """
+    n = len(train)
+    prior = 0.5
+    if n == 0:
+        return (
+            {
+                "Elo rating": lambda f: prior,
+                "Logistic regression": lambda f: prior,
+                "Logistic regression (L2, λ=0.1)": lambda f: prior,
+                "Logistic regression (L2, λ=1)": lambda f: prior,
+                "Distance-weighted k-NN (k=21)": lambda f: prior,
+                "Boosted decision stumps": lambda f: prior,
+                "Neural network (MLP)": lambda f: prior,
+                "Blended ensemble": lambda f: prior,
+            },
+            30.0,
+            0.5,
+        )
+
+    # Elo home-field advantage tuned on the prior window.
+    elo_hfa = 30.0
+    if n >= 20:
+        best_brier = float("inf")
+        for hfa in HFA_GRID:
+            preds = [elo_prob(r, hfa) for r in train]
+            b = compute_brier(preds, [r["label"] for r in train])
+            if b < best_brier:
+                best_brier = b
+                elo_hfa = hfa
+
+    lr_model = train_logistic(train, feature_names)
+    lr_strong = train_logistic(train, feature_names, lambda_=0.1)
+    lr_stronger = train_logistic(train, feature_names, lambda_=1.0)
+    knn_train = train[-KNN_TRAIN_CAP:] if n > KNN_TRAIN_CAP else train
+    wknn = weighted_knn_model(knn_train, feature_names)
+    boost = boosted_stumps_model(train, feature_names)
+    nn = mlp_model(train, feature_names)
+
+    # Blend weight tuned on the trailing 20% of the prior window (chronological
+    # holdout) — mirrors run_model's calib-set blend tuning, but stays strictly
+    # inside prior data so the scored day is never used to tune the blend.
+    blend_w = 0.5
+    split = int(math.floor(n * 0.8))
+    blend_train = train[:split]
+    blend_calib = train[split:]
+    if len(blend_calib) >= 20 and len(blend_train) >= 20:
+        lr_blend = train_logistic(blend_train, feature_names)
+        lr_logits = [logistic_logit(lr_blend, r["features"], None) for r in blend_calib]
+        elo_logits = [logit(elo_prob(r, elo_hfa)) for r in blend_calib]
+        labels = [r["label"] for r in blend_calib]
+        best_brier = float("inf")
+        w = 0.0
+        while w <= 1.0001:
+            preds = [sigmoid((1 - w) * l + w * e) for l, e in zip(lr_logits, elo_logits)]
+            b = compute_brier(preds, labels)
+            if b < best_brier:
+                best_brier = b
+                blend_w = w
+            w += 0.05
+
+    predictors = {
+        "Elo rating": lambda r: elo_prob(r, elo_hfa),
+        "Logistic regression": lambda r: sigmoid(logistic_logit(lr_model, r["features"], None)),
+        "Logistic regression (L2, λ=0.1)": lambda r: sigmoid(logistic_logit(lr_strong, r["features"], None)),
+        "Logistic regression (L2, λ=1)": lambda r: sigmoid(logistic_logit(lr_stronger, r["features"], None)),
+        "Distance-weighted k-NN (k=21)": lambda r: wknn(r["features"]),
+        "Boosted decision stumps": lambda r: boost(r["features"]),
+        "Neural network (MLP)": lambda r: nn(r["features"]),
+        "Blended ensemble": lambda r: sigmoid(
+            (1 - blend_w) * logistic_logit(lr_model, r["features"], None)
+            + blend_w * logit(elo_prob(r, elo_hfa))
+        ),
+    }
+    return predictors, elo_hfa, blend_w
+
+
+def refit_logistic_model(
+    rows: list[dict],
+    feature_names: list[str],
+    elo_hfa: float = 30.0,
+    monte_carlo_enabled: bool = False,
+    monte_carlo_sigma: float = 0.0,
+) -> dict:
+    """Fit the production logistic model on ALL `rows` with `feature_names`.
+
+    Used after walk-forward feature selection to rebuild today's deployed model
+    on the complete training history using only the features the walk-forward
+    record selected. Isotonic calibration is fit on the same rows (the walk-
+    forward selection itself supplies the unbiased out-of-sample metrics).
+    """
+    lr_model = train_logistic(rows, feature_names)
+    preds = [sigmoid(logistic_logit(lr_model, r["features"], None)) for r in rows]
+    labels = [r["label"] for r in rows]
+    order = sorted(zip(preds, labels), key=lambda t: t[0])
+    isotonic_points = isotonic_regression([o[0] for o in order], [o[1] for o in order])
+    return {
+        "featureNames": feature_names,
+        "weights": lr_model["weights"],
+        "bias": lr_model["bias"],
+        "featureStats": lr_model["featureStats"],
+        "isotonicPoints": isotonic_points,
+        "monteCarloSigma": monte_carlo_sigma,
+        "monteCarloEnabled": monte_carlo_enabled,
+        "eloHfa": elo_hfa,
+    }

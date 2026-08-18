@@ -52,6 +52,7 @@ from .engine.model import (
     simulate_runs_batch,
 )
 from .engine.runs import expected_margin, expected_total, simulate_runs
+from .wf_selection import apply_walk_forward_selection, build_walk_forward_selection
 
 RUN_SIM_TRIALS = 10000
 RUN_CALIB_TRIALS = 500
@@ -821,17 +822,22 @@ def run_refresh(
         "fetchedAt": int(now.timestamp() * 1000),
     }
 
+    # 8b. Walk-forward model & feature selection. Today's deployed model must
+    #     be chosen by the out-of-sample walk-forward record (all prior days'
+    #     models, rolled forward), not the in-sample 70/15/15 split. This
+    #     rebuilds `model` + `result` so the Model Monitor and the live scorer
+    #     agree, and reuses `rows` already computed by run_model.
+    rep("Walk-forward selection", 72, "Selecting today's model from the walk-forward record…")
+    wf_selection = build_walk_forward_selection(report=rep, rows=rows)
+    apply_walk_forward_selection(result, model, rows, wf_selection)
+
     # 9. Calibration rows for every completed game (as-of-time predictions).
     rep("Scoring games", 74, "Generating predictions & run simulations…")
     calibration_rows = build_calibration_rows(rows, model, run_model_state, run_line_iso, run_margin_cal)
 
-    full_preds = [r["pickProb"] for r in calibration_rows]
-    full_labels = [1 if r["isCorrect"] else 0 for r in calibration_rows]
-    full_curve = calibration_curve_points(full_preds, full_labels, 12)
-    full_eval = evaluate(full_preds, full_labels)
-    spearman = spearman_rank(full_preds, full_labels)
-    high_conf = [r for r in calibration_rows if r["pickProb"] >= 0.65]
-    top_decile = (sum(1 for r in high_conf if r["isCorrect"]) / len(high_conf)) if high_conf else 0.0
+    # The monitor's headline metrics now come from the walk-forward selection
+    # (wf_selection) rather than this in-sample full-season evaluation; the
+    # calibration tab reads its own metrics from calibration_summary below.
     calibration_summary = build_calibration_summary(calibration_rows)
 
     # 10. Fresh game docs for the fetched window. The 10,000-trial Monte Carlo
@@ -943,13 +949,13 @@ def run_refresh(
         "monteCarloTrials": result["monteCarloTrials"],
         "monteCarloSigma": result["monteCarloSigma"],
         "monteCarloRationale": result["monteCarloRationale"],
-        "auc": full_eval["auc"],
-        "brier": full_eval["brier"],
-        "logLoss": full_eval["logLoss"],
-        "ece": full_eval["ece"],
-        "bins": full_eval["bins"],
-        "confidenceDistribution": full_eval["confidenceDistribution"],
-        "calibrationCurve": full_curve if full_curve else result["calibrationCurve"],
+        "auc": wf_selection["auc"],
+        "brier": wf_selection["brier"],
+        "logLoss": wf_selection["logLoss"],
+        "ece": wf_selection["ece"],
+        "bins": wf_selection["bins"],
+        "confidenceDistribution": wf_selection["confidenceDistribution"],
+        "calibrationCurve": wf_selection["calibrationCurve"] or result["calibrationCurve"],
         "featureImportances": result["featureImportances"],
         "candidates": result["candidates"],
         "powerRankings": result["powerRankings"],
@@ -969,8 +975,9 @@ def run_refresh(
         # every save and every app startup.
         "dataFingerprint": fingerprint,
         "calibrationSummary": calibration_summary,
-        "spearmanRho": spearman,
-        "topDecileWinRate": top_decile,
+        "spearmanRho": wf_selection["spearmanRho"],
+        "topDecileWinRate": wf_selection["topDecileWinRate"],
+        "walkForwardSelection": wf_selection,
         "todaysRecord": todays_record,
         "marketOddsStatus": market_odds_status,
     }
@@ -1002,10 +1009,10 @@ def run_refresh(
         "asOfDate": today,
         "gamesTrained": result["gamesTrained"],
         "holdoutCount": result["holdoutCount"],
-        "auc": full_eval["auc"],
-        "brier": full_eval["brier"],
-        "logLoss": full_eval["logLoss"],
-        "ece": full_eval["ece"],
+        "auc": wf_selection["auc"],
+        "brier": wf_selection["brier"],
+        "logLoss": wf_selection["logLoss"],
+        "ece": wf_selection["ece"],
         "selectedModel": result["selectedModel"],
         "monteCarloEnabled": result["monteCarloEnabled"],
         "storedGames": len(fresh_docs),
