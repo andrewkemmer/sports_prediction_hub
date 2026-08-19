@@ -61,6 +61,34 @@ def main() -> None:
     check("no-vig edge is positive", decision["edge"] > 0.02)
     check("expected value is positive", decision["expectedValue"] > 0.01)
 
+    blocked_prediction = {**prediction, "gateEnabled": True, "gateAccepted": False, "concordance": 0.5}
+    blocked = build_bet_decision(
+        blocked_prediction,
+        quote,
+        game_date="2026-08-19T18:00:00Z",
+        game_status="Scheduled",
+        now_ms=now_ms,
+    )
+    check("enabled gate remains a wager filter", blocked["available"] is True and blocked["recommended"] is False)
+    check("gate filter is recorded", blocked["gateRequired"] is True and blocked["gateAccepted"] is False)
+    check("gate abstention explains PASS", "Concordance gate" in blocked["reason"])
+    accepted = build_bet_decision(
+        {**prediction, "gateEnabled": True, "gateAccepted": True, "concordance": 1.0},
+        quote,
+        game_date="2026-08-19T18:00:00Z",
+        game_status="Scheduled",
+        now_ms=now_ms,
+    )
+    check("accepted gate allows positive EV", accepted["recommended"] is True)
+    disabled_gate = build_bet_decision(
+        {**prediction, "gateEnabled": False, "gateAccepted": False},
+        quote,
+        game_date="2026-08-19T18:00:00Z",
+        game_status="Scheduled",
+        now_ms=now_ms,
+    )
+    check("held-out gate does not block market execution", disabled_gate["recommended"] is True)
+
     missing_timestamp = build_bet_decision(
         prediction,
         {"homeMoneyline": -110, "awayMoneyline": -110},

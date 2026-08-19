@@ -106,6 +106,9 @@ def _base_result(reason: str, *, min_edge: float, now_ms: float) -> dict:
         "minEdge": min_edge,
         "minExpectedValue": MIN_EXPECTED_VALUE,
         "asOfMs": now_ms,
+        "gateRequired": False,
+        "gateAccepted": None,
+        "gateConcordance": None,
         "reason": reason,
     }
 
@@ -142,6 +145,11 @@ def build_bet_decision(
     stake_cap = clamp(float(max_stake_fraction), 0.0, 0.05)
     out = _base_result("No pre-game market snapshot", min_edge=edge_floor, now_ms=now)
     out["minExpectedValue"] = ev_floor
+    gate_required = prediction.get("gateEnabled") is True
+    gate_accepted = prediction.get("gateAccepted") is True if gate_required else None
+    out["gateRequired"] = gate_required
+    out["gateAccepted"] = gate_accepted
+    out["gateConcordance"] = prediction.get("concordance")
 
     if not isinstance(market_odds, dict):
         return out
@@ -210,9 +218,16 @@ def build_bet_decision(
         b = candidate["decimal"] - 1.0
         candidate["kelly"] = max(0.0, candidate["expectedValue"] / b) if b > 0 else 0.0
     best = max(candidates, key=lambda c: (c["expectedValue"], c["edge"], c["modelProb"]))
-    passes = best["edge"] >= edge_floor and best["expectedValue"] >= ev_floor
+    gate_blocked = gate_required and not gate_accepted
+    passes = (
+        not gate_blocked
+        and best["edge"] >= edge_floor
+        and best["expectedValue"] >= ev_floor
+    )
     kelly = min(stake_cap, fractional * best["kelly"]) if passes else 0.0
-    if passes:
+    if gate_blocked:
+        reason = "Concordance gate abstains; no wager is eligible"
+    elif passes:
         reason = "Positive EV after no-vig and PIT price checks"
     elif best["expectedValue"] < ev_floor:
         reason = "Best executable price does not clear the EV guard"
@@ -226,6 +241,10 @@ def build_bet_decision(
         "side": best["side"] if passes else None,
         "team": best["side"] if passes else None,
         "offeredOdds": best["odds"] if passes else None,
+        "candidateSide": best["side"],
+        "candidateOdds": best["odds"],
+        "candidateExpectedValue": best["expectedValue"],
+        "candidateEdge": best["edge"],
         "bookmaker": best["book"],
         "modelProb": best["modelProb"],
         "marketImpliedProb": best["marketRaw"],

@@ -702,12 +702,13 @@ def _game_card(game: dict, col) -> None:
             if bet.get("available"):
                 bet_color = ui.EMERALD if bet.get("recommended") else ui.AMBER
                 bet_label = "BET" if bet.get("recommended") else "PASS"
-                bet_team = bet.get("team")
+                bet_team = bet.get("team") or bet.get("candidateSide")
                 bet_abbrev = (
                     game["home"]["abbrev"] if bet_team == "home"
                     else game["away"]["abbrev"] if bet_team == "away" else "best side"
                 )
-                odds_text = fmt_american(bet.get("offeredOdds")) if bet.get("offeredOdds") is not None else "—"
+                quoted_odds = bet.get("offeredOdds") if bet.get("offeredOdds") is not None else bet.get("candidateOdds")
+                odds_text = fmt_american(quoted_odds) if quoted_odds is not None else "—"
                 ev_text = f"{float(bet.get('expectedValue') or 0):+.1%} EV"
                 edge_text = f"{float(bet.get('edge') or 0):+.1%} vs no-vig"
                 stake_text = f"quarter-Kelly {float(bet.get('recommendedStakeFraction') or 0):.2%} bankroll"
