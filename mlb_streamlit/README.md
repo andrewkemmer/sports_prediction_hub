@@ -17,7 +17,9 @@ Everything lives in this directory and runs on a plain Python interpreter:
 | `engine/` | Pure-stdlib ML engine (features, logistic, metrics, model, runs, teams) |
 | `engine/model.py` | Auto-ML: feature selection, model stacking, calibration, Monte Carlo decision |
 | `engine/metrics.py` | AUC, Brier, log-loss, ECE, isotonic regression, calibration curves |
+| `engine/betting.py` | PIT market mapping, no-vig probabilities, EV, fractional Kelly, and safe abstention |
 | `scripts/smoke_test.py` | Offline engine test (no Streamlit/network required) |
+| `scripts/betting_test.py` | Offline market execution regression test |
 
 ## Run it
 
@@ -36,9 +38,15 @@ only new dates are re-fetched.
 **Market odds (optional):** set the `THE_ODDS_API_KEY` env var to show live
 sportsbook prices (moneyline / totals / run lines) on the game cards. Without
 it the dashboard uses model-derived fair odds and shows an amber status chip in
-the header. Odds snapshots are cached on disk for an hour, so on-demand date
-lookups stay inside The Odds API free-tier limits; a failed fetch falls back to
-the last good snapshot.
+the header.Odds snapshots are cached on disk for an hour, so on-demand date
+lookups stay inside The Odds API free-tier limits; a failed fetch falls back to the
+last good snapshot. The live game card also exposes a separate market execution
+layer: it normalizes the two-way moneyline to no-vig probabilities, calculates
+EV from the offered price, and emits quarter-Kelly stake fractions capped at 1%
+of bankroll. It will PASS when the quote lacks an original timestamp, is stale,
+is after game start, or does not clear both the 2-point model-edge and 1% EV
+guards. Current odds are never used in model training or historical calibration.
+
 
 ## Deploy
 
@@ -80,6 +88,9 @@ Any date the user picks in the Games tab is predicted on demand via
   interaction, lineup batter momentum (recent OPS vs season) and 7-day
   fatigue. Trajectory features populate only where real data exists (same
   fresh-window gating as lineups), so older history never gets junk values.
+  Historical completed games do not use observed boxscore lineups because MLB
+  does not expose a trustworthy lineup-publication timestamp; only lineups
+  available on scheduled/upcoming games can enter the live feature vector.
 - **Feature selection**: nested, per-date L1 (LASSO) logistic regression — the
   λ penalty is tuned on a chronological holdout by Brier — followed by a
   3-block stability vote (features selected in ≥2 of the last 3 blocks
@@ -117,11 +128,17 @@ Any date the user picks in the Games tab is predicted on demand via
   shows the Elo table as it stood before any past date (cached walk-forward).
 - **Monitoring**: per-feature PSI drift, rolling 30-day Brier, and model
   version history are persisted with each training run.
+- **Market execution**: `engine/betting.py` is a downstream decision layer, not a
+  probability model. It uses the preferred market quote as a no-vig benchmark,
+  the executable quote for EV, and quarter-Kelly sizing with a hard 1% cap.
+  It deliberately does not backtest ROI from today’s odds feed: historical EV
+  requires timestamped historical prices and a separate line-history store.
 
 ## Testing
 
 ```bash
 python3 mlb_streamlit/scripts/smoke_test.py          # engine + data pipeline (298 checks)
+python3 mlb_streamlit/scripts/betting_test.py        # PIT EV/Kelly/market guards
 python3 mlb_streamlit/scripts/ui_render_test.py       # Streamlit UI panels with stubbed streamlit/plotly
 ```
 

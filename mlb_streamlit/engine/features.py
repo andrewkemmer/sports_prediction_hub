@@ -16,7 +16,7 @@ ELO_HFA_UPDATE = 30.0  # home advantage baked into Elo updates only
 
 # Bump whenever feature engineering changes so refresh fingerprints and every
 # cached prediction/backtest are invalidated and rebuilt point-in-time.
-FEATURE_VERSION = 6
+FEATURE_VERSION = 7
 
 # Canonical feature order (27 features). Every feature is computed as-of the
 # game's own date (no lookahead) and flows into the ML candidate set; greedy

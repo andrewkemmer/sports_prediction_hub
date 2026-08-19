@@ -36,6 +36,7 @@ from .data import (
 )
 from .engine.features import FEATURE_KEYS, FEATURE_VERSION, build_features_for_game, compute_elo_and_features
 from .engine.gating import GATE_VERSION, apply_concordance_gate, default_gate_config, summarize_gate_results
+from .engine.betting import build_bet_decision, stamp_market_odds, summarize_bet_decisions
 from .engine.metrics import (
     apply_isotonic,
     calibration_curve_points,
@@ -65,7 +66,17 @@ RUN_SIM_TRIALS = 10000
 RUN_CALIB_TRIALS = 500
 MIN_COMPLETED_GAMES = 40
 
-PREDICTION_VERSION = 10  # bump to re-score docs so the gate fields cannot be bypassed by legacy cache hits
+
+def _market_odds_snapshot(odds_map: dict | None) -> dict:
+    """Stamp quotes with the cache payload's original fetch time.
+
+    The timestamp is deliberately not set to ``now``: cached market prices
+    must retain their real observation time for the pre-game PIT check.
+    """
+    payload = cache.load_market_odds() or {}
+    return stamp_market_odds(odds_map, payload.get("fetchedAt"))
+
+PREDICTION_VERSION = 11  # invalidate docs whenever the PIT market/EV execution layer changes
 BACKTEST_STATES_FILE = "backtest_states.json"
 BACKTEST_CACHE_VERSION = cache.BACKTEST_CACHE_VERSION  # invalidate stale point-in-time rows when the gate recipe changes
 WF_REFIT_DAYS = 7  # refit the walk-forward model every N days (games in a block share a model)
@@ -321,6 +332,15 @@ def build_game_doc(
     # Pitcher/team stats are already attached as-of the game's own date by
     # attach_as_of_stats — never override them with a flat full-season dict.
     season = game.get("season")
+    # Current live quotes may be used only for today/future games. For a
+    # historical or completed game, never create an execution decision from a
+    # current odds snapshot. The helper preserves the cache's original fetch
+    # timestamp rather than relabeling it as now.
+    market_odds = (
+        _market_odds_snapshot(market_odds)
+        if game.get("date", "") >= et_date_string()
+        else None
+    )
 
     doc = {
         "gamePk": game["gamePk"],
@@ -354,6 +374,12 @@ def build_game_doc(
         "lineupStats": game.get("lineupStats"),
         "runProjection": run_projection,
         "marketOdds": market_odds,
+        "betDecision": build_bet_decision(
+            pred,
+            market_odds,
+            game_date=game.get("gameDate"),
+            game_status=game.get("status"),
+        ),
     }
     for key in (
         "gateEnabled", "gateAccepted", "gatedPickTeam", "gatedPickProb",
@@ -506,7 +532,7 @@ def _refresh_fast(fresh: list[dict], all_games: list[dict], cached_state: dict, 
     b0 = len(batter_log_cache)
     if to_fetch_batter:
         batter_log_cache.update(fetch_batter_game_logs(to_fetch_batter, season, batter_log_cache))
-    enriched = attach_lineups_as_of(enriched, lineups, batter_log_cache)
+    enriched = attach_lineups_as_of(enriched, lineups, batter_log_cache, pregame_only=True)
 
     rep("Scoring fresh games", 78, "Predicting with the stored model…")
     matchup = enrich_with_matchups(
@@ -518,7 +544,7 @@ def _refresh_fast(fresh: list[dict], all_games: list[dict], cached_state: dict, 
         season,
     )
     enriched = matchup["games"]
-    market_odds = fetch_market_odds()
+    market_odds = _market_odds_snapshot(fetch_market_odds())
 
     model = reconstruct_model(cached_state)
     team_state = reconstruct_team_state(cached_state.get("powerRankings") or [])
@@ -610,6 +636,7 @@ def _refresh_fast(fresh: list[dict], all_games: list[dict], cached_state: dict, 
     state = dict(cached_state)
     state["asOfDate"] = today
     state["trainedAt"] = int(now.timestamp() * 1000)
+    state["marketExecution"] = summarize_bet_decisions(docs)
     state["marketOddsStatus"] = {
         "enabled": market_odds_enabled(),
         "count": len(market_odds),
@@ -835,7 +862,7 @@ def run_refresh(
         for fut in futures:
             batter_log_cache.update(fut.result())
     rep("Batter game logs loaded", 48, f"Cached {len(batter_log_cache)} batter-season logs.")
-    enriched = attach_lineups_as_of(enriched, lineups, batter_log_cache)
+    enriched = attach_lineups_as_of(enriched, lineups, batter_log_cache, pregame_only=True)
 
     # 6c. Matchup edges (BvP / platoon / vs-team): only for games in the fresh
     #    window (real boxscore lineup + opposing starter both known), mirroring
@@ -885,7 +912,7 @@ def run_refresh(
         run_line_iso = result["runLineCalibration"] or []
         run_margin_cal = result["runMarginCalibration"] or {"slope": 0, "intercept": 0}
         rep("Fetching market odds", 68, "Loading market odds (best-effort)…")
-        market_odds = odds_future.result()
+        market_odds = _market_odds_snapshot(odds_future.result())
     finally:
         odds_pool.shutdown(wait=False)
     market_odds_status = {
@@ -1066,6 +1093,7 @@ def run_refresh(
         "concordanceGateDiagnostics": wf_selection.get("concordanceGateDiagnostics") or {},
         "todaysRecord": todays_record,
         "marketOddsStatus": market_odds_status,
+        "marketExecution": summarize_bet_decisions(fresh_docs),
     }
     # 11-12. Persist everything in one parallel write (each file is written
     #        atomically and independently, so concurrency is safe), then update
@@ -1163,7 +1191,7 @@ def _backtest_state(target: str, report=None) -> dict | None:
             except (TypeError, ValueError):
                 pass
     batter_log_cache = cache.load_batter_logs()
-    enriched = attach_lineups_as_of(enriched, lineups, batter_log_cache)
+    enriched = attach_lineups_as_of(enriched, lineups, batter_log_cache, pregame_only=True)
     # No matchup enrichment: current-season platoon/vs-team splits are
     # season-to-date and would leak post-target games into training features.
     completed_enriched = [g for g in enriched if g.get("winner") in ("home", "away")]
@@ -1290,7 +1318,7 @@ def build_walk_forward_calibration_rows(
                     lineups[int(pk)] = lu
                 except (TypeError, ValueError):
                     pass
-        enriched = attach_lineups_as_of(enriched, lineups, cache.load_batter_logs())
+        enriched = attach_lineups_as_of(enriched, lineups, cache.load_batter_logs(), pregame_only=True)
         enriched = [g for g in enriched if (g.get("date") or "") < today]
         if not enriched:
             return []

@@ -1297,8 +1297,19 @@ def _batter_prefix(log: list[dict] | None, ymd: str, acc: dict, key: str) -> dic
     return {"ops": ops, "woba": woba, "iso": iso, "recentOps": recent_ops_val, "momentum": momentum, "games7": games7}
 
 
-def attach_lineups_as_of(games: list[dict], lineups: dict, batter_logs: dict) -> list[dict]:
-    """Attach lineups with each batter's OPS as-of the game's own date (no lookahead).
+def attach_lineups_as_of(
+    games: list[dict],
+    lineups: dict,
+    batter_logs: dict,
+    pregame_only: bool | None = None,
+) -> list[dict]:
+    """Attach lineups with each batter's OPS as-of the game's own date.
+
+    When ``pregame_only`` is true, completed games are intentionally returned
+    without lineup features. The MLB boxscore endpoint exposes the observed
+    lineup but not a reliable publication timestamp; using a completed game's
+    lineup in a historical row would therefore be an unprovable post-game
+    leak. Upcoming/scheduled games may use a lineup fetched before first pitch.
 
     One chronological pass with per-batter cursors (amortized O(1) per game),
     then restores input order. Output is byte-identical to the naive rescan.
@@ -1309,6 +1320,13 @@ def attach_lineups_as_of(games: list[dict], lineups: dict, batter_logs: dict) ->
     bacc: dict[str, dict] = {}
     for i in order:
         g = games[i]
+        historical_boxscore_guard = (
+            pregame_only is True
+            or (pregame_only is None and g.get("status") in ("Final", "Live"))
+        )
+        if historical_boxscore_guard and g.get("winner") in ("home", "away"):
+            out[i] = g
+            continue
         lu = lineups.get(g["gamePk"])
         if not lu:
             out[i] = g

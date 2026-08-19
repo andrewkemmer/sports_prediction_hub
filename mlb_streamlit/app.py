@@ -696,6 +696,31 @@ def _game_card(game: dict, col) -> None:
                 unsafe_allow_html=True,
             )
 
+            # Market-aware execution layer. This is deliberately separate from
+            # the model pick and from the PIT calibration metrics.
+            bet = game.get("betDecision") or {}
+            if bet.get("available"):
+                bet_color = ui.EMERALD if bet.get("recommended") else ui.AMBER
+                bet_label = "BET" if bet.get("recommended") else "PASS"
+                bet_team = bet.get("team")
+                bet_abbrev = (
+                    game["home"]["abbrev"] if bet_team == "home"
+                    else game["away"]["abbrev"] if bet_team == "away" else "best side"
+                )
+                odds_text = fmt_american(bet.get("offeredOdds")) if bet.get("offeredOdds") is not None else "—"
+                ev_text = f"{float(bet.get('expectedValue') or 0):+.1%} EV"
+                edge_text = f"{float(bet.get('edge') or 0):+.1%} vs no-vig"
+                stake_text = f"quarter-Kelly {float(bet.get('recommendedStakeFraction') or 0):.2%} bankroll"
+                st.markdown(
+                    f"<div style='margin-top:8px;border:1px solid {bet_color};background:rgba(255,255,255,0.025);border-radius:10px;padding:9px 10px;'>"
+                    f"<div style='display:flex;justify-content:space-between;align-items:center;'>"
+                    f"<span style='font-size:11px;font-weight:700;letter-spacing:.08em;color:{bet_color}'>MARKET ACTION · {bet_label}</span>"
+                    f"<span style='font-size:12px;font-weight:700;color:{ui.TEXT}'>{bet_abbrev} {odds_text}</span></div>"
+                    f"<div style='margin-top:4px;font-size:11px;color:{ui.MUTED}'>{ev_text} · {edge_text} · {stake_text}</div>"
+                    f"<div style='margin-top:3px;font-size:10px;color:{ui.MUTED}'>{bet.get('reason', '')}</div></div>",
+                    unsafe_allow_html=True,
+                )
+
             # Lineups expander
             lu = game.get("lineups")
             has_lineups = bool(lu and ((lu.get("home") or {}).get("battingOrder") or (lu.get("away") or {}).get("battingOrder")))
