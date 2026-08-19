@@ -20,21 +20,31 @@ day added.
 from __future__ import annotations
 
 import hashlib
+import math
 
 from . import cache
 from .data import add_days, attach_as_of_stats, attach_lineups_as_of, et_date_string
 from .engine.features import FEATURE_KEYS, FEATURE_LABELS, compute_elo_and_features
-from .engine.logistic import build_stacking_weights, cross_validate
-from .engine.metrics import compute_auc, evaluate, spearman_rank
+from .engine.logistic import build_stacking_weights, cross_validate, logistic_logit, train_logistic_l1
+from .engine.metrics import compute_auc, compute_brier, evaluate, sigmoid, spearman_rank
 from .engine.model import CANDIDATE_MIN_AUC, fit_candidate_pool, refit_stack_model
 
 WF_SELECTION_FILE = "walk_forward_selection.json"
-WF_SELECTION_VERSION = 4
+WF_SELECTION_VERSION = 5
 WF_SELECTION_REFIT_DAYS = 7  # candidates share a fit within a block (matches calibration)
 WF_TRAIN_WINDOW = 2000  # rolling window of most-recent prior games for each candidate fit
 WF_MLP_EPOCHS = 20  # the MLP fit dominates backtest CPU; cap it for the repeated walk-forward fits
 MIN_PRIOR_GAMES = 40
 FEATURE_SIGNAL_EPS = 0.01  # |AUC - 0.5| threshold for a feature to stay active
+
+# L1 (LASSO) feature selection — the per-date walk-forward selector. The penalty
+# strength is tuned on a chronological holdout by Brier (fit on Brier), and the
+# stability rule keeps features selected in >= 2 of the last 3 blocks so the
+# per-date feature sets don't churn.
+L1_LAMBDA_GRID = (0.005, 0.02, 0.05)
+L1_MIN_ROWS = 100
+STABILITY_K = 3
+STABILITY_VOTES = 2
 
 # Ordering matches engine/model.run_model so the monitor renders a stable table.
 CANDIDATE_NAMES = [
@@ -53,6 +63,53 @@ CANDIDATE_NAMES = [
 # These features are always retained: they are the structural backbone of the
 # model and their out-of-sample signal is stable by construction.
 CORE_FEATURES = ("eloDiff", "homeField", "winPctDiff")
+
+
+def _l1_selected_features(prior_rows: list[dict], feature_names: list[str]) -> list[str]:
+    """L1 (LASSO) logistic on prior-only rows -> features with nonzero weight.
+
+    The penalty strength is tuned on the trailing 20% chronological holdout by
+    Brier (fit on Brier). The structural core features are always retained.
+    With too little history, fall back to the core features only.
+    """
+    if len(prior_rows) < L1_MIN_ROWS:
+        return [f for f in feature_names if f in CORE_FEATURES]
+    n = len(prior_rows)
+    holdout = prior_rows[int(math.floor(n * 0.8)):]
+    best_model = None
+    best_brier = float("inf")
+    for lam in L1_LAMBDA_GRID:
+        m = train_logistic_l1(prior_rows, feature_names, lambda_l1=lam)
+        if len(holdout) >= 20:
+            preds = [sigmoid(logistic_logit(m, r["features"], None)) for r in holdout]
+            b = compute_brier(preds, [r["label"] for r in holdout])
+            if b < best_brier:
+                best_brier = b
+                best_model = m
+        elif best_model is None:
+            best_model = m
+    m = best_model or train_logistic_l1(prior_rows, feature_names)
+    sel = {f for f, w in zip(m["featureNames"], m["weights"]) if abs(w) > 1e-9}
+    sel.update(CORE_FEATURES)
+    return [f for f in feature_names if f in sel]
+
+
+def _stabilize_features(current: list[str], history: list[list[str]]) -> list[str]:
+    """Keep current selections plus any feature selected in >= 2 of the last 3
+    blocks, plus the structural core.
+
+    Reduces per-date churn: a feature that flickers out for one block survives
+    via persistence and decays only after it stops being selected for 3 blocks.
+    The current L1 selection is always trusted immediately.
+    """
+    recent = (history + [current])[-STABILITY_K:]
+    votes: dict[str, int] = {}
+    for w in recent:
+        for f in w:
+            votes[f] = votes.get(f, 0) + 1
+    stable = set(current) | {f for f, c in votes.items() if c >= STABILITY_VOTES}
+    stable.update(CORE_FEATURES)
+    return [f for f in FEATURE_KEYS if f in stable]
 
 
 def _game_line(g: dict) -> str:
@@ -82,6 +139,20 @@ def _load_completed_rows(today: str) -> list[dict]:
     enriched = attach_lineups_as_of(enriched, lineups, cache.load_batter_logs())
     enriched = [g for g in enriched if (g.get("date") or "") < today]
     return compute_elo_and_features(enriched, cache.load_injury_snapshots(), today)["rows"]
+
+
+def load_selection_days() -> dict:
+    """Version-checked per-date walk-forward record: date -> {features, modelChoice}.
+
+    The calibration backtest and on-demand past-date predictions read each
+    date's L1-selected features (and, once the calibration pass records it,
+    the stack-vs-logistic decision) from here so every dashboard serves the
+    identical per-date recipe.
+    """
+    raw = cache.load_json(WF_SELECTION_FILE, {}) or {}
+    if not isinstance(raw, dict) or raw.get("version") != WF_SELECTION_VERSION:
+        return {}
+    return raw.get("days", {}) or {}
 
 
 def _index(fe_rows: list[dict], today: str):
@@ -134,6 +205,8 @@ def build_walk_forward_selection(report=None, rows=None) -> dict:
     # from O(prior games) into O(1) amortized (the full replay previously
     # re-hashed ~6000 games for every one of ~150 dates).
     prior_hash = hashlib.sha256()
+    sel_history: list[list[str]] = []
+    last_features: list[str] | None = None
     for i, d in enumerate(dates):
         day_rows = rows_by_date.get(d) or []
         if not day_rows:
@@ -153,22 +226,35 @@ def build_walk_forward_selection(report=None, rows=None) -> dict:
         cached_day = existing.get(d)
         if cached_day and cached_day.get("fp") == fp:
             out[d] = cached_day
+            last_features = cached_day.get("features") or last_features
             current_predictors = None
             current_cutoff = None
             continue
         if current_predictors is None or d >= add_days(current_cutoff, WF_SELECTION_REFIT_DAYS):
-            # Rolling window: fit candidates on the most recent WF_TRAIN_WINDOW
-            # prior games (still strictly before the scored day — no lookahead).
-            # This caps the MLP/boost/logistic fit cost once history grows large.
+            # Rolling window: fit on the most recent WF_TRAIN_WINDOW prior games
+            # (still strictly before the scored day — no lookahead).
             prior_rows = fe_rows[max(0, ptr - WF_TRAIN_WINDOW):ptr]
+            # Nested feature selection: L1 logistic on prior-only rows, λ tuned
+            # by holdout Brier, then a stability vote across the last 3 blocks.
+            current_features = _stabilize_features(
+                _l1_selected_features(prior_rows, list(FEATURE_KEYS)), sel_history
+            )
+            sel_history.append(current_features)
             current_predictors, _elo_hfa, _blend_w = fit_candidate_pool(
-                prior_rows, list(FEATURE_KEYS), mlp_epochs=WF_MLP_EPOCHS
+                prior_rows, current_features, mlp_epochs=WF_MLP_EPOCHS
             )
             current_cutoff = d
         preds = {name: [current_predictors[name](r) for r in day_rows] for name in CANDIDATE_NAMES}
         labels = [r["label"] for r in day_rows]
         feat_vals = {f: [r["features"][f] for r in day_rows] for f in FEATURE_KEYS}
-        out[d] = {"fp": fp, "candPreds": preds, "labels": labels, "featVals": feat_vals}
+        out[d] = {
+            "fp": fp,
+            "candPreds": preds,
+            "labels": labels,
+            "featVals": feat_vals,
+            "features": current_features,
+        }
+        last_features = current_features
         rep("Walk-forward selection", 30 + int(55 * (i + 1) / max(1, len(dates))),
             f"Evaluated {len(day_rows)} game(s) on {d} against {len(prior_games)} prior game(s)…")
 
@@ -254,14 +340,11 @@ def build_walk_forward_selection(report=None, rows=None) -> dict:
     for c in candidates:
         c["selected"] = c["name"] == best_name
 
-    # Walk-forward feature selection: a feature stays active when its out-of-
-    # sample univariate AUC is measurably better than a coin flip in EITHER
-    # direction (the logistic weight learns the sign), plus the structural core.
-    selected_features = []
-    for f in FEATURE_KEYS:
-        uni = compute_auc(accum["featVals"][f], labels)
-        if f in CORE_FEATURES or abs(uni - 0.5) >= FEATURE_SIGNAL_EPS:
-            selected_features.append(f)
+    # Today's deployed feature set = the FINAL walk-forward block's L1+stability
+    # selection (nested: chosen only from games strictly before that date, so no
+    # future result influences it). The pooled univariate AUCs below remain as
+    # the per-feature importance readout for the monitor.
+    selected_features = last_features or [f for f in FEATURE_KEYS if f in CORE_FEATURES]
 
     # Final weights are filled in by apply_walk_forward_selection (it refits on
     # the complete history); here we only report the out-of-sample signal.
@@ -282,10 +365,10 @@ def build_walk_forward_selection(report=None, rows=None) -> dict:
     is_correct = [1 if (p >= 0.5) == (y == 1) else 0 for p, y in zip(chosen_preds, labels)]
     high_conf = [c for p, c in zip(pick_probs, is_correct) if p >= 0.65]
 
-    if best_name == "Blended ensemble":
-        description = "Walk-forward blended ensemble (logistic + Elo), isotonic-calibrated."
-    else:
-        description = f"Walk-forward selected {best_name}, isotonic-calibrated."
+    description = (
+        "Walk-forward per-date model: stack vs logistic chosen by holdout Brier, "
+        "L1-selected features, isotonic-calibrated."
+    )
 
     selection = {
         "trainedThrough": today,
@@ -308,8 +391,10 @@ def build_walk_forward_selection(report=None, rows=None) -> dict:
         "spearmanRho": spearman_rank(pick_probs, is_correct),
         "topDecileWinRate": (sum(high_conf) / len(high_conf)) if high_conf else 0.0,
         "optimizationParams": {
-            "featureSelection": "Walk-forward univariate AUC (out-of-sample)",
+            "featureSelection": "Per-date L1 (LASSO) + stability vote, λ tuned by holdout Brier",
+            "modelSelection": "Stack vs logistic per date by holdout Brier",
             "minCandidateAuc": CANDIDATE_MIN_AUC,
+            "l1LambdaGrid": list(L1_LAMBDA_GRID),
             "l2Lambda": 0.001,
             "epochs": 20,
             "hfaGrid": [0, 10, 20, 30, 40, 50, 60],

@@ -905,20 +905,23 @@ def run_model_light(
     as_of_date: str,
     feature_names: list[str] | None = None,
     mlp_epochs: int = 40,
+    model_choice: str | None = None,
 ) -> dict:
     """Cheap point-in-time refit for walk-forward backtests.
 
     Reuses precomputed chronological feature rows (`rows`) and fits the same
     core production recipe — the deployable multi-model stack (logistic / k-NN
-    / boosted stumps / MLP / naive Bayes blended by holdout-tuned weights) +
-    Elo blend + isotonic calibration + Poisson run-scoring — but skips the
+    / boosted stumps / MLP / naive Bayes blended by holdout-tuned weights) OR a
+    pure logistic, chosen per-date by holdout Brier (fit_deployable_model) —
+    plus Elo blend + isotonic calibration + Poisson run-scoring. It skips the
     expensive Auto-ML layers (greedy backward elimination, the full candidate
     pool, Monte Carlo grid, drift and cross-validation diagnostics). It trains
     strictly on prior rows, so no future outcome leaks into the fitted model.
 
     `feature_names` defaults to the full FEATURE_KEYS universe; the walk-
-    forward calibration passes today's selected features so every dashboard
-    scores with the identical feature set.
+    forward calibration passes each date's L1-selected features so every
+    dashboard scores with the identical feature set. `model_choice` forces the
+    stack-vs-logistic decision when the walk-forward record already made it.
     """
     n = len(rows)
     train_end = int(math.floor(n * 0.7))
@@ -938,36 +941,15 @@ def run_model_light(
                 best_brier = b
                 elo_hfa = hfa
 
-    # Deployable multi-model stack: fit families on the full prior history,
-    # tune family weights + Elo blend on a chronological holdout, then fit
-    # isotonic on the exact served blend (stack + Elo) — train == serve.
-    # The repeated walk-forward fits cap the MLP member's epochs (it dominates
-    # backtest CPU); the deployed model keeps the full default.
-    stack, blend_w = fit_stack(rows, selected, elo_hfa, mlp_epochs=mlp_epochs)
-
-    def _served_logit(r: dict) -> float:
-        sl = stack_logit(stack, r["features"])
-        el = logit(elo_prob(r, elo_hfa))
-        return (1 - blend_w) * sl + blend_w * el if blend_w > 0 else sl
-
-    served_preds = [sigmoid(_served_logit(r)) for r in rows]
-    all_labels = [r["label"] for r in rows]
-    order = sorted(zip(served_preds, all_labels), key=lambda t: t[0])
-    isotonic_points = isotonic_regression([o[0] for o in order], [o[1] for o in order])
-
-    lr_member = stack["members"].get("Logistic regression") or {}
-    model = {
-        "featureNames": selected,
-        "weights": lr_member.get("weights", []),
-        "bias": lr_member.get("bias", 0.0),
-        "featureStats": lr_member.get("featureStats", {}),
-        "isotonicPoints": isotonic_points,
-        "monteCarloSigma": 0.0,
-        "monteCarloEnabled": False,
-        "eloHfa": elo_hfa,
-        "blendW": blend_w,
-        "stack": stack,
-    }
+    # Deployable model + per-date family choice: fit the stack AND a pure
+    # logistic on the prior history, tune each's Elo blend on a chronological
+    # holdout, deploy whichever has the lower Brier on the trailing 15% (fit
+    # on Brier), then fit isotonic on the exact served blend — train == serve.
+    model, model_choice = fit_deployable_model(
+        rows, selected, elo_hfa, mlp_epochs=mlp_epochs, model_choice=model_choice
+    )
+    model["monteCarloSigma"] = 0.0
+    model["monteCarloEnabled"] = False
 
     run_margin_calibration = fit_run_margin_calibration(rows, model)
     run_model_state = fit_run_model(completed_games)
@@ -1004,19 +986,25 @@ def run_model_light(
     ]
     test_eval = evaluate(test_preds, test_labels)
 
-    positive_members = [nm for nm, w in stack["weights"].items() if w > 0]
-    if len(positive_members) > 1:
+    stack = model.get("stack") or {}
+    positive_members = [nm for nm, w in stack.get("weights", {}).items() if w > 0]
+    blend_w = model.get("blendW", 0.0)
+    deployed = model_choice.get("deployed", "stack")
+    if deployed == "stack" and len(positive_members) > 1:
         selected_model_name = "Multi-model stack (point-in-time)"
         description = (
             f"Point-in-time multi-model stack ({', '.join(positive_members)}), "
             f"blended {1 - blend_w:.2f} + {blend_w:.2f}·Elo, isotonic-calibrated."
         )
-    else:
-        selected_model_name = "Logistic + Elo (point-in-time)"
+    elif deployed == "stack" or blend_w > 0:
+        selected_model_name = "Blended ensemble (point-in-time)"
         description = (
             f"Point-in-time ensemble: {1 - blend_w:.2f}·logistic + {blend_w:.2f}·Elo, "
             "isotonic-calibrated."
         )
+    else:
+        selected_model_name = "Logistic regression (point-in-time)"
+        description = "Point-in-time logistic + Elo, isotonic-calibrated."
 
     return {
         "season": season,
@@ -1026,13 +1014,14 @@ def run_model_light(
         "selectedModel": selected_model_name,
         "modelDescription": description,
         "featureNames": selected,
-        "weights": lr_member.get("weights", []),
-        "bias": lr_member.get("bias", 0.0),
-        "featureStats": lr_member.get("featureStats", {}),
-        "isotonicPoints": isotonic_points,
+        "weights": model.get("weights", []),
+        "bias": model.get("bias", 0.0),
+        "featureStats": model.get("featureStats", {}),
+        "isotonicPoints": model.get("isotonicPoints", []),
         "eloHfa": elo_hfa,
         "blendW": blend_w,
         "stack": stack,
+        "modelChoice": model_choice,
         "monteCarloEnabled": False,
         "monteCarloTrials": 0,
         "monteCarloSigma": 0.0,
@@ -1145,47 +1134,128 @@ def fit_candidate_pool(train: list[dict], feature_names: list[str], mlp_epochs: 
     return predictors, elo_hfa, blend_w
 
 
+def _tune_elo_blend(served_logits: list[float], holdout: list[dict], elo_hfa: float) -> float:
+    """Tune the Elo blend weight on a chronological holdout by Brier."""
+    elo_logits = [logit(elo_prob(r, elo_hfa)) for r in holdout]
+    labels = [r["label"] for r in holdout]
+    best_brier = float("inf")
+    best_w = 0.0
+    w = 0.0
+    while w <= 1.0001:
+        preds = [sigmoid((1 - w) * sl + w * el) for sl, el in zip(served_logits, elo_logits)]
+        b = compute_brier(preds, labels)
+        if b < best_brier:
+            best_brier = b
+            best_w = w
+        w += 0.05
+    return best_w
+
+
+def fit_deployable_model(
+    rows: list[dict],
+    feature_names: list[str],
+    elo_hfa: float = 30.0,
+    mlp_epochs: int = 40,
+    model_choice: str | None = None,
+) -> tuple[dict, dict]:
+    """Fit the deployable stack AND a pure logistic on `rows` (strictly prior-
+    only) and deploy whichever has the lower Brier on the trailing 15% of
+    `rows` — model selection on Brier, the user's risk metric.
+
+    Each family's Elo blend is tuned on the trailing 20% chronological holdout
+    (never a future game). `model_choice` ("stack" | "logistic") forces the
+    decision when the walk-forward record already made it, so the calibration
+    backtest and today's deployed model serve the identical recipe. Isotonic
+    calibration is fit on the exact blend apply_model serves (train == serve).
+
+    Returns (model, choice): model carries featureNames / weights / bias /
+    featureStats / isotonicPoints / eloHfa / blendW / stack; choice carries the
+    deployed family and both holdout Briers for the monitor.
+    """
+    selected = list(feature_names)
+    stack, blend_w = fit_stack(rows, selected, elo_hfa, mlp_epochs=mlp_epochs)
+    lr = train_logistic(rows, selected)
+    n = len(rows)
+
+    lr_blend_w = 0.0
+    holdout = rows[int(math.floor(n * 0.8)):] if n >= 40 else []
+    if len(holdout) >= 20:
+        lr_blend_w = _tune_elo_blend(
+            [logistic_logit(lr, r["features"], None) for r in holdout], holdout, elo_hfa
+        )
+
+    test = rows[min(n, int(math.floor(n * 0.85))):]
+    labels = [r["label"] for r in test]
+
+    def _served(r: dict, bw: float, logits_fn) -> float:
+        sl = logits_fn(r)
+        el = logit(elo_prob(r, elo_hfa))
+        return sigmoid((1 - bw) * sl + bw * el if bw > 0 else sl)
+
+    stack_brier = float("inf")
+    lr_brier = float("inf")
+    if len(labels) >= 20:
+        stack_brier = compute_brier(
+            [_served(r, blend_w, lambda r: stack_logit(stack, r["features"])) for r in test], labels
+        )
+        lr_brier = compute_brier(
+            [_served(r, lr_blend_w, lambda r: logistic_logit(lr, r["features"], None)) for r in test],
+            labels,
+        )
+    if model_choice is None:
+        model_choice = "logistic" if lr_brier < stack_brier - 1e-4 else "stack"
+
+    if model_choice == "logistic":
+        stack = {"members": {"Logistic regression": lr}, "weights": {"Logistic regression": 1.0}}
+        blend_w = lr_blend_w
+        lr_member = lr
+    else:
+        lr_member = stack["members"].get("Logistic regression") or {}
+
+    served_preds = [
+        _served(r, blend_w, lambda r: stack_logit(stack, r["features"])) for r in rows
+    ]
+    all_labels = [r["label"] for r in rows]
+    order = sorted(zip(served_preds, all_labels), key=lambda t: t[0])
+    isotonic_points = isotonic_regression([o[0] for o in order], [o[1] for o in order])
+
+    model = {
+        "featureNames": selected,
+        "weights": lr_member.get("weights", []),
+        "bias": lr_member.get("bias", 0.0),
+        "featureStats": lr_member.get("featureStats", {}),
+        "isotonicPoints": isotonic_points,
+        "eloHfa": elo_hfa,
+        "blendW": blend_w,
+        "stack": stack,
+    }
+    choice = {"deployed": model_choice, "stackBrier": stack_brier, "logisticBrier": lr_brier}
+    return model, choice
+
+
 def refit_stack_model(
     rows: list[dict],
     feature_names: list[str],
     elo_hfa: float = 30.0,
     monte_carlo_enabled: bool = False,
     monte_carlo_sigma: float = 0.0,
+    model_choice: str | None = None,
 ) -> dict:
-    """Fit the production multi-model stack on ALL `rows` with `feature_names`.
+    """Fit the production model on ALL `rows` with `feature_names`.
 
     Used after walk-forward feature selection to rebuild today's deployed model
     on the complete training history using only the features the walk-forward
-    record selected. The family weights + Elo blend are tuned on a chronological
-    holdout of `rows` (never a future game) and isotonic calibration is fit on
-    the exact blend apply_model serves (stack + Elo), so train == serve. The
-    walk-forward selection itself supplies the unbiased out-of-sample metrics.
+    record selected. Deploys the stack or a pure logistic by holdout Brier
+    (fit_deployable_model), tunes the Elo blend on a chronological holdout of
+    `rows` (never a future game) and fits isotonic calibration on the exact
+    blend apply_model serves (stack + Elo), so train == serve. The walk-forward
+    selection itself supplies the unbiased out-of-sample metrics.
     """
-    stack, blend_w = fit_stack(rows, feature_names, elo_hfa)
-
-    def _served_logit(r: dict) -> float:
-        sl = stack_logit(stack, r["features"])
-        el = logit(elo_prob(r, elo_hfa))
-        return (1 - blend_w) * sl + blend_w * el if blend_w > 0 else sl
-
-    served_preds = [sigmoid(_served_logit(r)) for r in rows]
-    labels = [r["label"] for r in rows]
-    order = sorted(zip(served_preds, labels), key=lambda t: t[0])
-    isotonic_points = isotonic_regression([o[0] for o in order], [o[1] for o in order])
-
-    lr_member = stack["members"].get("Logistic regression") or {}
-    return {
-        "featureNames": feature_names,
-        "weights": lr_member.get("weights", []),
-        "bias": lr_member.get("bias", 0.0),
-        "featureStats": lr_member.get("featureStats", {}),
-        "isotonicPoints": isotonic_points,
-        "monteCarloSigma": monte_carlo_sigma,
-        "monteCarloEnabled": monte_carlo_enabled,
-        "eloHfa": elo_hfa,
-        "blendW": blend_w,
-        "stack": stack,
-    }
+    model, _choice = fit_deployable_model(rows, feature_names, elo_hfa, model_choice=model_choice)
+    model["monteCarloSigma"] = monte_carlo_sigma
+    model["monteCarloEnabled"] = monte_carlo_enabled
+    model["modelChoice"] = _choice
+    return model
 
 
 def refit_logistic_model(

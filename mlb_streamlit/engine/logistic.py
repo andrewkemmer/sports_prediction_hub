@@ -202,6 +202,152 @@ def train_logistic(rows: list[dict], feature_names: list[str], iterations: int =
     }
 
 
+def _soft_threshold(z: float, gamma: float) -> float:
+    """Soft-thresholding operator S(z, γ) = sign(z)·max(|z| − γ, 0)."""
+    if z > gamma:
+        return z - gamma
+    if z < -gamma:
+        return z + gamma
+    return 0.0
+
+
+def _train_logistic_l1_vectorized(rows: list[dict], feature_names: list[str], lambda_l1: float, iterations: int, l2: float) -> dict | None:
+    """numpy coordinate-descent L1 (LASSO) logistic — glmnet-style shooting.
+
+    Standardized features, same featureStats convention as train_logistic.
+    Features whose coefficient is soft-thresholded to zero are "not selected";
+    the returned weights are exactly 0.0 for them. Returns None when the fit
+    degenerates so the caller can fall back to the reference implementation.
+    """
+    np = _np
+    n = len(rows)
+    m = len(feature_names)
+    feature_stats = {}
+    for f in feature_names:
+        vals = np.array([r["features"][f] for r in rows], dtype=float)
+        s = float(vals.std())
+        if not s or not math.isfinite(s):
+            s = 1.0
+        feature_stats[f] = {"mean": float(vals.mean()), "std": s}
+    means = np.array([feature_stats[f]["mean"] for f in feature_names])
+    stds = np.array([feature_stats[f]["std"] for f in feature_names])
+    X = np.array([[r["features"][f] for f in feature_names] for r in rows], dtype=float)
+    X = np.clip((X - means) / stds, -Z_CAP, Z_CAP)
+    y = np.array([r["label"] for r in rows], dtype=float)
+    pos = float(y.sum())
+    w = np.zeros(m + 1)
+    w[m] = math.log((pos + 1) / (n - pos + 1))
+    ones = np.ones(n)
+    # glmnet convention: minimize (1/n)·loss + λ·||w||_1, so the soft-threshold
+    # is n·λ (the un-normalized gradient Σ x·(y−p) has scale √n).
+    lam = lambda_l1 * n
+    for _ in range(iterations):
+        eta = X @ w[:m] + w[m]
+        p = np.clip(_np_sigmoid(eta), 1e-6, 1 - 1e-6)
+        v = p * (1 - p)
+        max_change = 0.0
+        for j in range(m):
+            xj = X[:, j]
+            rj = float(np.sum(xj * (y - p))) + w[j] * float(np.sum(xj * xj * v))
+            denom = float(np.sum(xj * xj * v)) + l2
+            if denom <= 0:
+                continue
+            nxt = _soft_threshold(rj / denom, lam / denom)
+            max_change = max(max_change, abs(nxt - w[j]))
+            w[j] = nxt
+        denom = float(np.sum(v))
+        if denom > 0:
+            nxt = w[m] + float(np.sum(y - p)) / denom
+            max_change = max(max_change, abs(nxt - w[m]))
+            w[m] = nxt
+        if max_change < 1e-6:  # converged — stop exactly at the fixed point
+            break
+    if not np.all(np.isfinite(w)):
+        return None
+    return {
+        "featureNames": feature_names,
+        "weights": [float(v) for v in w[:m]],
+        "bias": float(w[m]),
+        "featureStats": feature_stats,
+    }
+
+
+def _train_logistic_l1_pure(rows: list[dict], feature_names: list[str], lambda_l1: float, iterations: int, l2: float) -> dict:
+    """Pure-Python coordinate-descent L1 logistic (reference implementation)."""
+    feature_stats = {}
+    for f in feature_names:
+        vals = [r["features"][f] for r in rows]
+        s = std(vals) or 1
+        feature_stats[f] = {"mean": mean(vals), "std": s}
+    X = [
+        [zscore(r["features"][f], feature_stats[f]["mean"], feature_stats[f]["std"]) for f in feature_names]
+        for r in rows
+    ]
+    y = [r["label"] for r in rows]
+    n = len(rows)
+    m = len(feature_names)
+    pos = sum(y)
+    w = [0.0] * (m + 1)
+    w[m] = math.log((pos + 1) / (n - pos + 1))
+    # glmnet convention: minimize (1/n)·loss + λ·||w||_1 → soft-threshold n·λ.
+    lam = lambda_l1 * n
+    for _ in range(iterations):
+        p = [clamp(sigmoid(sum(w[j] * X[i][j] for j in range(m)) + w[m]), 1e-6, 1 - 1e-6) for i in range(n)]
+        max_change = 0.0
+        for j in range(m):
+            rj = 0.0
+            denom = l2
+            for i in range(n):
+                xij = X[i][j]
+                v = p[i] * (1 - p[i])
+                rj += xij * (y[i] - p[i]) + w[j] * xij * xij * v
+                denom += xij * xij * v
+            if denom <= 0:
+                continue
+            nxt = _soft_threshold(rj / denom, lam / denom)
+            max_change = max(max_change, abs(nxt - w[j]))
+            w[j] = nxt
+        denom = sum(p[i] * (1 - p[i]) for i in range(n))
+        if denom > 0:
+            nxt = w[m] + sum(y[i] - p[i] for i in range(n)) / denom
+            max_change = max(max_change, abs(nxt - w[m]))
+            w[m] = nxt
+        if max_change < 1e-6:
+            break
+    return {
+        "featureNames": feature_names,
+        "weights": w[:m],
+        "bias": w[m],
+        "featureStats": feature_stats,
+    }
+
+
+def train_logistic_l1(
+    rows: list[dict],
+    feature_names: list[str],
+    lambda_l1: float = 0.02,
+    iterations: int = 100,
+    l2: float = 1e-4,
+) -> dict:
+    """L1-regularized (LASSO) logistic regression — the walk-forward feature selector.
+
+    Coordinate descent on standardized features (glmnet-style shooting). Returns
+    the same dict shape as train_logistic (featureNames / weights / bias /
+    featureStats) so logistic_logit works unchanged; features whose coefficient
+    is soft-thresholded to exactly 0.0 are the ones L1 drops. `lambda_l1` is the
+    L1 penalty strength — the walk-forward pass tunes it on a chronological
+    holdout by Brier (fit on Brier).
+    """
+    if _np is not None:
+        try:
+            m = _train_logistic_l1_vectorized(rows, feature_names, lambda_l1, iterations, l2)
+            if m is not None:
+                return m
+        except Exception:  # pragma: no cover - fall back to the reference on any edge case
+            pass
+    return _train_logistic_l1_pure(rows, feature_names, lambda_l1, iterations, l2)
+
+
 def logistic_logit(model: dict, features: dict, shap: list | None = None) -> float:
     """Raw logit = bias + Σ w·z (z winsorized at ±Z_CAP). When `shap` is a
     list, appends contributions."""

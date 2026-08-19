@@ -396,7 +396,7 @@ def test_walk_forward_calibration() -> None:
     real_sim = emod.simulate_runs_batch
     calls = {"n": 0}
 
-    def stub_run_model_light(rows, completed_games, season, as_of_date, feature_names=None, mlp_epochs=40):
+    def stub_run_model_light(rows, completed_games, season, as_of_date, feature_names=None, mlp_epochs=40, model_choice=None):
         calls["n"] += 1
         return {
             "season": season, "asOfDate": as_of_date,
@@ -407,6 +407,7 @@ def test_walk_forward_calibration() -> None:
             "monteCarloEnabled": False, "monteCarloTrials": 0,
             "monteCarloSigma": 0.0, "auc": 0.5, "brier": 0.25,
             "logLoss": 0.69, "ece": 0.0,
+            "modelChoice": {"deployed": "stub", "stackBrier": 0.25, "logisticBrier": 0.25},
             "runModel": {"parkFactor": {}, "leagueRuns": 4.5,
                           "teamOffense": {}, "teamDefense": {}},
             "runLineCalibration": [],
@@ -481,7 +482,7 @@ def test_point_in_time_docs() -> None:
     real_batter = refresh.fetch_batter_game_logs
     real_odds = refresh.fetch_market_odds
 
-    def stub_run_model_light(rows, completed_games, season, as_of_date, feature_names=None, mlp_epochs=40):
+    def stub_run_model_light(rows, completed_games, season, as_of_date, feature_names=None, mlp_epochs=40, model_choice=None):
         return {
             "season": season, "asOfDate": as_of_date,
             "gamesTrained": len(rows), "holdoutCount": 0,
@@ -491,6 +492,7 @@ def test_point_in_time_docs() -> None:
             "monteCarloEnabled": False, "monteCarloTrials": 0,
             "monteCarloSigma": 0.0, "auc": 0.5, "brier": 0.25,
             "logLoss": 0.69, "ece": 0.0,
+            "modelChoice": {"deployed": "stub", "stackBrier": 0.25, "logisticBrier": 0.25},
             "runModel": {"parkFactor": {}, "leagueRuns": 4.5,
                           "teamOffense": {}, "teamDefense": {}},
             "runLineCalibration": [],

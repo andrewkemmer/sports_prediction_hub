@@ -52,13 +52,19 @@ from .engine.model import (
     simulate_runs_batch,
 )
 from .engine.runs import expected_margin, expected_total, simulate_runs
-from .wf_selection import apply_walk_forward_selection, build_walk_forward_selection
+from .wf_selection import (
+    WF_SELECTION_FILE,
+    WF_SELECTION_VERSION,
+    apply_walk_forward_selection,
+    build_walk_forward_selection,
+    load_selection_days,
+)
 
 RUN_SIM_TRIALS = 10000
 RUN_CALIB_TRIALS = 500
 MIN_COMPLETED_GAMES = 40
 
-PREDICTION_VERSION = 7  # bump to force re-scoring of previously cached dates
+PREDICTION_VERSION = 8  # bump to force re-scoring of previously cached dates
 BACKTEST_STATES_FILE = "backtest_states.json"
 BACKTEST_CACHE_VERSION = cache.BACKTEST_CACHE_VERSION  # bump with PREDICTION_VERSION to invalidate stale backtest caches
 WF_REFIT_DAYS = 7  # refit the walk-forward model every N days (games in a block share a model)
@@ -1093,15 +1099,20 @@ def _backtest_state(target: str, report=None) -> dict | None:
     # season-to-date and would leak post-target games into training features.
     completed_enriched = [g for g in enriched if g.get("winner") in ("home", "away")]
     fe = compute_elo_and_features(completed_enriched, cache.load_injury_snapshots(), target)
-    # Use today's deployed feature set so the games-tab backtest and the
-    # calibration backtest score with the identical model family + features.
-    # The fit uses the same rolling window + capped MLP as the calibration
-    # backtest, so every dashboard's point-in-time model is the same recipe.
+    # Each date uses ITS OWN prior-only L1-selected features and family from the
+    # walk-forward selection record (nested), falling back to today's deployed
+    # set when the record has none. The fit uses the same rolling window +
+    # capped MLP as the calibration backtest, so every dashboard's point-in-
+    # time model is the same recipe.
     deployed_state = cache.load_model_state()
-    feature_names = (deployed_state or {}).get("featureNames") or list(FEATURE_KEYS)
+    fallback_features = (deployed_state or {}).get("featureNames") or list(FEATURE_KEYS)
+    sel_day = load_selection_days().get(target) or {}
+    feature_names = sel_day.get("features") or fallback_features
+    model_choice = sel_day.get("modelChoice") or None
     prior_rows = fe["rows"][max(0, len(fe["rows"]) - WF_TRAIN_WINDOW):]
     result = run_model_light(
-        prior_rows, completed_enriched, season, target, feature_names, mlp_epochs=WF_MLP_EPOCHS
+        prior_rows, completed_enriched, season, target, feature_names,
+        mlp_epochs=WF_MLP_EPOCHS, model_choice=model_choice,
     )
 
     state = {
@@ -1122,6 +1133,7 @@ def _backtest_state(target: str, report=None) -> dict | None:
         "eloHfa": result["eloHfa"],
         "blendW": result.get("blendW", 0.0),
         "stack": result.get("stack", {}),
+        "modelChoice": result.get("modelChoice"),
         "monteCarloEnabled": result["monteCarloEnabled"],
         "monteCarloTrials": result["monteCarloTrials"],
         "monteCarloSigma": result["monteCarloSigma"],
@@ -1229,6 +1241,10 @@ def build_walk_forward_calibration_rows(
     existing = existing_raw.get("days", {}) if isinstance(existing_raw, dict) and "days" in existing_raw else {}
     if (existing_raw.get("version") if isinstance(existing_raw, dict) else None) != BACKTEST_CACHE_VERSION:
         existing = {}
+    # Per-date L1-selected features + stack-vs-logistic choice from the walk-
+    # forward selection record, so every date is scored by ITS point-in-time
+    # feature set and model family (nested selection).
+    sel_days = load_selection_days()
     out: dict[str, dict] = {}
     season = today[:4]
     dates = sorted(d for d in by_date if d[:4] == season)
@@ -1254,10 +1270,16 @@ def build_walk_forward_calibration_rows(
     # re-hashed ~6000 games for every one of ~150 dates).
     prior_hash = hashlib.sha256()
 
+    current_model_choice: str | None = None
     for i, d in enumerate(dates):
         day_rows = rows_by_date.get(d) or []
         if not day_rows:
             continue
+        # Per-date recipe from the walk-forward selection record (nested): each
+        # date's model uses ITS OWN prior-only L1-selected features and family.
+        sel_day = sel_days.get(d) or {}
+        feats_d = sel_day.get("features") or feature_names
+        choice_d = sel_day.get("modelChoice") or None
         # Advance the prior-games pointer once through the chronological
         # feature rows (amortized O(n) over the whole loop instead of an
         # O(n) rescan per date).
@@ -1283,8 +1305,11 @@ def build_walk_forward_calibration_rows(
                 )
             ).encode("utf-8")
         ).hexdigest()
+        # The per-date feature set participates in the fingerprint so a change
+        # in the L1 selection invalidates that date's cached rows.
         fp = hashlib.sha256(
-            (f"{prior_hash.hexdigest()}|{day_hash}|featureVersion:{FEATURE_VERSION}").encode("utf-8")
+            (f"{prior_hash.hexdigest()}|{day_hash}|featureVersion:{FEATURE_VERSION}"
+             f"|feats:{','.join(sorted(feats_d))}").encode("utf-8")
         ).hexdigest()
         cached_day = existing.get(d)
         if cached_day and cached_day.get("fp") == fp:
@@ -1301,7 +1326,8 @@ def build_walk_forward_calibration_rows(
         if current_model is None or d >= add_days(current_cutoff, WF_REFIT_DAYS):
             prior_rows = fe_rows[max(0, ptr - WF_TRAIN_WINDOW):ptr]
             result = run_model_light(
-                prior_rows, prior_games, season, d, feature_names, mlp_epochs=WF_MLP_EPOCHS
+                prior_rows, prior_games, season, d, feats_d, mlp_epochs=WF_MLP_EPOCHS,
+                model_choice=choice_d,
             )
             current_model = {
                 "featureNames": result["featureNames"],
@@ -1315,6 +1341,7 @@ def build_walk_forward_calibration_rows(
                 "blendW": result.get("blendW", 0.0),
                 "stack": result.get("stack", {}),
             }
+            current_model_choice = (result.get("modelChoice") or {}).get("deployed")
             current_run_model = result["runModel"]
             current_run_line_iso = result["runLineCalibration"]
             current_run_margin_cal = result["runMarginCalibration"]
@@ -1328,10 +1355,26 @@ def build_walk_forward_calibration_rows(
         )
         for r in cal_rows:
             r["trainedThrough"] = current_cutoff
-        out[d] = {"fp": fp, "rows": cal_rows}
+            r["modelChoice"] = current_model_choice
+        out[d] = {"fp": fp, "rows": cal_rows, "modelChoice": current_model_choice}
         rep("Walk-forward", 30 + int(65 * (i + 1) / max(1, len(dates))),
             f"Scored {len(cal_rows)} game(s) on {d} with a model trained on {len(prior_games)} prior game(s)…")
     cache.save_json(CALIBRATION_WF_FILE, {"version": BACKTEST_CACHE_VERSION, "days": out})
+    # Record each date's deployed family in the walk-forward selection record so
+    # the Model Monitor can show the per-date stack-vs-logistic decision.
+    sel_raw = cache.load_json(WF_SELECTION_FILE, {}) or {}
+    sel_days_out = sel_raw.get("days", {}) if isinstance(sel_raw, dict) else {}
+    changed = False
+    for d in out:
+        choice = out[d].get("modelChoice")
+        if choice and sel_days_out.get(d, {}).get("modelChoice") != choice:
+            sel_days_out.setdefault(d, {})["modelChoice"] = choice
+            changed = True
+    if changed:
+        sel_raw = dict(sel_raw)
+        sel_raw["version"] = WF_SELECTION_VERSION
+        sel_raw["days"] = sel_days_out
+        cache.save_json(WF_SELECTION_FILE, sel_raw)
     flat: list[dict] = []
     for d in sorted(out):
         flat.extend(out[d]["rows"])
