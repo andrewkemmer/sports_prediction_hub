@@ -27,7 +27,7 @@ from .data import add_days, attach_as_of_stats, attach_lineups_as_of, et_date_st
 from .engine.features import FEATURE_KEYS, FEATURE_LABELS, compute_elo_and_features
 from .engine.gating import apply_concordance_gate, default_gate_config, summarize_gate_results, tune_concordance_gate
 from .engine.logistic import cross_validate, logistic_logit, train_logistic_l1
-from .engine.metrics import compute_auc, compute_brier, evaluate, sigmoid, spearman_rank
+from .engine.metrics import compute_auc, compute_brier, evaluate, roundn, sigmoid, spearman_rank
 from .engine.model import CANDIDATE_MIN_AUC, apply_model, elo_prob, fit_walk_forward_step, refit_stack_model
 from .engine.stack import predict_member, stack_probability
 
@@ -671,22 +671,28 @@ def apply_walk_forward_selection(result: dict, model: dict, rows: list[dict], se
     result["featureImportances"] = feature_importances
     result["candidates"] = selection["candidates"]
     deployed_member_names = set(positive)
-    # Highlight the actual positive-weight stack members AND the single family
-    # that dominated the walk-forward holdout (best by Brier, AUC tie-break),
-    # so a strictly better out-of-sample family like the MLP is never shown
-    # as unselected next to a worse deployed family.
+    # Two DISTINCT flags, one concept per row:
+    #   * `selected` — the strict best single family by holdout Brier (AUC
+    #     tie-break), exactly one row. "Best single" is a rank, not a weight.
+    #   * `inStack`   — the fitted families carrying positive weight in the
+    #     deployed stack (the allocation vector).
+    # A family can be both (best single AND a stack member), but a model that
+    # merely dominates the holdout can no longer collide with the deployed
+    # family into two simultaneous "best" badges.
     best_single: dict | None = None
     for c in selection.get("candidates", []):
         if c.get("eligible") and c["name"] != "Multi-model stack":
             if best_single is None or (c["brier"], -c["auc"]) < (best_single["brier"], -best_single["auc"]):
                 best_single = c
     for c in result["candidates"]:
-        c["selected"] = c["name"] in deployed_member_names or (
-            best_single is not None and c["name"] == best_single["name"]
-        )
+        c["selected"] = best_single is not None and c["name"] == best_single["name"]
+        c["inStack"] = c["name"] in deployed_member_names
+    # Single normalized allocation vector across the full candidate pool:
+    # deployed stack members carry their (sum-to-1) weights, every other row
+    # is an explicit zero — never an implicit 100% fallback.
     result["stackingWeights"] = [
-        {"name": n, "weight": w}
-        for n, w in sorted(stack.get("weights", {}).items(), key=lambda kv: -kv[1])
+        {"name": c["name"], "weight": roundn((stack.get("weights") or {}).get(c["name"], 0.0), 3)}
+        for c in result["candidates"]
     ]
     result["crossValidation"] = selection["crossValidation"]
     result["optimizationParams"] = selection["optimizationParams"]

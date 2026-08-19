@@ -1784,14 +1784,23 @@ def _automl_panel(ms: dict) -> None:
         weights = ms.get("stackingWeights") or []
         rows = []
         for c in candidates:
-            w = next((x["weight"] for x in weights if x["name"] == c["name"]), (1 if c.get("selected") else 0))
+            # A single normalized allocation vector: the deployed stack's
+            # member weights (summing to 1.0). Rows without a stack entry are
+            # diagnostics and carry exactly zero — never an implicit 100%.
+            w = next((x["weight"] for x in weights if x["name"] == c["name"]), 0.0)
+            pills = ""
+            if c.get("selected"):
+                pills += ui.pill("Best single", ui.EMERALD, "rgba(52,211,153,0.15)")
+            if c.get("inStack"):
+                pills += ui.pill("In stack", ui.CYAN, "rgba(34,211,238,0.15)")
+            if not c.get("eligible"):
+                pills += ui.pill("Excluded", ui.AMBER, "rgba(252,211,77,0.12)")
             rows.append(
                 f"<div style='margin-bottom:12px;'>"
                 f"<div style='display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;'>"
                 f"<div style='display:flex;align-items:center;gap:8px;'>"
                 f"<span style='font-size:13px;font-weight:500;color:{ui.TEXT}'>{c['name']}</span>"
-                + (ui.pill("Best single", ui.EMERALD, "rgba(52,211,153,0.15)") if c.get("selected") else "")
-                + (ui.pill("Excluded", ui.AMBER, "rgba(252,211,77,0.12)") if not c.get("eligible") else "")
+                + pills
                 + f"</div>"
                 f"<div style='display:flex;gap:12px;font-size:12px;color:{ui.MUTED};font-variant-numeric:tabular-nums;'>"
                 f"<span>AUC {c['auc']:.3f}</span><span>Brier {c['brier']:.3f}</span>"
@@ -1803,7 +1812,9 @@ def _automl_panel(ms: dict) -> None:
             f"<h3 style='margin:0;font-size:14px;font-weight:600;color:{ui.TEXT}'>Optimal Model Stacking Weights</h3>"
             f"<p style='margin:6px 0 14px;font-size:12px;color:{ui.MUTED};line-height:1.5;max-width:760px;'>"
             f"Greedy forward-selection solves for convex-combination weights that minimize holdout Brier loss. "
-            f"Only models that measurably reduce risk are added to the stack; the remainder carry zero weight.</p>"
+            f"Only models that measurably reduce risk are added to the stack; the remainder carry zero weight. "
+            f"The 'Multi-model stack' row is a diagnostic (the raw blend) — its allocation is expressed through "
+            f"the member families that carry weight.</p>"
             + "".join(rows) + "</div>",
             unsafe_allow_html=True,
         )
@@ -1919,12 +1930,14 @@ def _ensemble_panel(ms: dict) -> None:
 
     cand_rows = []
     for c in candidates:
+        pills = []
         if c.get("selected"):
-            status = ui.pill("Selected", ui.EMERALD, "rgba(52,211,153,0.15)")
-        elif not c.get("eligible"):
-            status = ui.pill(f"Excluded (<{CANDIDATE_MIN_AUC:.2f})", ui.AMBER, "rgba(252,211,77,0.12)")
-        else:
-            status = "<span style='color:#8b939f;font-size:12px'>—</span>"
+            pills.append(ui.pill("Best single", ui.EMERALD, "rgba(52,211,153,0.15)"))
+        if c.get("inStack"):
+            pills.append(ui.pill("In stack", ui.CYAN, "rgba(34,211,238,0.15)"))
+        if not pills and not c.get("eligible"):
+            pills.append(ui.pill(f"Excluded (<{CANDIDATE_MIN_AUC:.2f})", ui.AMBER, "rgba(252,211,77,0.12)"))
+        status = "".join(pills) if pills else "<span style='color:#8b939f;font-size:12px'>—</span>"
         cand_rows.append([
             f"<b style='color:{ui.TEXT}'>{c['name']}</b>",
             f"<span style='color:{ui.TEXT};font-variant-numeric:tabular-nums'>{c['auc']:.3f}</span>",

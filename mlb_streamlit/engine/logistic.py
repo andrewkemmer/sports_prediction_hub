@@ -566,44 +566,48 @@ def build_stacking_weights(cand_preds: dict, labels: list[int]) -> dict:
             ensemble = [(1 - best_w) * e + best_w * p[j] for j, e in enumerate(ensemble)]
             cur_brier = best_b
 
-    # Joint re-optimization: greedy's proportional-shrink is only an
-    # approximation. Coordinate-descent each selected member's weight on the
-    # fine grid (others keep their relative proportions) until no move helps.
-    selected = [nm for nm, w in weights.items() if w > 0]
-    if len(selected) > 1:
-        preds_by_name = {nm: cand_preds[nm] for nm in selected}
-        for _ in range(2):
-            improved = False
-            for nm in selected:
-                others = {m: w for m, w in weights.items() if m != nm and w > 0}
-                other_total = sum(others.values())
-                best_w = weights[nm]
-                best_b = cur_brier
-                w = 0.0
-                while w <= 1.0001:
-                    scale = (1.0 - w) / other_total if other_total > 0 else 1.0
-                    cand_weights = {nm: w}
-                    for m, ww in others.items():
-                        cand_weights[m] = ww * scale
-                    b = compute_brier(_blend_predictions(preds_by_name, cand_weights, selected, n), labels)
-                    if b < best_b - 1e-12:
-                        best_b = b
-                        best_w = w
-                    w += step
-                if abs(best_w - weights[nm]) > 1e-9 and best_b < cur_brier - 1e-12:
-                    cand_weights = {nm: best_w}
-                    for m, ww in others.items():
-                        cand_weights[m] = ww * ((1.0 - best_w) / other_total if other_total > 0 else 1.0)
-                    weights = cand_weights
-                    cur_brier = best_b
-                    improved = True
-            if not improved:
-                break
-        # Renormalize and rebuild the served blend from the final weights.
-        total = sum(weights.values()) or 1.0
-        weights = {k: v / total for k, v in weights.items()}
-        ensemble = _blend_predictions(cand_preds, weights, names, n)
-        cur_brier = compute_brier(ensemble, labels)
+    # Joint re-optimization over the FULL pool: the greedy proportional-shrink
+    # pass is only an initialization. Coordinate-descent every candidate's
+    # weight on the fine grid (others keep their relative proportions) so
+    # decorrelated members the greedy pass never admitted can still enter the
+    # blend — the final weights are the argmin of holdout Brier on the
+    # simplex, not the greedy trajectory. Every intermediate state is a valid
+    # convex combination (sums to 1.0), and the vector is renormalized at the
+    # end to absorb float drift.
+    for _ in range(3):
+        improved = False
+        for nm in names:
+            others = {m: w for m, w in weights.items() if m != nm and w > 0}
+            other_total = sum(others.values())
+            cur_w = weights.get(nm, 0.0)
+            best_w = cur_w
+            best_b = cur_brier
+            w = 0.0
+            while w <= 1.0001:
+                scale = (1.0 - w) / other_total if other_total > 0 else 1.0
+                cand_weights = {nm: w}
+                for m, ww in others.items():
+                    cand_weights[m] = ww * scale
+                b = compute_brier(_blend_predictions(cand_preds, cand_weights, names, n), labels)
+                if b < best_b - 1e-12:
+                    best_b = b
+                    best_w = w
+                w += step
+            if abs(best_w - cur_w) > 1e-9 and best_b < cur_brier - 1e-12:
+                cand_weights = {nm: best_w}
+                for m, ww in others.items():
+                    cand_weights[m] = ww * ((1.0 - best_w) / other_total if other_total > 0 else 1.0)
+                weights = cand_weights
+                cur_brier = best_b
+                improved = True
+        if not improved:
+            break
+    # Renormalize and rebuild the served blend from the final weights — a
+    # single, valid, normalized allocation vector across the whole pool.
+    total = sum(weights.values()) or 1.0
+    weights = {k: v / total for k, v in weights.items()}
+    ensemble = _blend_predictions(cand_preds, weights, names, n)
+    cur_brier = compute_brier(ensemble, labels)
 
     # Honesty floor: never deploy a blend that does not beat the single best
     # model beyond the noise bar — a redundant blend only adds holdout

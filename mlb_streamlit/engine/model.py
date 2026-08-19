@@ -598,6 +598,15 @@ def run_model(
     #    on the exact blend apply_model serves (stack + Elo) — train == serve.
     stack, stack_blend_w = fit_stack(rows, selected, elo_hfa)
 
+    # Stack-membership highlight for the monitor. `selected` above is the
+    # strict best single family by holdout Brier (a rank, exactly one row);
+    # `inStack` marks the fitted families carrying positive weight in the
+    # deployed stack (the allocation vector). A family can be both, but the
+    # two concepts never merge into duplicate "best" badges.
+    positive_stack = {nm for nm, w in (stack.get("weights") or {}).items() if (w or 0) > 0}
+    for c in candidates:
+        c["inStack"] = c["name"] in positive_stack
+
     def _served_logit(r: dict) -> float:
         sl = stack_logit(stack, r["features"])
         el = logit(elo_prob(r, elo_hfa))
@@ -830,9 +839,12 @@ def run_model(
         "rollingBrier": rolling["points"],
         "brierBaseline": brier_baseline,
         "modelVersions": model_versions,
+        # Single normalized allocation vector across the full candidate pool:
+        # deployed stack members carry their (sum-to-1) weights, every other
+        # row is an explicit zero — never an implicit 100% fallback.
         "stackingWeights": [
-            {"name": n, "weight": w}
-            for n, w in sorted(stack["weights"].items(), key=lambda kv: -kv[1])
+            {"name": c["name"], "weight": roundn((stack.get("weights") or {}).get(c["name"], 0.0), 3)}
+            for c in candidates
         ],
         "crossValidation": cross_validation,
         "optimizationParams": optimization_params,
