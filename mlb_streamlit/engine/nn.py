@@ -358,6 +358,69 @@ def _predict_numpy(params: dict, x: list[float], h1n: int, h2n: int) -> float:
     return min(0.9999, max(0.0001, p))
 
 
+def mlp_params(
+    train: list[dict],
+    feature_names: list[str],
+    hidden: tuple[int, int] = (20, 10),
+    epochs: int = 40,
+    batch: int = 128,
+    lr: float = 0.03,
+    l2: float = 1e-4,
+    momentum: float = 0.9,
+    val_frac: float = 0.15,
+    patience: int = 6,
+    seed: int = 2026,
+) -> dict:
+    """Serializable parameters for the two-hidden-layer MLP model.
+
+    The standardized-feature stats + weight matrices are JSON-serializable, so
+    the model can be persisted and served later (a deployable ensemble member).
+    """
+    n = len(train)
+    d = len(feature_names)
+    if n < 40 or d == 0:
+        prior = mean([r["label"] for r in train]) if train else 0.5
+        return {"prior": min(0.9999, max(0.0001, prior))}
+    labels = [r["label"] for r in train]
+    pos = sum(labels)
+    if pos == 0 or pos == n:  # single-class target — predict the prior
+        prior = pos / n
+        return {"prior": min(0.9999, max(0.0001, prior))}
+
+    stats = {}
+    for f in feature_names:
+        vals = [r["features"][f] for r in train]
+        stats[f] = {"mean": mean(vals), "std": std(vals) or 1}
+    X = [[(r["features"][f] - stats[f]["mean"]) / stats[f]["std"] for f in feature_names] for r in train]
+
+    rng = random.Random(seed)
+    h1n, h2n = hidden
+    if _np is not None:
+        params = _fit_numpy(X, labels, hidden, epochs, batch, lr, l2, momentum, val_frac, patience, rng)
+    else:
+        params = _fit_pure(X, labels, hidden, epochs, batch, lr, l2, momentum, val_frac, patience, rng)
+    return {
+        "stats": stats,
+        "params": params,
+        "hidden": [h1n, h2n],
+        "featureNames": list(feature_names),
+    }
+
+
+def mlp_predict(member: dict, features: dict) -> float:
+    """Predict from serialized mlp_params (identical math to the closure
+    returned by mlp_model)."""
+    if "prior" in member:
+        return member["prior"]
+    feature_names = member["featureNames"]
+    stats = member["stats"]
+    h1n, h2n = member["hidden"]
+    z = [(features[f] - stats[f]["mean"]) / stats[f]["std"] for f in feature_names]
+    if _np is not None:
+        return _predict_numpy(member["params"], z, h1n, h2n)
+    return _predict_pure(member["params"], z, h1n, h2n)
+
+
 def mlp_model(
     train: list[dict],
     feature_names: list[str],
@@ -380,35 +443,7 @@ def mlp_model(
     already stacks + isotonically calibrates, so the MLP only needs to add a
     well-regularized, non-linear view of the features.
     """
-    n = len(train)
-    d = len(feature_names)
-    if n < 40 or d == 0:
-        prior = mean([r["label"] for r in train]) if train else 0.5
-        return lambda features: min(0.9999, max(0.0001, prior))
-    labels = [r["label"] for r in train]
-    pos = sum(labels)
-    if pos == 0 or pos == n:  # single-class target — predict the prior
-        prior = pos / n
-        return lambda features: min(0.9999, max(0.0001, prior))
-
-    stats = {}
-    for f in feature_names:
-        vals = [r["features"][f] for r in train]
-        stats[f] = {"mean": mean(vals), "std": std(vals) or 1}
-    X = [[(r["features"][f] - stats[f]["mean"]) / stats[f]["std"] for f in feature_names] for r in train]
-
-    rng = random.Random(seed)
-    h1n, h2n = hidden
-
-    def _std_vec(features: dict) -> list[float]:
-        # Serve exactly what the fit saw: z-scores from the training stats
-        # (raw values at predict time would be train/serve skew).
-        return [(features[f] - stats[f]["mean"]) / stats[f]["std"] for f in feature_names]
-
-    if _np is not None:
-        params = _fit_numpy(X, labels, hidden, epochs, batch, lr, l2, momentum, val_frac, patience, rng)
-        predict = lambda features: _predict_numpy(params, _std_vec(features), h1n, h2n)  # noqa: E731
-    else:
-        params = _fit_pure(X, labels, hidden, epochs, batch, lr, l2, momentum, val_frac, patience, rng)
-        predict = lambda features: _predict_pure(params, _std_vec(features), h1n, h2n)  # noqa: E731
-    return predict
+    member = mlp_params(
+        train, feature_names, hidden, epochs, batch, lr, l2, momentum, val_frac, patience, seed
+    )
+    return lambda features: mlp_predict(member, features)

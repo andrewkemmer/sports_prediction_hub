@@ -11,6 +11,11 @@ from __future__ import annotations
 
 import math
 
+try:  # numpy is optional; used only to run the true 10,000-trial Monte Carlo
+    import numpy as _np
+except Exception:  # pragma: no cover - quadrature fallback below
+    _np = None
+
 EPS = 1e-6
 
 
@@ -272,10 +277,22 @@ INV_SQRT_PI = 1 / math.sqrt(math.pi)
 
 
 def monte_carlo_adjust(p: float, sigma: float, trials: int = 10000) -> float:
-    """E[sigmoid(logit(p) + sigma*Z)] via Gauss-Hermite quadrature (O(1))."""
+    """E[sigmoid(logit(p) + sigma*Z)] for Z ~ N(0,1).
+
+    With numpy this is a true `trials`-iteration Monte Carlo simulation
+    (deterministic: a fixed seed is used per call, so every game prediction is
+    scored with the same 10,000-draw noise realization). Without numpy it falls
+    back to 7-point Gauss-Hermite quadrature — the exact analytic expectation
+    of the same integral.
+    """
     if sigma <= 0 or trials <= 0:
         return p
     lp = logit(p)
+    if _np is not None:
+        rng = _np.random.default_rng(2026)
+        z = rng.standard_normal(trials)
+        vals = 1.0 / (1.0 + _np.exp(-(lp + sigma * z)))
+        return clamp(float(_np.mean(vals)), 0.001, 0.999)
     s = sigma * math.sqrt(2)
     total = GAUSS_HERMITE_WEIGHTS[0] * sigmoid(lp)
     for i in range(1, len(GAUSS_HERMITE_NODES)):

@@ -35,12 +35,11 @@ except Exception:  # pragma: no cover - fallback path
 # Distance-weighted k-NN
 # ---------------------------------------------------------------------------
 
-def weighted_knn_model(train: list[dict], feature_names: list[str], k: int = 21):
-    """k-nearest-neighbour classifier with inverse-distance voting.
+def weighted_knn_params(train: list[dict], feature_names: list[str], k: int = 21) -> dict:
+    """Serializable parameters for the distance-weighted k-NN model.
 
-    Nearest neighbors contribute weight 1/(distance + ε) instead of an equal
-    vote, so closer (more similar) training games dominate — this removes the
-    flat-majority degeneracy that keeps plain kNN AUC low.
+    The training set is stored as standardized vectors + labels, so the model
+    can be persisted to JSON and served later (a deployable ensemble member).
     """
     stats = {}
     for f in feature_names:
@@ -48,27 +47,51 @@ def weighted_knn_model(train: list[dict], feature_names: list[str], k: int = 21)
         stats[f] = {"mean": mean(vals), "std": std(vals) or 1}
     z_train = [standardized(r["features"], feature_names, stats) for r in train]
     labels = [r["label"] for r in train]
+    return {
+        "k": k,
+        "stats": stats,
+        "zTrain": z_train,
+        "labels": labels,
+        "featureNames": list(feature_names),
+    }
+
+
+def weighted_knn_predict(params: dict, features: dict) -> float:
+    """Predict from serialized weighted_knn_params (identical math to the
+    closure returned by weighted_knn_model)."""
+    k = params["k"]
+    stats = params["stats"]
+    z_train = params["zTrain"]
+    labels = params["labels"]
+    feature_names = params["featureNames"]
     d = len(feature_names)
+    z = standardized(features, feature_names, stats)
+    # heapq.nsmallest is O(n log k) — cheaper than a full sort per row.
+    nn = heapq.nsmallest(
+        k,
+        ((sum((zt[j] - z[j]) ** 2 for j in range(d)), i) for i, zt in enumerate(z_train)),
+    )
+    total = 0.0
+    wsum = 0.0
+    for dist, i in nn:
+        w = 1.0 / (dist + 1e-6)
+        total += w * labels[i]
+        wsum += w
+    p = total / wsum if wsum > 0 else 0.5
+    # A zero-distance neighbor (duplicate feature vector) could otherwise
+    # yield an exact 0.0/1.0, which breaks log-loss in candidate scoring.
+    return min(0.9999, max(0.0001, p))
 
-    def predict(features: dict) -> float:
-        z = standardized(features, feature_names, stats)
-        # heapq.nsmallest is O(n log k) — cheaper than a full sort per row.
-        nn = heapq.nsmallest(
-            k,
-            ((sum((zt[j] - z[j]) ** 2 for j in range(d)), i) for i, zt in enumerate(z_train)),
-        )
-        total = 0.0
-        wsum = 0.0
-        for dist, i in nn:
-            w = 1.0 / (dist + 1e-6)
-            total += w * labels[i]
-            wsum += w
-        p = total / wsum if wsum > 0 else 0.5
-        # A zero-distance neighbor (duplicate feature vector) could otherwise
-        # yield an exact 0.0/1.0, which breaks log-loss in candidate scoring.
-        return min(0.9999, max(0.0001, p))
 
-    return predict
+def weighted_knn_model(train: list[dict], feature_names: list[str], k: int = 21):
+    """k-nearest-neighbour classifier with inverse-distance voting.
+
+    Nearest neighbors contribute weight 1/(distance + ε) instead of an equal
+    vote, so closer (more similar) training games dominate — this removes the
+    flat-majority degeneracy that keeps plain kNN AUC low.
+    """
+    params = weighted_knn_params(train, feature_names, k)
+    return lambda features: weighted_knn_predict(params, features)
 
 
 def weighted_knn_calib_preds(
@@ -211,6 +234,56 @@ def _stump_predict(stump: dict, features: dict) -> float:
     return stump["left"] if features.get(stump["feature"], 0.0) <= stump["threshold"] else stump["right"]
 
 
+def boosted_stumps_params(
+    train: list[dict],
+    feature_names: list[str],
+    n_trees: int = 60,
+    learning_rate: float = 0.1,
+    max_features: int = 5,
+    min_leaf: int | None = None,
+    seed: int = 7,
+) -> dict:
+    """Serializable parameters for the L2-boosted decision-stump model.
+
+    The fitted stumps + learning rate are JSON-serializable, so the model can
+    be persisted and served later (a deployable ensemble member).
+    """
+    n = len(train)
+    if min_leaf is None:
+        min_leaf = max(8, n // 40)
+    if n < 2 * min_leaf + 2:
+        prior = mean([r["label"] for r in train])
+        return {"prior": prior, "learningRate": learning_rate, "trees": []}
+    features = [r["features"] for r in train]
+    labels = [r["label"] for r in train]
+    max_features = min(max_features, len(feature_names)) or 1
+    rng = random.Random(seed)
+    pred = [0.0] * n
+    trees: list[dict] = []
+    for _ in range(n_trees):
+        feats = rng.sample(feature_names, max_features)
+        feature_values = {f: [features[i].get(f, 0.0) for i in range(n)] for f in feats}
+        residuals = [labels[i] - pred[i] for i in range(n)]
+        stump = _best_stump(feature_values, residuals, feats, min_leaf)
+        trees.append(stump)
+        if stump["feature"] is not None:
+            for i in range(n):
+                pred[i] += learning_rate * _stump_predict(stump, features[i])
+    return {"learningRate": learning_rate, "trees": trees}
+
+
+def boosted_stumps_predict(params: dict, features_dict: dict) -> float:
+    """Predict from serialized boosted_stumps_params (identical math to the
+    closure returned by boosted_stumps_model)."""
+    if "prior" in params:
+        return params["prior"]
+    s = 0.0
+    learning_rate = params["learningRate"]
+    for stump in params["trees"]:
+        s += learning_rate * _stump_predict(stump, features_dict)
+    return sigmoid(s)
+
+
 def boosted_stumps_model(
     train: list[dict],
     feature_names: list[str],
@@ -227,32 +300,7 @@ def boosted_stumps_model(
     then maps it to calibrated probabilities). Feature subsets per stump are
     drawn with a fixed-seed RNG, so training is fully deterministic.
     """
-    n = len(train)
-    if min_leaf is None:
-        min_leaf = max(8, n // 40)
-    if n < 2 * min_leaf + 2:
-        prior = mean([r["label"] for r in train])
-        return lambda features: prior
-    features = [r["features"] for r in train]
-    labels = [r["label"] for r in train]
-    max_features = min(max_features, len(feature_names)) or 1
-    rng = random.Random(seed)
-    pred = [0.0] * n
-    trees: list[dict] = []
-    for _ in range(n_trees):
-        feats = rng.sample(feature_names, max_features)
-        feature_values = {f: [features[i].get(f, 0.0) for i in range(n)] for f in feats}
-        residuals = [labels[i] - pred[i] for i in range(n)]
-        stump = _best_stump(feature_values, residuals, feats, min_leaf)
-        trees.append(stump)
-        if stump["feature"] is not None:
-            for i in range(n):
-                pred[i] += learning_rate * _stump_predict(stump, features[i])
-
-    def predict(features_dict: dict) -> float:
-        s = 0.0
-        for stump in trees:
-            s += learning_rate * _stump_predict(stump, features_dict)
-        return sigmoid(s)
-
-    return predict
+    params = boosted_stumps_params(
+        train, feature_names, n_trees, learning_rate, max_features, min_leaf, seed
+    )
+    return lambda features: boosted_stumps_predict(params, features)

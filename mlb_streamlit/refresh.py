@@ -34,7 +34,7 @@ from .data import (
     market_odds_enabled,
     market_odds_for_game,
 )
-from .engine.features import FEATURE_VERSION, build_features_for_game, compute_elo_and_features
+from .engine.features import FEATURE_KEYS, FEATURE_VERSION, build_features_for_game, compute_elo_and_features
 from .engine.metrics import (
     apply_isotonic,
     calibration_curve_points,
@@ -58,7 +58,7 @@ RUN_SIM_TRIALS = 10000
 RUN_CALIB_TRIALS = 500
 MIN_COMPLETED_GAMES = 40
 
-PREDICTION_VERSION = 5  # bump to force re-scoring of previously cached dates
+PREDICTION_VERSION = 6  # bump to force re-scoring of previously cached dates
 BACKTEST_STATES_FILE = "backtest_states.json"
 BACKTEST_CACHE_VERSION = cache.BACKTEST_CACHE_VERSION  # bump with PREDICTION_VERSION to invalidate stale backtest caches
 WF_REFIT_DAYS = 3  # refit the walk-forward model every N days (games in a block share a model)
@@ -587,6 +587,7 @@ def reconstruct_model(state: dict) -> dict:
         "monteCarloEnabled": state.get("monteCarloEnabled") or False,
         "eloHfa": state.get("eloHfa") or 30,
         "blendW": state.get("blendW", 0.0) or 0.0,
+        "stack": state.get("stack") or {},
     }
 
 
@@ -952,6 +953,7 @@ def run_refresh(
         "isotonicPoints": result["isotonicPoints"],
         "eloHfa": result["eloHfa"],
         "blendW": result.get("blendW", 0.0),
+        "stack": result.get("stack", {}),
         "monteCarloEnabled": result["monteCarloEnabled"],
         "monteCarloTrials": result["monteCarloTrials"],
         "monteCarloSigma": result["monteCarloSigma"],
@@ -1009,6 +1011,16 @@ def run_refresh(
         ("injury_snapshots.json", injury_cache),
         ("docs_by_date.json", docs_by_date),
     ])
+
+    # Walk-forward calibration rows are built once here (persisted to
+    # calibration_rows_wf.json) so the Calibration tab does not re-run the
+    # backtest when it is opened. It reuses the walk-forward-selected features,
+    # so every dashboard scores with the identical model family + feature set.
+    rep("Walk-forward calibration", 96, "Building point-in-time calibration rows…")
+    build_walk_forward_calibration_rows(
+        report=rep,
+        feature_names=result["featureNames"],
+    )
 
     rep("Complete", 100, f"Refreshed {len(fresh_dates)} day(s) of predictions", )
     return {
@@ -1078,7 +1090,11 @@ def _backtest_state(target: str, report=None) -> dict | None:
     # season-to-date and would leak post-target games into training features.
     completed_enriched = [g for g in enriched if g.get("winner") in ("home", "away")]
     fe = compute_elo_and_features(completed_enriched, cache.load_injury_snapshots(), target)
-    result = run_model_light(fe["rows"], completed_enriched, season, target)
+    # Use today's deployed feature set so the games-tab backtest and the
+    # calibration backtest score with the identical model family + features.
+    deployed_state = cache.load_model_state()
+    feature_names = (deployed_state or {}).get("featureNames") or list(FEATURE_KEYS)
+    result = run_model_light(fe["rows"], completed_enriched, season, target, feature_names)
 
     state = {
         "key": "backtest",
@@ -1097,6 +1113,7 @@ def _backtest_state(target: str, report=None) -> dict | None:
         "isotonicPoints": result["isotonicPoints"],
         "eloHfa": result["eloHfa"],
         "blendW": result.get("blendW", 0.0),
+        "stack": result.get("stack", {}),
         "monteCarloEnabled": result["monteCarloEnabled"],
         "monteCarloTrials": result["monteCarloTrials"],
         "monteCarloSigma": result["monteCarloSigma"],
@@ -1119,7 +1136,10 @@ def _backtest_state(target: str, report=None) -> dict | None:
 CALIBRATION_WF_FILE = "calibration_rows_wf.json"
 
 
-def build_walk_forward_calibration_rows(report=None) -> list[dict]:
+def build_walk_forward_calibration_rows(
+    report=None,
+    feature_names: list[str] | None = None,
+) -> list[dict]:
     """Strict walk-forward calibration rows — the true point-in-time backtest.
 
     Every completed game in the **current season** on date D is scored with a
@@ -1147,6 +1167,10 @@ def build_walk_forward_calibration_rows(report=None) -> list[dict]:
         and (g.get("home") or {}).get("id") and (g.get("away") or {}).get("id")
     ]
     today = et_date_string()
+    if feature_names is None:
+        state = cache.load_model_state()
+        feature_names = (state or {}).get("featureNames") or list(FEATURE_KEYS)
+    feature_names = list(feature_names)
     pitcher_log_cache = cache.load_pitcher_logs()
     team_log_cache = cache.load_team_logs()
     enriched = attach_as_of_stats(completed, pitcher_log_cache, team_log_cache)
@@ -1224,7 +1248,7 @@ def build_walk_forward_calibration_rows(report=None) -> list[dict]:
         # WF_REFIT_DAYS of dates.
         if current_model is None or d >= add_days(current_cutoff, WF_REFIT_DAYS):
             prior_rows = fe_rows[:ptr]
-            result = run_model_light(prior_rows, prior_games, season, d)
+            result = run_model_light(prior_rows, prior_games, season, d, feature_names)
             current_model = {
                 "featureNames": result["featureNames"],
                 "weights": result["weights"],
@@ -1235,6 +1259,7 @@ def build_walk_forward_calibration_rows(report=None) -> list[dict]:
                 "monteCarloEnabled": result["monteCarloEnabled"],
                 "eloHfa": result["eloHfa"],
                 "blendW": result.get("blendW", 0.0),
+                "stack": result.get("stack", {}),
             }
             current_run_model = result["runModel"]
             current_run_line_iso = result["runLineCalibration"]

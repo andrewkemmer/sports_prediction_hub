@@ -26,10 +26,10 @@ from .data import add_days, attach_as_of_stats, attach_lineups_as_of, et_date_st
 from .engine.features import FEATURE_KEYS, FEATURE_LABELS, compute_elo_and_features
 from .engine.logistic import build_stacking_weights, cross_validate
 from .engine.metrics import compute_auc, evaluate, spearman_rank
-from .engine.model import CANDIDATE_MIN_AUC, fit_candidate_pool, refit_logistic_model
+from .engine.model import CANDIDATE_MIN_AUC, fit_candidate_pool, refit_stack_model
 
 WF_SELECTION_FILE = "walk_forward_selection.json"
-WF_SELECTION_VERSION = 2
+WF_SELECTION_VERSION = 3
 WF_SELECTION_REFIT_DAYS = 3  # candidates share a fit within a block (matches calibration)
 MIN_PRIOR_GAMES = 40
 FEATURE_SIGNAL_EPS = 0.01  # |AUC - 0.5| threshold for a feature to stay active
@@ -361,7 +361,7 @@ def apply_walk_forward_selection(result: dict, model: dict, rows: list[dict], se
     walk-forward-selected features and model family so the Model Monitor and the
     live scorer agree.
     """
-    refit = refit_logistic_model(
+    refit = refit_stack_model(
         rows,
         selection["featureNames"],
         elo_hfa=result.get("eloHfa", 30.0),
@@ -392,13 +392,23 @@ def apply_walk_forward_selection(result: dict, model: dict, rows: list[dict], se
     result["featureStats"] = refit["featureStats"]
     result["isotonicPoints"] = refit["isotonicPoints"]
     result["blendW"] = refit["blendW"]
+    result["stack"] = refit["stack"]
 
-    # The deployed scorer is always the logistic + Elo blend (blendW), so the
-    # monitor's selectedModel and candidate-table highlight describe exactly
-    # what apply_model serves — never a non-deployable family that the
-    # walk-forward record merely measured out-of-sample.
+    # The deployed scorer is now the serializable multi-model stack (logistic /
+    # k-NN / boosted stumps / MLP / naive Bayes blended by holdout-tuned
+    # weights) plus the Elo blend via blendW. The monitor's selectedModel,
+    # stacking weights and candidate highlights describe exactly what
+    # apply_model serves.
+    stack = refit.get("stack") or {}
+    positive = [n for n, w in stack.get("weights", {}).items() if w > 0]
     blend_w = refit.get("blendW", 0.0)
-    if blend_w > 0:
+    if len(positive) > 1:
+        deployed_name = "Multi-model stack"
+        deployed_description = (
+            f"Walk-forward multi-model stack ({', '.join(positive)}), "
+            f"blended {1 - blend_w:.2f} + {blend_w:.2f}·Elo, isotonic-calibrated."
+        )
+    elif blend_w > 0:
         deployed_name = "Blended ensemble"
         deployed_description = (
             f"Walk-forward blended ensemble: {1 - blend_w:.2f}·logistic + {blend_w:.2f}·Elo, "
@@ -411,22 +421,23 @@ def apply_walk_forward_selection(result: dict, model: dict, rows: list[dict], se
     result["modelDescription"] = deployed_description
     result["featureImportances"] = feature_importances
     result["candidates"] = selection["candidates"]
+    deployed_member_names = set(positive)
     for c in result["candidates"]:
-        c["selected"] = c["name"] == deployed_name
-    result["stackingWeights"] = selection["stackingWeights"]
+        c["selected"] = c["name"] in deployed_member_names
+    result["stackingWeights"] = [
+        {"name": n, "weight": w}
+        for n, w in sorted(stack.get("weights", {}).items(), key=lambda kv: -kv[1])
+    ]
     result["crossValidation"] = selection["crossValidation"]
     result["optimizationParams"] = selection["optimizationParams"]
 
-    # Headline metrics reflect the deployed model's walk-forward out-of-sample
-    # record (the blend candidate), so the monitor never reports a different
-    # model's AUC/Brier than the one actually scoring today's games.
-    deployed_metrics = next(
-        (c for c in result["candidates"] if c["name"] == deployed_name), None
-    )
-    result["auc"] = deployed_metrics["auc"] if deployed_metrics else selection["auc"]
-    result["brier"] = deployed_metrics["brier"] if deployed_metrics else selection["brier"]
-    result["logLoss"] = deployed_metrics["logLoss"] if deployed_metrics else selection["logLoss"]
-    result["ece"] = deployed_metrics["ece"] if deployed_metrics else selection["ece"]
+    # Headline metrics remain the walk-forward out-of-sample record of the
+    # chosen blend; the deployed stack is measured by the same candidate
+    # families in that record.
+    result["auc"] = selection["auc"]
+    result["brier"] = selection["brier"]
+    result["logLoss"] = selection["logLoss"]
+    result["ece"] = selection["ece"]
     result["bins"] = selection["bins"]
     result["confidenceDistribution"] = selection["confidenceDistribution"]
     result["calibrationCurve"] = selection["calibrationCurve"]

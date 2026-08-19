@@ -244,8 +244,12 @@ def knn_model(train: list[dict], feature_names: list[str], k: int = 21):
     return predict
 
 
-def naive_bayes_model(train: list[dict], feature_names: list[str]):
-    """Gaussian Naive Bayes classifier with Laplace-smoothed priors."""
+def naive_bayes_params(train: list[dict], feature_names: list[str]) -> dict:
+    """Serializable parameters for the Gaussian Naive Bayes classifier.
+
+    The per-class Gaussian moments + Laplace-smoothed prior are JSON-safe, so
+    the model can be persisted and served later (a deployable ensemble member).
+    """
     n = len(train)
     pos = [r for r in train if r["label"] == 1]
     neg = [r for r in train if r["label"] == 0]
@@ -259,25 +263,41 @@ def naive_bayes_model(train: list[dict], feature_names: list[str]):
             out.append({"m": mean(vals), "v": v})
         return out
 
-    pos_stats = cond(pos)
-    neg_stats = cond(neg)
+    return {
+        "prior": prior,
+        "posStats": cond(pos),
+        "negStats": cond(neg),
+        "featureNames": list(feature_names),
+    }
+
+
+def naive_bayes_predict(member: dict, features: dict) -> float:
+    """Predict from serialized naive_bayes_params (identical math to the
+    closure returned by naive_bayes_model)."""
+    prior = member["prior"]
+    pos_stats = member["posStats"]
+    neg_stats = member["negStats"]
+    feature_names = member["featureNames"]
 
     def gauss_log(x: float, s: dict) -> float:
         return -0.5 * math.log(2 * math.pi * s["v"]) - ((x - s["m"]) * (x - s["m"])) / (2 * s["v"])
 
-    def predict(features: dict) -> float:
-        log_pos = math.log(prior)
-        log_neg = math.log(1 - prior)
-        for j, f in enumerate(feature_names):
-            log_pos += gauss_log(features[f], pos_stats[j])
-            log_neg += gauss_log(features[f], neg_stats[j])
-        max_log = max(log_pos, log_neg)
-        p_pos = math.exp(log_pos - max_log)
-        p_neg = math.exp(log_neg - max_log)
-        s = p_pos + p_neg
-        return p_pos / s if s > 0 else prior
+    log_pos = math.log(prior)
+    log_neg = math.log(1 - prior)
+    for j, f in enumerate(feature_names):
+        log_pos += gauss_log(features[f], pos_stats[j])
+        log_neg += gauss_log(features[f], neg_stats[j])
+    max_log = max(log_pos, log_neg)
+    p_pos = math.exp(log_pos - max_log)
+    p_neg = math.exp(log_neg - max_log)
+    s = p_pos + p_neg
+    return p_pos / s if s > 0 else prior
 
-    return predict
+
+def naive_bayes_model(train: list[dict], feature_names: list[str]):
+    """Gaussian Naive Bayes classifier with Laplace-smoothed priors."""
+    member = naive_bayes_params(train, feature_names)
+    return lambda features: naive_bayes_predict(member, features)
 
 
 def build_stacking_weights(cand_preds: dict, labels: list[int]) -> dict:

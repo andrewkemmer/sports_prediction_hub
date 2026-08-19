@@ -40,7 +40,7 @@ _MARKET_ODDS = "market_odds.json"
 
 # Bump to invalidate stale backtest caches (calibration_rows_wf.json).
 # refresh.py reads this value as its source of truth.
-BACKTEST_CACHE_VERSION = 5
+BACKTEST_CACHE_VERSION = 6
 
 
 def _path(name: str) -> Path:
