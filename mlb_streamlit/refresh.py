@@ -35,6 +35,7 @@ from .data import (
     market_odds_for_game,
 )
 from .engine.features import FEATURE_KEYS, FEATURE_VERSION, build_features_for_game, compute_elo_and_features
+from .engine.gating import GATE_VERSION, apply_concordance_gate, default_gate_config, summarize_gate_results
 from .engine.metrics import (
     apply_isotonic,
     calibration_curve_points,
@@ -64,9 +65,9 @@ RUN_SIM_TRIALS = 10000
 RUN_CALIB_TRIALS = 500
 MIN_COMPLETED_GAMES = 40
 
-PREDICTION_VERSION = 8  # bump to force re-scoring of previously cached dates
+PREDICTION_VERSION = 10  # bump to re-score docs so the gate fields cannot be bypassed by legacy cache hits
 BACKTEST_STATES_FILE = "backtest_states.json"
-BACKTEST_CACHE_VERSION = cache.BACKTEST_CACHE_VERSION  # bump with PREDICTION_VERSION to invalidate stale backtest caches
+BACKTEST_CACHE_VERSION = cache.BACKTEST_CACHE_VERSION  # invalidate stale point-in-time rows when the gate recipe changes
 WF_REFIT_DAYS = 7  # refit the walk-forward model every N days (games in a block share a model)
 WF_TRAIN_WINDOW = 2000  # rolling window of most-recent prior games for each walk-forward fit
 WF_MLP_EPOCHS = 20  # the MLP fit dominates backtest CPU; cap it for the repeated walk-forward fits
@@ -147,11 +148,14 @@ def build_calibration_rows(
     run_model_state: dict,
     run_line_iso: list[dict],
     run_margin_cal: dict,
+    gate_config: dict | None = None,
 ) -> list[dict]:
     """Compact per-game calibration projection (pre-game prediction vs result)."""
     from .engine.model import simulate_runs_batch
 
     out: list[dict] = []
+    selection_raw = cache.load_json("walk_forward_selection.json", {}) or {}
+    selection_days = selection_raw.get("days", {}) if isinstance(selection_raw, dict) else {}
     games = [r["game"] for r in rows]
     home_ids = [g["home"]["id"] for g in games]
     away_ids = [g["away"]["id"] for g in games]
@@ -170,6 +174,29 @@ def build_calibration_rows(
     for r, pred, proj in zip(rows, preds, projs):
         g = r["game"]
         winner = g.get("winner")
+        # A historical selection day always wins over a caller's current/live
+        # config. This keeps full-season calibration strictly date-specific;
+        # the explicit argument is only a fallback for dates with no selection
+        # record (for example today's fresh prediction window).
+        row_gate_config = (
+            (selection_days.get(g["date"], {}) or {}).get("gate")
+            or gate_config
+            or default_gate_config()
+        )
+        gate = apply_concordance_gate(
+            pred,
+            model,
+            r["features"],
+            r["homeElo"],
+            r["awayElo"],
+            row_gate_config,
+        )
+        compact_gate = {k: v for k, v in gate.items() if k != "gateSignals"}
+        gated_correct = (
+            gate["gatedPickTeam"] == winner
+            if gate["gateAccepted"] and winner in ("home", "away")
+            else None
+        )
         out.append({
             "gamePk": g["gamePk"],
             "date": g["date"],
@@ -181,6 +208,8 @@ def build_calibration_rows(
             "homeWinProb": pred["homeWinProb"],
             "isCorrect": pred["pickTeam"] == winner,
             "isUpset": pred["pickTeam"] != winner,
+            **compact_gate,
+            "gatedIsCorrect": gated_correct,
             "predictedTotal": proj["total"],
             "homeRunLineProb": proj["homeRunLineProb"],
             "actualTotal": (g["away"].get("score") or 0) + (g["home"].get("score") or 0),
@@ -242,6 +271,7 @@ def build_calibration_summary(rows: list[dict]) -> dict:
         "total": total,
         "correct": correct,
         "accuracy": correct / total if total > 0 else 0,
+        "concordanceGate": summarize_gate_results(rows),
     }
 
 
@@ -261,6 +291,8 @@ def build_todays_record(rows_today: list[dict], today: str) -> dict:
             "loser": r[loser_side]["abbrev"],
             "prob": round(prob * 100),
         })
+    gate_rows = [r for r in completed if "gateAccepted" in r]
+    gate_summary = summarize_gate_results(gate_rows)
     return {
         "date": today,
         "total": total,
@@ -270,6 +302,7 @@ def build_todays_record(rows_today: list[dict], today: str) -> dict:
         "correct": correct,
         "accuracy": correct / total if total > 0 else 0,
         "upsets": upsets,
+        "concordanceGate": gate_summary,
     }
 
 
@@ -322,19 +355,37 @@ def build_game_doc(
         "runProjection": run_projection,
         "marketOdds": market_odds,
     }
+    for key in (
+        "gateEnabled", "gateAccepted", "gatedPickTeam", "gatedPickProb",
+        "gatedHomeWinProb", "concordance", "gateAgreeCount", "gateSignalCount",
+        "gateThreshold", "gateMinSignals", "gateReason", "gateSignals",
+    ):
+        if key in pred:
+            doc[key] = pred[key]
     if game.get("winner") in ("home", "away"):
         doc["isCorrect"] = pred["pickTeam"] == game["winner"]
         doc["isUpset"] = pred["pickTeam"] != game["winner"]
+        doc["gatedIsCorrect"] = (
+            pred.get("gatedPickTeam") == game["winner"]
+            if pred.get("gateAccepted") else None
+        )
     return doc
 
 
-def predict_for_game(game: dict, model: dict, team_state: dict) -> dict:
-    return apply_model(
-        model,
-        build_features_for_game(game, team_state),
-        team_state["elo"].get(game["home"]["id"], 1500),
-        team_state["elo"].get(game["away"]["id"], 1500),
-    )
+def predict_for_game(
+    game: dict,
+    model: dict,
+    team_state: dict,
+    gate_config: dict | None = None,
+) -> dict:
+    features = build_features_for_game(game, team_state)
+    home_elo = team_state["elo"].get(game["home"]["id"], 1500)
+    away_elo = team_state["elo"].get(game["away"]["id"], 1500)
+    pred = apply_model(model, features, home_elo, away_elo)
+    gate_config = gate_config or model.get("concordanceGate")
+    if gate_config is not None:
+        pred.update(apply_concordance_gate(pred, model, features, home_elo, away_elo, gate_config))
+    return pred
 
 
 def merge_pitcher(fresh: dict | None, stored: dict | None) -> dict | None:
@@ -479,7 +530,9 @@ def _refresh_fast(fresh: list[dict], all_games: list[dict], cached_state: dict, 
     up_solo: list[tuple[dict, dict, dict | None]] = []
     for g in enriched:
         odds = market_odds_for_game(market_odds, g)
-        pred = predict_for_game(g, model, team_state)
+        pred = predict_for_game(
+            g, model, team_state, cached_state.get("concordanceGate") or default_gate_config()
+        )
         if ((odds or {}).get("runLine") or 1.5) == 1.5:
             up_batch.append((g, pred, odds))
         else:
@@ -596,6 +649,7 @@ def reconstruct_model(state: dict) -> dict:
         "eloHfa": state.get("eloHfa") or 30,
         "blendW": state.get("blendW", 0.0) or 0.0,
         "stack": state.get("stack") or {},
+        "concordanceGate": state.get("concordanceGate"),
     }
 
 
@@ -710,6 +764,9 @@ def run_refresh(
         not force_full
         and cached_state
         and cached_state.get("dataFingerprint") == fingerprint
+        # A pre-gate state cannot take the fast path: it would keep serving
+        # predictions without the point-in-time concordance configuration.
+        and (cached_state.get("concordanceGate") or {}).get("version") == GATE_VERSION
     ):
         return _refresh_fast(fresh, all_games, cached_state, today, season, report)
 
@@ -848,7 +905,14 @@ def run_refresh(
 
     # 9. Calibration rows for every completed game (as-of-time predictions).
     rep("Scoring games", 74, "Generating predictions & run simulations…")
-    calibration_rows = build_calibration_rows(rows, model, run_model_state, run_line_iso, run_margin_cal)
+    gate_config = wf_selection.get("concordanceGate") or default_gate_config()
+    # Use each historical date's own gate recipe for this diagnostic table.
+    # Passing today's final config here would make the historical gate appear
+    # to have known a future threshold. Live/upcoming docs still receive the
+    # final `gate_config` below.
+    calibration_rows = build_calibration_rows(
+        rows, model, run_model_state, run_line_iso, run_margin_cal
+    )
 
     # The monitor's headline metrics now come from the walk-forward selection
     # (wf_selection) rather than this in-sample full-season evaluation; the
@@ -873,10 +937,13 @@ def run_refresh(
             row = rows_by_pk.get(g["gamePk"])
             if not row:
                 continue
-            comp.append((g, apply_model(model, row["features"], row["homeElo"], row["awayElo"])))
+            comp.append((
+                g,
+                predict_for_game(g, model, team_state, gate_config),
+            ))
         else:
             odds = market_odds_for_game(market_odds, g)
-            pred = predict_for_game(g, model, team_state)
+            pred = predict_for_game(g, model, team_state, gate_config)
             if ((odds or {}).get("runLine") or 1.5) == 1.5:
                 up_batch.append((g, pred, odds))
             else:
@@ -995,6 +1062,8 @@ def run_refresh(
         "spearmanRho": wf_selection["spearmanRho"],
         "topDecileWinRate": wf_selection["topDecileWinRate"],
         "walkForwardSelection": wf_selection,
+        "concordanceGate": gate_config,
+        "concordanceGateDiagnostics": wf_selection.get("concordanceGateDiagnostics") or {},
         "todaysRecord": todays_record,
         "marketOddsStatus": market_odds_status,
     }
@@ -1134,6 +1203,7 @@ def _backtest_state(target: str, report=None) -> dict | None:
         "blendW": result.get("blendW", 0.0),
         "stack": result.get("stack", {}),
         "modelChoice": result.get("modelChoice"),
+        "concordanceGate": (sel_day.get("gate") if sel_day else None) or default_gate_config(),
         "monteCarloEnabled": result["monteCarloEnabled"],
         "monteCarloTrials": result["monteCarloTrials"],
         "monteCarloSigma": result["monteCarloSigma"],
@@ -1262,6 +1332,7 @@ def build_walk_forward_calibration_rows(
     current_run_model: dict | None = None
     current_run_line_iso: list[dict] | None = None
     current_run_margin_cal: dict | None = None
+    current_gate: dict | None = None
     prior_games: list[dict] = []
     ptr = 0  # fe_rows is chronological; the pointer only moves forward
     # Rolling hash of the prior-games pointer: prior_games only grows in

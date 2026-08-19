@@ -400,6 +400,21 @@ def render_header(active_tab: str) -> None:
         if st.button("⟳ Refresh", key="header_refresh"):
             st.session_state.refresh_requested = True
             st.rerun()
+    if active_tab == "monitor":
+        bundle = st.session_state.get("bundle")
+        state = (bundle or {}).get("model_state") or {}
+        cfg = state.get("concordanceGate") or {}
+        diag = state.get("concordanceGateDiagnostics") or {}
+        st.markdown(
+            f"<div style='margin:4px 0 14px;background:{ui._card_bg()};border:1px solid {ui.BORDER};border-radius:12px;padding:10px 14px;'>"
+            f"<span style='font-size:11px;font-weight:700;color:{ui.CYAN};text-transform:uppercase;letter-spacing:.08em;'>Concordance gate</span>"
+            f"<span style='font-size:12px;color:{ui.TEXT};margin-left:10px;'>"
+            f"{'active' if cfg.get('enabled') else 'held out'} · threshold {float(cfg.get('threshold', .75)):.0%} · "
+            f"{fmt_pct(diag.get('winRate', 0), 1)} conditional win rate · "
+            f"{fmt_pct(diag.get('coverage', 0), 1)} coverage · "
+            f"{diag.get('accepted', 0)} accepted of {diag.get('total', 0)}</span></div>",
+            unsafe_allow_html=True,
+        )
 
 
 def render_empty_state() -> None:
@@ -496,6 +511,13 @@ def _game_card(game: dict, col) -> None:
         else game["away"]["abbrev"] if game.get("winner") == "away" else None
     )
     pick_abbrev = game["home"]["abbrev"] if game.get("pickTeam") == "home" else game["away"]["abbrev"]
+    gate_enabled = game.get("gateEnabled") is True
+    gate_accepted = game.get("gateAccepted") is True
+    gated_team = game.get("gatedPickTeam")
+    gated_abbrev = (
+        game["home"]["abbrev"] if gated_team == "home"
+        else game["away"]["abbrev"] if gated_team == "away" else None
+    )
 
     pills = []
     if is_coin_flip:
@@ -506,6 +528,10 @@ def _game_card(game: dict, col) -> None:
         pills.append(ui.pill("Miss", ui.ROSE, "rgba(251,113,133,0.15)"))
     if game.get("isCorrect") is True:
         pills.append(ui.pill("Correct pick", ui.EMERALD, "rgba(52,211,153,0.15)"))
+    if gate_accepted:
+        pills.append(ui.pill("Gated pick", ui.EMERALD, "rgba(52,211,153,0.15)"))
+    elif gate_enabled:
+        pills.append(ui.pill("No gated play", ui.AMBER, "rgba(252,211,77,0.15)"))
     if is_live:
         pills.append(ui.pill("Live", ui.EMERALD, "rgba(52,211,153,0.15)"))
     if is_final:
@@ -548,7 +574,9 @@ def _game_card(game: dict, col) -> None:
                 rec = ""
                 if team.get("wins") is not None and team.get("losses") is not None:
                     rec = f"{team['wins']}-{team['losses']}"
-                pick_pill = ui.pill("Pick", ui.ACCENT, "rgba(77,125,255,0.18)") if is_pick else ""
+                model_pill = ui.pill("Model pick", ui.ACCENT, "rgba(77,125,255,0.18)") if is_pick else ""
+                gate_pill = ui.pill("Gate pick", ui.EMERALD, "rgba(52,211,153,0.15)") if gated_team == side_key else ""
+                pick_pill = model_pill + gate_pill
                 st.markdown(
                     f"<div style='padding:4px 2px;'>"
                     f"<div style='display:flex;align-items:center;gap:10px;'>"
@@ -568,10 +596,19 @@ def _game_card(game: dict, col) -> None:
             team_row("home", game["homeWinProb"], game.get("pickTeam") == "home", True)
             team_row("away", game["awayWinProb"], game.get("pickTeam") == "away", False)
 
+            gate_text = ""
+            if gate_enabled:
+                gate_text = (
+                    f"Concordance gate: <b style='color:{ui.EMERALD}'>ACCEPTED — {gated_abbrev}</b>"
+                    if gate_accepted else
+                    f"Concordance gate: <b style='color:{ui.AMBER}'>ABSTAIN</b> · "
+                    f"{game.get('gateAgreeCount', 0)}/{game.get('gateSignalCount', 0)} signals agree"
+                )
             st.markdown(
                 f"<div style='text-align:center;font-size:11px;color:{ui.MUTED};padding:2px 0 6px;'>"
                 f"Pre-game: {game['home']['abbrev']} {fmt_pct(game['homeWinProb'])} vs "
-                f"{game['away']['abbrev']} {fmt_pct(game['awayWinProb'])}</div>",
+                f"{game['away']['abbrev']} {fmt_pct(game['awayWinProb'])}"
+                f"{(' · ' + gate_text) if gate_text else ''}</div>",
                 unsafe_allow_html=True,
             )
 
@@ -1000,7 +1037,59 @@ def _moneyline_metrics(rows: list[dict]) -> dict:
     labels = [1 if r["isCorrect"] else 0 for r in rows]
     ev = evaluate(preds, labels)
     curve = calibration_curve_points(preds, labels, 12)
+    _render_concordance_gate(rows)
     return {"ev": ev, "curve": curve if curve else ev["calibrationCurve"], "n": len(rows)}
+
+
+def _gated_metrics(rows: list[dict]) -> dict:
+    """Conditional moneyline results for accepted concordance picks only."""
+    completed = [r for r in rows if r.get("isCorrect") is not None]
+    accepted = [r for r in completed if r.get("gateAccepted") is True]
+    wins = sum(1 for r in accepted if r.get("gatedIsCorrect") is True)
+    base_wins = sum(1 for r in completed if r.get("isCorrect") is True)
+    base_rate = base_wins / len(completed) if completed else 0.0
+    rate = wins / len(accepted) if accepted else 0.0
+    return {
+        "total": len(completed),
+        "accepted": len(accepted),
+        "coverage": len(accepted) / len(completed) if completed else 0.0,
+        "wins": wins,
+        "losses": len(accepted) - wins,
+        "winRate": rate,
+        "baseWinRate": base_rate,
+        "lift": rate - base_rate if accepted and completed else 0.0,
+        "meanConcordance": sum(float(r.get("concordance", 0) or 0) for r in accepted) / len(accepted) if accepted else 0.0,
+    }
+
+
+def _render_concordance_gate(rows: list[dict]) -> None:
+    """Render gate diagnostics without mixing them into base model metrics."""
+    gate = _gated_metrics(rows)
+    first = next((r for r in rows if "gateEnabled" in r), {})
+    enabled = any(r.get("gateEnabled") is True for r in rows)
+    st.markdown(
+        f"<div style='margin-top:16px;background:{ui._card_bg()};border:1px solid {ui.BORDER};border-radius:16px;padding:16px;'>"
+        f"<div style='display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;'>"
+        f"<div><h3 style='margin:0;font-size:14px;font-weight:600;color:{ui.TEXT}'>Multi-Signal Concordance Gate</h3>"
+        f"<p style='margin:5px 0 0;font-size:12px;color:{ui.MUTED};line-height:1.5'>"
+        f"Conditional results for picks accepted by the prior-only model-stack, Elo, record/form, pitching, offense, lineup, and context gate.</p></div>"
+        f"{ui.pill('Active' if enabled else 'Held out', ui.EMERALD if enabled else ui.AMBER, 'rgba(52,211,153,0.15)' if enabled else 'rgba(252,211,77,0.15)')}"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+    cols = st.columns(4)
+    cards = [
+        ("Conditional win rate", fmt_pct(gate["winRate"], 1), ui.EMERALD, f"{gate['wins']}-{gate['losses']} accepted"),
+        ("Coverage", fmt_pct(gate["coverage"], 1), ui.CYAN, f"{gate['accepted']} of {gate['total']} games"),
+        ("Win-rate lift", f"{gate['lift']:+.1%}", ui.AMBER if gate["lift"] < 0 else ui.EMERALD, "vs base picks"),
+        ("Mean concordance", fmt_pct(gate["meanConcordance"], 1), ui.PURPLE, f"min {first.get('gateMinSignals', '—')} signals"),
+    ]
+    for col, (label, value, color, sub) in zip(cols, cards):
+        with col:
+            st.markdown(ui.metric_card(label, value, color, sub), unsafe_allow_html=True)
+    if not enabled:
+        st.caption(first.get("gateReason") or "The gate is held out until prior-only validation shows a guarded improvement.")
+    st.markdown("</div>", unsafe_allow_html=True)
 
 
 def _totals_metrics(rows: list[dict]) -> dict:

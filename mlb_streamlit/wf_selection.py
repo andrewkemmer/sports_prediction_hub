@@ -25,13 +25,17 @@ import math
 from . import cache
 from .data import add_days, attach_as_of_stats, attach_lineups_as_of, et_date_string
 from .engine.features import FEATURE_KEYS, FEATURE_LABELS, compute_elo_and_features
+from .engine.gating import apply_concordance_gate, default_gate_config, summarize_gate_results, tune_concordance_gate
 from .engine.logistic import cross_validate, logistic_logit, train_logistic_l1
 from .engine.metrics import compute_auc, compute_brier, evaluate, sigmoid, spearman_rank
 from .engine.model import CANDIDATE_MIN_AUC, apply_model, elo_prob, fit_walk_forward_step, refit_stack_model
 from .engine.stack import predict_member, stack_probability
 
 WF_SELECTION_FILE = "walk_forward_selection.json"
-WF_SELECTION_VERSION = 6
+# Gate configuration is part of the per-date scoring recipe. Bump this when
+# the gate is introduced/changed so pre-gate selection caches cannot silently
+# disable the live abstention layer.
+WF_SELECTION_VERSION = 8
 WF_SELECTION_REFIT_DAYS = 7  # candidates share a fit within a block (matches calibration)
 WF_TRAIN_WINDOW = 2000  # rolling window of most-recent prior games for each candidate fit
 WF_MLP_EPOCHS = 20  # the MLP fit dominates backtest CPU; cap it for the repeated walk-forward fits
@@ -223,6 +227,7 @@ def build_walk_forward_selection(report=None, rows=None) -> dict:
     current_choice: dict | None = None
     current_cutoff: str | None = None
     current_features: list[str] | None = None
+    current_gate: dict | None = None
 
     # Rolling hash of the prior-games pointer: prior_games only grows in
     # chronological order, so a running sha256 turns the per-date fingerprint
@@ -231,6 +236,7 @@ def build_walk_forward_selection(report=None, rows=None) -> dict:
     prior_hash = hashlib.sha256()
     sel_history: list[list[str]] = []
     last_features: list[str] | None = None
+    last_gate: dict | None = None
     for i, d in enumerate(dates):
         day_rows = rows_by_date.get(d) or []
         if not day_rows:
@@ -243,6 +249,7 @@ def build_walk_forward_selection(report=None, rows=None) -> dict:
             current_model = None
             current_cutoff = None
             current_features = None
+            current_gate = None
             continue
         day_hash = hashlib.sha256(
             "\n".join(sorted(_game_line(g) for g in by_date[d])).encode("utf-8")
@@ -252,9 +259,11 @@ def build_walk_forward_selection(report=None, rows=None) -> dict:
         if cached_day and cached_day.get("fp") == fp:
             out[d] = cached_day
             last_features = cached_day.get("features") or last_features
+            last_gate = cached_day.get("gate") or last_gate
             current_model = None
             current_cutoff = None
             current_features = None
+            current_gate = None
             continue
         if current_model is None or d >= add_days(current_cutoff, WF_SELECTION_REFIT_DAYS):
             # Rolling window: fit on the most recent WF_TRAIN_WINDOW prior games
@@ -271,10 +280,29 @@ def build_walk_forward_selection(report=None, rows=None) -> dict:
             current_model, current_choice = fit_walk_forward_step(
                 prior_rows, current_features, mlp_epochs=WF_MLP_EPOCHS
             )
+            # Tune the abstention layer only on games already inside this
+            # prior-only window. The scored day is never part of this fit.
+            prior_base_preds = [
+                apply_model(current_model, r["features"], r["homeElo"], r["awayElo"])
+                for r in prior_rows
+            ]
+            current_gate = tune_concordance_gate(prior_rows, current_model, prior_base_preds)
             current_cutoff = d
-        chosen = [
-            apply_model(current_model, r["features"], r["homeElo"], r["awayElo"])["homeWinProb"]
+        base_preds = [
+            apply_model(current_model, r["features"], r["homeElo"], r["awayElo"])
             for r in day_rows
+        ]
+        chosen = [p["homeWinProb"] for p in base_preds]
+        gate_results = [
+            apply_concordance_gate(
+                p,
+                current_model,
+                r["features"],
+                r["homeElo"],
+                r["awayElo"],
+                current_gate,
+            )
+            for p, r in zip(base_preds, day_rows)
         ]
         cand_members = current_model.get("candidateMembers") or {}
         elo_hfa = current_model.get("eloHfa", 30.0)
@@ -294,8 +322,18 @@ def build_walk_forward_selection(report=None, rows=None) -> dict:
             "modelChoice": (current_choice or {}).get("deployed"),
             "stackBrier": (current_choice or {}).get("stackBrier"),
             "logisticBrier": (current_choice or {}).get("logisticBrier"),
+            "gate": current_gate or default_gate_config(),
+            "gateAccepted": [g["gateAccepted"] for g in gate_results],
+            "gateConcordance": [g["concordance"] for g in gate_results],
+            "gateSignalCounts": [g["gateSignalCount"] for g in gate_results],
+            "gatedCorrect": [
+                bool(g["gateAccepted"] and ((r["label"] == 1 and g["gatedPickTeam"] == "home") or
+                                             (r["label"] == 0 and g["gatedPickTeam"] == "away")))
+                for g, r in zip(gate_results, day_rows)
+            ],
         }
         last_features = current_features
+        last_gate = current_gate or last_gate
         rep("Walk-forward selection", 30 + int(55 * (i + 1) / max(1, len(dates))),
             f"Evaluated {len(day_rows)} game(s) on {d} against {len(prior_games)} prior game(s)…")
 
@@ -308,6 +346,10 @@ def build_walk_forward_selection(report=None, rows=None) -> dict:
         "candPreds": {name: [] for name in CANDIDATE_NAMES},
         "labels": [],
         "featVals": {f: [] for f in FEATURE_KEYS},
+        "gateAccepted": [],
+        "gateConcordance": [],
+        "gateSignalCounts": [],
+        "gatedCorrect": [],
         "stackDays": 0,
         "logisticDays": 0,
     }
@@ -319,6 +361,10 @@ def build_walk_forward_selection(report=None, rows=None) -> dict:
         accum["labels"].extend(day.get("labels", []))
         for f in FEATURE_KEYS:
             accum["featVals"][f].extend(day.get("featVals", {}).get(f, []))
+        accum["gateAccepted"].extend(day.get("gateAccepted", []))
+        accum["gateConcordance"].extend(day.get("gateConcordance", []))
+        accum["gateSignalCounts"].extend(day.get("gateSignalCounts", []))
+        accum["gatedCorrect"].extend(day.get("gatedCorrect", []))
         if day.get("modelChoice") == "stack":
             accum["stackDays"] += 1
         elif day.get("modelChoice") == "logistic":
@@ -366,6 +412,26 @@ def build_walk_forward_selection(report=None, rows=None) -> dict:
     # future result influences it). The pooled univariate AUCs below remain as
     # the per-feature importance readout for the monitor.
     selected_features = last_features or [f for f in FEATURE_KEYS if f in CORE_FEATURES]
+    gate_config = last_gate or default_gate_config()
+    gate_accepted = accum["gateAccepted"]
+    gated_correct = accum["gatedCorrect"]
+    accepted_count = sum(1 for accepted in gate_accepted if accepted)
+    gated_wins = sum(1 for accepted, correct in zip(gate_accepted, gated_correct) if accepted and correct)
+    base_correct_count = sum(
+        1 for p, y in zip(chosen_preds, labels) if (p >= 0.5) == (y == 1)
+    )
+    gate_diagnostics = {
+        "total": n_eval,
+        "accepted": accepted_count,
+        "coverage": accepted_count / n_eval if n_eval else 0.0,
+        "wins": gated_wins,
+        "losses": accepted_count - gated_wins,
+        "winRate": gated_wins / accepted_count if accepted_count else 0.0,
+        "baseWinRate": base_correct_count / n_eval if n_eval else 0.0,
+        "lift": (gated_wins / accepted_count - base_correct_count / n_eval) if accepted_count and n_eval else 0.0,
+        "meanConcordance": sum(accum["gateConcordance"]) / len(accum["gateConcordance"]) if accum["gateConcordance"] else 0.0,
+        "meanSignals": sum(accum["gateSignalCounts"]) / len(accum["gateSignalCounts"]) if accum["gateSignalCounts"] else 0.0,
+    }
 
     # Final weights are filled in by apply_walk_forward_selection (it refits on
     # the complete history); here we only report the out-of-sample signal.
@@ -411,9 +477,12 @@ def build_walk_forward_selection(report=None, rows=None) -> dict:
         "calibrationCurve": chosen_eval["calibrationCurve"],
         "spearmanRho": spearman_rank(pick_probs, is_correct),
         "topDecileWinRate": (sum(high_conf) / len(high_conf)) if high_conf else 0.0,
+        "concordanceGate": gate_config,
+        "concordanceGateDiagnostics": gate_diagnostics,
         "optimizationParams": {
             "featureSelection": "Per-date L1 (LASSO) + stability vote, λ tuned by holdout Brier",
             "modelSelection": "Stack vs logistic per date by holdout Brier",
+            "concordanceGate": "Prior-only threshold/min-signals tuned by Wilson lower bound and conditional win rate",
             "minCandidateAuc": CANDIDATE_MIN_AUC,
             "l1LambdaGrid": list(L1_LAMBDA_GRID),
             "stabilityWindow": STABILITY_K,
@@ -467,9 +536,23 @@ def _fallback_selection(today: str, days: int, games: int) -> dict:
         "calibrationCurve": [],
         "spearmanRho": 0.0,
         "topDecileWinRate": 0.0,
+        "concordanceGate": default_gate_config(),
+        "concordanceGateDiagnostics": {
+            "total": games,
+            "accepted": 0,
+            "coverage": 0.0,
+            "wins": 0,
+            "losses": 0,
+            "winRate": 0.0,
+            "baseWinRate": 0.0,
+            "lift": 0.0,
+            "meanConcordance": 0.0,
+            "meanSignals": 0.0,
+        },
         "optimizationParams": {
             "featureSelection": "Full feature set (fallback)",
             "modelSelection": "Stack vs logistic per date by holdout Brier",
+            "concordanceGate": "Disabled until prior-only validation history is sufficient",
         },
     }
 
@@ -552,6 +635,8 @@ def apply_walk_forward_selection(result: dict, model: dict, rows: list[dict], se
     ]
     result["crossValidation"] = selection["crossValidation"]
     result["optimizationParams"] = selection["optimizationParams"]
+    result["concordanceGate"] = selection.get("concordanceGate") or default_gate_config()
+    result["concordanceGateDiagnostics"] = selection.get("concordanceGateDiagnostics") or {}
 
     # Headline metrics remain the walk-forward out-of-sample record of the
     # chosen blend; the deployed stack is measured by the same candidate

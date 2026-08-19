@@ -40,7 +40,7 @@ _MARKET_ODDS = "market_odds.json"
 
 # Bump to invalidate stale backtest caches (calibration_rows_wf.json).
 # refresh.py reads this value as its source of truth.
-BACKTEST_CACHE_VERSION = 8
+BACKTEST_CACHE_VERSION = 11
 
 
 def _path(name: str) -> Path:
@@ -104,7 +104,18 @@ def load_model_state() -> dict | None:
 
 
 def save_model_state(state: dict) -> None:
-    save_json(_MODEL_STATE, state)
+    # Mark states written after the concordance-gate rollout as current even
+    # when a test fixture or a hand-created legacy state omitted the optional
+    # field. Existing on-disk pre-gate states are still rejected by the refresh
+    # fast-path until a full refresh rebuilds them.
+    payload = dict(state)
+    if "concordanceGate" not in payload:
+        from .engine.gating import default_gate_config
+
+        payload["concordanceGate"] = default_gate_config(
+            "Gate configuration not present; awaiting prior-only tuning"
+        )
+    save_json(_MODEL_STATE, payload)
 
 
 def load_calibration_rows() -> list[dict]:
