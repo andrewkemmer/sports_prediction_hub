@@ -904,6 +904,7 @@ def run_model_light(
     season: str,
     as_of_date: str,
     feature_names: list[str] | None = None,
+    mlp_epochs: int = 40,
 ) -> dict:
     """Cheap point-in-time refit for walk-forward backtests.
 
@@ -940,7 +941,9 @@ def run_model_light(
     # Deployable multi-model stack: fit families on the full prior history,
     # tune family weights + Elo blend on a chronological holdout, then fit
     # isotonic on the exact served blend (stack + Elo) — train == serve.
-    stack, blend_w = fit_stack(rows, selected, elo_hfa)
+    # The repeated walk-forward fits cap the MLP member's epochs (it dominates
+    # backtest CPU); the deployed model keeps the full default.
+    stack, blend_w = fit_stack(rows, selected, elo_hfa, mlp_epochs=mlp_epochs)
 
     def _served_logit(r: dict) -> float:
         sl = stack_logit(stack, r["features"])
@@ -1044,7 +1047,7 @@ def run_model_light(
     }
 
 
-def fit_candidate_pool(train: list[dict], feature_names: list[str]) -> tuple[dict, float, float]:
+def fit_candidate_pool(train: list[dict], feature_names: list[str], mlp_epochs: int = 40) -> tuple[dict, float, float]:
     """Fit the full candidate model pool on `train` (chronological, prior-only).
 
     Used by the walk-forward selection pass: every model family is fit on games
@@ -1055,6 +1058,11 @@ def fit_candidate_pool(train: list[dict], feature_names: list[str]) -> tuple[dic
       elo_hfa    — home-field advantage tuned on `train`
       blend_w    — logistic/Elo blend weight tuned on a chronological holdout
                    of `train` (never the scored day), so nothing leaks.
+
+    `mlp_epochs` caps the MLP's training length; the walk-forward pass lowers
+    it because the MLP fit dominates backtest CPU and the MLP is only a
+    diagnostic candidate there (the deployable stack's own MLP member keeps
+    its full epochs).
     """
     n = len(train)
     prior = 0.5
@@ -1094,7 +1102,7 @@ def fit_candidate_pool(train: list[dict], feature_names: list[str]) -> tuple[dic
     knn_train = train[-KNN_TRAIN_CAP:] if n > KNN_TRAIN_CAP else train
     wknn = weighted_knn_model(knn_train, feature_names)
     boost = boosted_stumps_model(train, feature_names)
-    nn = mlp_model(train, feature_names)
+    nn = mlp_model(train, feature_names, epochs=mlp_epochs)
     nb = naive_bayes_model(train, feature_names)
 
     # Blend weight tuned on the trailing 20% of the prior window (chronological

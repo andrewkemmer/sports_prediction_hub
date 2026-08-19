@@ -57,19 +57,22 @@ MIN_STACK_TRAIN = 40
 MIN_HOLDOUT = 20
 
 
-def fit_stack_members(train: list[dict], feature_names: list[str]) -> dict:
+def fit_stack_members(train: list[dict], feature_names: list[str], mlp_epochs: int = 40) -> dict:
     """Fit every deployable family on `train` and return JSON-safe parameters.
 
     `train` is chronological and prior-only (the caller guarantees no lookahead
     by construction). k-NN is capped to the most recent KNN_TRAIN_CAP rows so
-    the serialized state stays small and prediction stays fast.
+    the serialized state stays small and prediction stays fast. `mlp_epochs`
+    lets the repeated walk-forward fits trade a little MLP capacity for a
+    large speedup (the MLP fit dominates backtest CPU); the deployed model
+    keeps the full default.
     """
     knn_train = train[-KNN_TRAIN_CAP:] if len(train) > KNN_TRAIN_CAP else train
     return {
         "Logistic regression": train_logistic(train, feature_names),
         "Distance-weighted k-NN (k=21)": weighted_knn_params(knn_train, feature_names, KNN_K),
         "Boosted decision stumps": boosted_stumps_params(train, feature_names),
-        "Neural network (MLP)": mlp_params(train, feature_names),
+        "Neural network (MLP)": mlp_params(train, feature_names, epochs=mlp_epochs),
         "Gaussian naive Bayes": naive_bayes_params(train, feature_names),
     }
 
@@ -123,7 +126,7 @@ def _elo_logit(row: dict, hfa: float) -> float:
     return logit(p)
 
 
-def fit_stack(train: list[dict], feature_names: list[str], elo_hfa: float = 30.0) -> tuple[dict, float]:
+def fit_stack(train: list[dict], feature_names: list[str], elo_hfa: float = 30.0, mlp_epochs: int = 40) -> tuple[dict, float]:
     """Fit the deployable multi-model stack and the Elo blend weight.
 
     All tuning happens strictly on the chronological holdout (the trailing 20%
@@ -150,7 +153,7 @@ def fit_stack(train: list[dict], feature_names: list[str], elo_hfa: float = 30.0
     if len(fit_rows) < MIN_HOLDOUT or len(holdout) < MIN_HOLDOUT:
         return fallback, 0.0
 
-    fit_members = fit_stack_members(fit_rows, feature_names)
+    fit_members = fit_stack_members(fit_rows, feature_names, mlp_epochs=mlp_epochs)
     holdout_preds = {
         name: [predict_member(name, member, r["features"]) for r in holdout]
         for name, member in fit_members.items()
@@ -188,7 +191,7 @@ def fit_stack(train: list[dict], feature_names: list[str], elo_hfa: float = 30.0
         w += 0.05
 
     # Re-fit members on the FULL training history for deployment.
-    members = fit_stack_members(train, feature_names)
+    members = fit_stack_members(train, feature_names, mlp_epochs=mlp_epochs)
     weights = {k: v for k, v in weights_oos.items() if k in members}
     # Logistic is always kept in the stack as the stable, interpretable
     # backbone (it also powers the SHAP readout in apply_model).

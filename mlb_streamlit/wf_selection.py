@@ -29,8 +29,10 @@ from .engine.metrics import compute_auc, evaluate, spearman_rank
 from .engine.model import CANDIDATE_MIN_AUC, fit_candidate_pool, refit_stack_model
 
 WF_SELECTION_FILE = "walk_forward_selection.json"
-WF_SELECTION_VERSION = 3
-WF_SELECTION_REFIT_DAYS = 3  # candidates share a fit within a block (matches calibration)
+WF_SELECTION_VERSION = 4
+WF_SELECTION_REFIT_DAYS = 7  # candidates share a fit within a block (matches calibration)
+WF_TRAIN_WINDOW = 2000  # rolling window of most-recent prior games for each candidate fit
+WF_MLP_EPOCHS = 20  # the MLP fit dominates backtest CPU; cap it for the repeated walk-forward fits
 MIN_PRIOR_GAMES = 40
 FEATURE_SIGNAL_EPS = 0.01  # |AUC - 0.5| threshold for a feature to stay active
 
@@ -53,16 +55,11 @@ CANDIDATE_NAMES = [
 CORE_FEATURES = ("eloDiff", "homeField", "winPctDiff")
 
 
-def _fingerprint(games: list[dict]) -> str:
-    """Stable hash of the games a per-date walk-forward record depends on."""
-    lines = []
-    for g in games:
-        lines.append(
-            f"{g['gamePk']}|{g.get('date')}|{g.get('winner')}|"
-            f"{(g.get('home') or {}).get('score')}|{(g.get('away') or {}).get('score')}"
-        )
-    lines.sort()
-    return hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
+def _game_line(g: dict) -> str:
+    return (
+        f"{g['gamePk']}|{g.get('date')}|{g.get('winner')}|"
+        f"{(g.get('home') or {}).get('score')}|{(g.get('away') or {}).get('score')}"
+    )
 
 
 def _load_completed_rows(today: str) -> list[dict]:
@@ -132,18 +129,27 @@ def build_walk_forward_selection(report=None, rows=None) -> dict:
     current_predictors: dict | None = None
     current_cutoff: str | None = None
 
+    # Rolling hash of the prior-games pointer: prior_games only grows in
+    # chronological order, so a running sha256 turns the per-date fingerprint
+    # from O(prior games) into O(1) amortized (the full replay previously
+    # re-hashed ~6000 games for every one of ~150 dates).
+    prior_hash = hashlib.sha256()
     for i, d in enumerate(dates):
         day_rows = rows_by_date.get(d) or []
         if not day_rows:
             continue
         while ptr < len(fe_rows) and fe_rows[ptr]["game"]["date"] < d:
             prior_games.append(fe_rows[ptr]["game"])
+            prior_hash.update(_game_line(fe_rows[ptr]["game"]).encode("utf-8"))
             ptr += 1
         if len(prior_games) < MIN_PRIOR_GAMES:
             current_predictors = None
             current_cutoff = None
             continue
-        fp = _fingerprint(prior_games + by_date[d])
+        day_hash = hashlib.sha256(
+            "\n".join(sorted(_game_line(g) for g in by_date[d])).encode("utf-8")
+        ).hexdigest()
+        fp = hashlib.sha256((prior_hash.hexdigest() + "|" + day_hash).encode("utf-8")).hexdigest()
         cached_day = existing.get(d)
         if cached_day and cached_day.get("fp") == fp:
             out[d] = cached_day
@@ -151,8 +157,13 @@ def build_walk_forward_selection(report=None, rows=None) -> dict:
             current_cutoff = None
             continue
         if current_predictors is None or d >= add_days(current_cutoff, WF_SELECTION_REFIT_DAYS):
-            prior_rows = fe_rows[:ptr]
-            current_predictors, _elo_hfa, _blend_w = fit_candidate_pool(prior_rows, list(FEATURE_KEYS))
+            # Rolling window: fit candidates on the most recent WF_TRAIN_WINDOW
+            # prior games (still strictly before the scored day — no lookahead).
+            # This caps the MLP/boost/logistic fit cost once history grows large.
+            prior_rows = fe_rows[max(0, ptr - WF_TRAIN_WINDOW):ptr]
+            current_predictors, _elo_hfa, _blend_w = fit_candidate_pool(
+                prior_rows, list(FEATURE_KEYS), mlp_epochs=WF_MLP_EPOCHS
+            )
             current_cutoff = d
         preds = {name: [current_predictors[name](r) for r in day_rows] for name in CANDIDATE_NAMES}
         labels = [r["label"] for r in day_rows]

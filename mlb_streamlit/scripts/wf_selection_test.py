@@ -34,7 +34,7 @@ from mlb_streamlit.scripts.smoke_test import check, make_games  # noqa: E402
 _CHECKS = 0
 
 
-def _stub_fit_candidate_pool(train, feature_names):
+def _stub_fit_candidate_pool(train, feature_names, mlp_epochs=40):
     """Cheap deterministic candidate pool (identical predictors) so the test
     never pays for the pure-Python MLP / boosted-stump fits."""
     def pred(r):
@@ -55,9 +55,9 @@ def main() -> int:
     cache.CACHE_DIR = Path(tmp)
     calls = {"n": 0}
 
-    def counting_fit(train, feature_names):
+    def counting_fit(train, feature_names, mlp_epochs=40):
         calls["n"] += 1
-        return _stub_fit_candidate_pool(train, feature_names)
+        return _stub_fit_candidate_pool(train, feature_names, mlp_epochs=mlp_epochs)
 
     wf_selection.fit_candidate_pool = counting_fit
     try:

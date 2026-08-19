@@ -396,7 +396,7 @@ def test_walk_forward_calibration() -> None:
     real_sim = emod.simulate_runs_batch
     calls = {"n": 0}
 
-    def stub_run_model_light(rows, completed_games, season, as_of_date, feature_names=None):
+    def stub_run_model_light(rows, completed_games, season, as_of_date, feature_names=None, mlp_epochs=40):
         calls["n"] += 1
         return {
             "season": season, "asOfDate": as_of_date,
@@ -481,7 +481,7 @@ def test_point_in_time_docs() -> None:
     real_batter = refresh.fetch_batter_game_logs
     real_odds = refresh.fetch_market_odds
 
-    def stub_run_model_light(rows, completed_games, season, as_of_date, feature_names=None):
+    def stub_run_model_light(rows, completed_games, season, as_of_date, feature_names=None, mlp_epochs=40):
         return {
             "season": season, "asOfDate": as_of_date,
             "gamesTrained": len(rows), "holdoutCount": 0,

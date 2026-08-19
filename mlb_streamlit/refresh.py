@@ -58,10 +58,12 @@ RUN_SIM_TRIALS = 10000
 RUN_CALIB_TRIALS = 500
 MIN_COMPLETED_GAMES = 40
 
-PREDICTION_VERSION = 6  # bump to force re-scoring of previously cached dates
+PREDICTION_VERSION = 7  # bump to force re-scoring of previously cached dates
 BACKTEST_STATES_FILE = "backtest_states.json"
 BACKTEST_CACHE_VERSION = cache.BACKTEST_CACHE_VERSION  # bump with PREDICTION_VERSION to invalidate stale backtest caches
-WF_REFIT_DAYS = 3  # refit the walk-forward model every N days (games in a block share a model)
+WF_REFIT_DAYS = 7  # refit the walk-forward model every N days (games in a block share a model)
+WF_TRAIN_WINDOW = 2000  # rolling window of most-recent prior games for each walk-forward fit
+WF_MLP_EPOCHS = 20  # the MLP fit dominates backtest CPU; cap it for the repeated walk-forward fits
 
 SEASON_START = "2022-03-15"  # earliest calibration-range date (UI default)
 
@@ -1020,6 +1022,7 @@ def run_refresh(
     build_walk_forward_calibration_rows(
         report=rep,
         feature_names=result["featureNames"],
+        rows=rows,
     )
 
     rep("Complete", 100, f"Refreshed {len(fresh_dates)} day(s) of predictions", )
@@ -1092,9 +1095,14 @@ def _backtest_state(target: str, report=None) -> dict | None:
     fe = compute_elo_and_features(completed_enriched, cache.load_injury_snapshots(), target)
     # Use today's deployed feature set so the games-tab backtest and the
     # calibration backtest score with the identical model family + features.
+    # The fit uses the same rolling window + capped MLP as the calibration
+    # backtest, so every dashboard's point-in-time model is the same recipe.
     deployed_state = cache.load_model_state()
     feature_names = (deployed_state or {}).get("featureNames") or list(FEATURE_KEYS)
-    result = run_model_light(fe["rows"], completed_enriched, season, target, feature_names)
+    prior_rows = fe["rows"][max(0, len(fe["rows"]) - WF_TRAIN_WINDOW):]
+    result = run_model_light(
+        prior_rows, completed_enriched, season, target, feature_names, mlp_epochs=WF_MLP_EPOCHS
+    )
 
     state = {
         "key": "backtest",
@@ -1139,6 +1147,7 @@ CALIBRATION_WF_FILE = "calibration_rows_wf.json"
 def build_walk_forward_calibration_rows(
     report=None,
     feature_names: list[str] | None = None,
+    rows: list[dict] | None = None,
 ) -> list[dict]:
     """Strict walk-forward calibration rows — the true point-in-time backtest.
 
@@ -1155,46 +1164,66 @@ def build_walk_forward_calibration_rows(
     results are cached keyed by a fingerprint of (games < D plus games on D),
     so later calls re-score only new/changed dates. Dates with fewer than
     MIN_COMPLETED_GAMES prior games are skipped.
+
+    When `rows` (the chronological feature rows already computed by run_model)
+    is supplied, the feature replay is reused instead of recomputed — the
+    refresh pipeline passes them so the backtest does not re-run the full
+    as-of enrichment + Elo pass. Each walk-forward fit trains on a rolling
+    window of the most recent WF_TRAIN_WINDOW prior games (still strictly
+    before the scored day, so point-in-time integrity is preserved) and caps
+    the MLP member's epochs, which are the two dominant backtest CPU costs.
     """
     def rep(stage, pct, msg):
         if report:
             report(stage, pct, msg)
 
-    cached = cache.load_games()
-    completed = [
-        g for g in cached
-        if g.get("winner") in ("home", "away")
-        and (g.get("home") or {}).get("id") and (g.get("away") or {}).get("id")
-    ]
     today = et_date_string()
     if feature_names is None:
         state = cache.load_model_state()
         feature_names = (state or {}).get("featureNames") or list(FEATURE_KEYS)
     feature_names = list(feature_names)
-    pitcher_log_cache = cache.load_pitcher_logs()
-    team_log_cache = cache.load_team_logs()
-    enriched = attach_as_of_stats(completed, pitcher_log_cache, team_log_cache)
-    lineups = {}
-    for pk, lu in (cache.load_lineups() or {}).items():
-        if lu:
-            try:
-                lineups[int(pk)] = lu
-            except (TypeError, ValueError):
-                pass
-    enriched = attach_lineups_as_of(enriched, lineups, cache.load_batter_logs())
-    enriched = [g for g in enriched if (g.get("date") or "") < today]
-    if not enriched:
+    if rows is not None:
+        # Reuse run_model's already-computed chronological feature rows. They
+        # include today's completed games; the backtest only scores past dates.
+        fe_rows = [r for r in rows if (r["game"].get("date") or "") < today]
+        rows_by_date: dict[str, list[dict]] = {}
+        by_date: dict[str, list[dict]] = {}
+        for r in fe_rows:
+            rows_by_date.setdefault(r["game"]["date"], []).append(r)
+            by_date.setdefault(r["game"]["date"], []).append(r["game"])
+    else:
+        cached = cache.load_games()
+        completed = [
+            g for g in cached
+            if g.get("winner") in ("home", "away")
+            and (g.get("home") or {}).get("id") and (g.get("away") or {}).get("id")
+        ]
+        pitcher_log_cache = cache.load_pitcher_logs()
+        team_log_cache = cache.load_team_logs()
+        enriched = attach_as_of_stats(completed, pitcher_log_cache, team_log_cache)
+        lineups = {}
+        for pk, lu in (cache.load_lineups() or {}).items():
+            if lu:
+                try:
+                    lineups[int(pk)] = lu
+                except (TypeError, ValueError):
+                    pass
+        enriched = attach_lineups_as_of(enriched, lineups, cache.load_batter_logs())
+        enriched = [g for g in enriched if (g.get("date") or "") < today]
+        if not enriched:
+            return []
+        # One chronological replay gives every game's features/elo as-of itself.
+        fe = compute_elo_and_features(enriched, cache.load_injury_snapshots(), today)
+        fe_rows = fe["rows"]
+        rows_by_date = {}
+        for r in fe_rows:
+            rows_by_date.setdefault(r["game"]["date"], []).append(r)
+        by_date = {}
+        for g in enriched:
+            by_date.setdefault(g["date"], []).append(g)
+
+    if not fe_rows:
         return []
-
-    # One chronological replay gives every game's features/elo as-of itself.
-    fe = compute_elo_and_features(enriched, cache.load_injury_snapshots(), today)
-    rows_by_date: dict[str, list[dict]] = {}
-    for r in fe["rows"]:
-        rows_by_date.setdefault(r["game"]["date"], []).append(r)
-
-    by_date: dict[str, list[dict]] = {}
-    for g in enriched:
-        by_date.setdefault(g["date"], []).append(g)
 
     existing_raw = cache.load_json(CALIBRATION_WF_FILE, {}) or {}
     existing = existing_raw.get("days", {}) if isinstance(existing_raw, dict) and "days" in existing_raw else {}
@@ -1202,7 +1231,6 @@ def build_walk_forward_calibration_rows(
         existing = {}
     out: dict[str, dict] = {}
     season = today[:4]
-    fe_rows = fe["rows"]
     dates = sorted(d for d in by_date if d[:4] == season)
 
     # Refit cadence: a full model fit for every single date is the dominant
@@ -1220,6 +1248,11 @@ def build_walk_forward_calibration_rows(
     current_run_margin_cal: dict | None = None
     prior_games: list[dict] = []
     ptr = 0  # fe_rows is chronological; the pointer only moves forward
+    # Rolling hash of the prior-games pointer: prior_games only grows in
+    # chronological order, so a running sha256 turns the per-date fingerprint
+    # from O(prior games) into O(1) amortized (the full replay previously
+    # re-hashed ~6000 games for every one of ~150 dates).
+    prior_hash = hashlib.sha256()
 
     for i, d in enumerate(dates):
         day_rows = rows_by_date.get(d) or []
@@ -1230,12 +1263,29 @@ def build_walk_forward_calibration_rows(
         # O(n) rescan per date).
         while ptr < len(fe_rows) and fe_rows[ptr]["game"]["date"] < d:
             prior_games.append(fe_rows[ptr]["game"])
+            prior_hash.update(
+                f"{fe_rows[ptr]['game']['gamePk']}|{fe_rows[ptr]['game'].get('date')}|"
+                f"{fe_rows[ptr]['game'].get('winner')}|"
+                f"{(fe_rows[ptr]['game'].get('home') or {}).get('score')}|"
+                f"{(fe_rows[ptr]['game'].get('away') or {}).get('score')}".encode("utf-8")
+            )
             ptr += 1
         if len(prior_games) < MIN_COMPLETED_GAMES:
             current_model = None
             current_cutoff = None
             continue
-        fp = _data_fingerprint(prior_games + by_date[d], {})
+        day_hash = hashlib.sha256(
+            "\n".join(
+                sorted(
+                    f"{g['gamePk']}|{g.get('date')}|{g.get('winner')}|"
+                    f"{(g.get('home') or {}).get('score')}|{(g.get('away') or {}).get('score')}"
+                    for g in by_date[d]
+                )
+            ).encode("utf-8")
+        ).hexdigest()
+        fp = hashlib.sha256(
+            (f"{prior_hash.hexdigest()}|{day_hash}|featureVersion:{FEATURE_VERSION}").encode("utf-8")
+        ).hexdigest()
         cached_day = existing.get(d)
         if cached_day and cached_day.get("fp") == fp:
             out[d] = cached_day
@@ -1245,10 +1295,14 @@ def build_walk_forward_calibration_rows(
             current_cutoff = None
             continue
         # Cache miss: fit the block model once, then reuse it for the next
-        # WF_REFIT_DAYS of dates.
+        # WF_REFIT_DAYS of dates. Each fit trains on the most recent
+        # WF_TRAIN_WINDOW prior games (still strictly before the scored day)
+        # with a capped MLP — the two dominant backtest CPU costs.
         if current_model is None or d >= add_days(current_cutoff, WF_REFIT_DAYS):
-            prior_rows = fe_rows[:ptr]
-            result = run_model_light(prior_rows, prior_games, season, d, feature_names)
+            prior_rows = fe_rows[max(0, ptr - WF_TRAIN_WINDOW):ptr]
+            result = run_model_light(
+                prior_rows, prior_games, season, d, feature_names, mlp_epochs=WF_MLP_EPOCHS
+            )
             current_model = {
                 "featureNames": result["featureNames"],
                 "weights": result["weights"],
