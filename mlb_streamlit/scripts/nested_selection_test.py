@@ -39,6 +39,25 @@ def _make_rows(n: int, seed: int = 11) -> list[dict]:
     return rows
 
 
+def _stub_fit_walk_forward_step(train, feature_names, mlp_epochs=40):
+    """Return a trivial serializable per-date model (logistic chosen)."""
+    model = {
+        "featureNames": list(feature_names),
+        "weights": [0.0] * len(feature_names),
+        "bias": 0.0,
+        "featureStats": {f: {"mean": 0.0, "std": 1.0} for f in feature_names},
+        "isotonicPoints": [],
+        "eloHfa": 30.0,
+        "blendW": 0.0,
+        "stack": {"members": {}, "weights": {}},
+        "candidateMembers": {},
+        "monteCarloSigma": 0.0,
+        "monteCarloEnabled": False,
+    }
+    choice = {"deployed": "logistic", "stackBrier": 0.25, "logisticBrier": 0.24}
+    return model, choice
+
+
 def test_l1_selector() -> None:
     print("l1 selector")
     rows = _make_rows(1500)
@@ -62,14 +81,13 @@ def test_stability() -> None:
     # A feature selected in 2 of the last 3 blocks survives even when the
     # current block's L1 dropped it; a one-off flicker does not persist.
     core = set(wf_selection.CORE_FEATURES)
-    current = ["eloDiff", "homeField", "winPctDiff", "newSignal"]
-    history = [["eloDiff", "homeField", "winPctDiff", "persistent"],
-               ["eloDiff", "homeField", "winPctDiff", "persistent"],
-               ["eloDiff", "homeField", "winPctDiff", "flicker"]]
+    current = ["eloDiff", "homeField", "winPctDiff", "spFipDiff"]
+    history = [["eloDiff", "homeField", "winPctDiff", "spEraDiff"],
+               ["eloDiff", "homeField", "winPctDiff", "spEraDiff", "opsDiff"]]
     stable = set(wf_selection._stabilize_features(current, history))
-    check("stability keeps current selections", {"newSignal"} <= stable)
-    check("stability keeps persistent feature", {"persistent"} <= stable)
-    check("stability drops one-off flicker", "flicker" not in stable)
+    check("stability keeps current selections", {"spFipDiff"} <= stable)
+    check("stability keeps persistent feature", {"spEraDiff"} <= stable)
+    check("stability drops one-off flicker", "opsDiff" not in stable)
     check("stability always keeps core", core <= stable)
 
 
@@ -99,7 +117,7 @@ def test_deployable_choice() -> None:
 
 def test_walk_forward_records_features() -> None:
     print("walk-forward per-date features")
-    real_fit = wf_selection.fit_candidate_pool
+    real_fit = wf_selection.fit_walk_forward_step
     real_dir = cache.CACHE_DIR
     tmp = tempfile.mkdtemp(prefix="mlb_nested_")
     cache.CACHE_DIR = Path(tmp)
@@ -107,13 +125,9 @@ def test_walk_forward_records_features() -> None:
 
     def counting_fit(train, feature_names, mlp_epochs=40):
         calls["n"] += 1
-        def pred(r):
-            s = (r["homeElo"] - r["awayElo"]) / 250.0
-            s += sum(r["features"].get(f, 0.0) for f in feature_names) * 0.05
-            return 1.0 / (1.0 + math.exp(-s))
-        return {name: pred for name in wf_selection.CANDIDATE_NAMES}, 30.0, 0.5
+        return _stub_fit_walk_forward_step(train, feature_names, mlp_epochs=mlp_epochs)
 
-    wf_selection.fit_candidate_pool = counting_fit
+    wf_selection.fit_walk_forward_step = counting_fit
     try:
         games = make_games(120, seed=7)
         rows = compute_elo_and_features(games)["rows"]
@@ -127,7 +141,7 @@ def test_walk_forward_records_features() -> None:
         check("final features match last recorded date",
               sel["featureNames"] == list(days[sorted(days)[-1]].get("features")))
     finally:
-        wf_selection.fit_candidate_pool = real_fit
+        wf_selection.fit_walk_forward_step = real_fit
         cache.CACHE_DIR = real_dir
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -146,8 +160,10 @@ def test_calibration_records_choice() -> None:
             "season": season, "asOfDate": as_of_date,
             "gamesTrained": len(rows), "holdoutCount": 0,
             "selectedModel": "stub", "modelDescription": "stub",
-            "featureNames": list(feature_names or []), "weights": [], "bias": 0.0,
-            "featureStats": {}, "isotonicPoints": [], "eloHfa": 30,
+            "featureNames": list(feature_names or []),
+            "weights": [0.0] * len(feature_names or []), "bias": 0.0,
+            "featureStats": {f: {"mean": 0.0, "std": 1.0} for f in (feature_names or [])},
+            "isotonicPoints": [], "eloHfa": 30,
             "blendW": 0.0, "stack": {"members": {}, "weights": {}},
             "monteCarloEnabled": False, "monteCarloTrials": 0,
             "monteCarloSigma": 0.0, "auc": 0.5, "brier": 0.25,
@@ -169,14 +185,12 @@ def test_calibration_records_choice() -> None:
         games = make_games(48, seed=13)
         rows = compute_elo_and_features(games)["rows"]
         # Populate per-date features in the selection record first.
-        real_fit = wf_selection.fit_candidate_pool
-        wf_selection.fit_candidate_pool = lambda train, fn, mlp_epochs=40: (
-            {name: (lambda r: 0.5) for name in wf_selection.CANDIDATE_NAMES}, 30.0, 0.5
-        )
+        real_fit = wf_selection.fit_walk_forward_step
+        wf_selection.fit_walk_forward_step = _stub_fit_walk_forward_step
         try:
             wf_selection.build_walk_forward_selection(rows=rows)
         finally:
-            wf_selection.fit_candidate_pool = real_fit
+            wf_selection.fit_walk_forward_step = real_fit
         cal = refresh.build_walk_forward_calibration_rows(rows=rows)
         check("calibration rows produced", len(cal) > 0, f"{len(cal)}")
         check("every row records its model family",

@@ -25,12 +25,13 @@ import math
 from . import cache
 from .data import add_days, attach_as_of_stats, attach_lineups_as_of, et_date_string
 from .engine.features import FEATURE_KEYS, FEATURE_LABELS, compute_elo_and_features
-from .engine.logistic import build_stacking_weights, cross_validate, logistic_logit, train_logistic_l1
+from .engine.logistic import cross_validate, logistic_logit, train_logistic_l1
 from .engine.metrics import compute_auc, compute_brier, evaluate, sigmoid, spearman_rank
-from .engine.model import CANDIDATE_MIN_AUC, fit_candidate_pool, refit_stack_model
+from .engine.model import CANDIDATE_MIN_AUC, apply_model, elo_prob, fit_walk_forward_step, refit_stack_model
+from .engine.stack import predict_member, stack_probability
 
 WF_SELECTION_FILE = "walk_forward_selection.json"
-WF_SELECTION_VERSION = 5
+WF_SELECTION_VERSION = 6
 WF_SELECTION_REFIT_DAYS = 7  # candidates share a fit within a block (matches calibration)
 WF_TRAIN_WINDOW = 2000  # rolling window of most-recent prior games for each candidate fit
 WF_MLP_EPOCHS = 20  # the MLP fit dominates backtest CPU; cap it for the repeated walk-forward fits
@@ -46,7 +47,8 @@ L1_MIN_ROWS = 100
 STABILITY_K = 3
 STABILITY_VOTES = 2
 
-# Ordering matches engine/model.run_model so the monitor renders a stable table.
+# Ordering matches the deployable stack families (engine.stack.STACK_FAMILIES)
+# plus Elo, the ridge-logistic diagnostics, and the raw multi-model blend.
 CANDIDATE_NAMES = [
     "Elo rating",
     "Logistic regression",
@@ -57,7 +59,7 @@ CANDIDATE_NAMES = [
     "Boosted decision stumps",
     "Neural network (MLP)",
     "Gaussian naive Bayes",
-    "Blended ensemble",
+    "Multi-model stack",
 ]
 
 # These features are always retained: they are the structural backbone of the
@@ -110,6 +112,26 @@ def _stabilize_features(current: list[str], history: list[list[str]]) -> list[st
     stable = set(current) | {f for f, c in votes.items() if c >= STABILITY_VOTES}
     stable.update(CORE_FEATURES)
     return [f for f in FEATURE_KEYS if f in stable]
+
+
+def _candidate_prediction(name: str, candidate_members: dict, row: dict, elo_hfa: float) -> float:
+    """Score one diagnostic candidate on a single row from serialized members.
+
+    The ridge-logistic variants are scored with logistic_logit; every other
+    family goes through engine.stack.predict_member. `Multi-model stack` is the
+    raw convex combination of the deployable families (before the Elo blend).
+    """
+    if name == "Elo rating":
+        return elo_prob(row, elo_hfa)
+    if name == "Multi-model stack":
+        p = stack_probability(candidate_members.get("__stack"), row["features"])
+        return 0.5 if p is None else p
+    member = candidate_members.get(name)
+    if member is None:
+        return 0.5
+    if name.startswith("Logistic regression"):
+        return sigmoid(logistic_logit(member, row["features"], None))
+    return predict_member(name, member, row["features"])
 
 
 def _game_line(g: dict) -> str:
@@ -197,8 +219,10 @@ def build_walk_forward_selection(report=None, rows=None) -> dict:
     out: dict[str, dict] = {}
     prior_games: list[dict] = []
     ptr = 0
-    current_predictors: dict | None = None
+    current_model: dict | None = None
+    current_choice: dict | None = None
     current_cutoff: str | None = None
+    current_features: list[str] | None = None
 
     # Rolling hash of the prior-games pointer: prior_games only grows in
     # chronological order, so a running sha256 turns the per-date fingerprint
@@ -216,8 +240,9 @@ def build_walk_forward_selection(report=None, rows=None) -> dict:
             prior_hash.update(_game_line(fe_rows[ptr]["game"]).encode("utf-8"))
             ptr += 1
         if len(prior_games) < MIN_PRIOR_GAMES:
-            current_predictors = None
+            current_model = None
             current_cutoff = None
+            current_features = None
             continue
         day_hash = hashlib.sha256(
             "\n".join(sorted(_game_line(g) for g in by_date[d])).encode("utf-8")
@@ -227,10 +252,11 @@ def build_walk_forward_selection(report=None, rows=None) -> dict:
         if cached_day and cached_day.get("fp") == fp:
             out[d] = cached_day
             last_features = cached_day.get("features") or last_features
-            current_predictors = None
+            current_model = None
             current_cutoff = None
+            current_features = None
             continue
-        if current_predictors is None or d >= add_days(current_cutoff, WF_SELECTION_REFIT_DAYS):
+        if current_model is None or d >= add_days(current_cutoff, WF_SELECTION_REFIT_DAYS):
             # Rolling window: fit on the most recent WF_TRAIN_WINDOW prior games
             # (still strictly before the scored day — no lookahead).
             prior_rows = fe_rows[max(0, ptr - WF_TRAIN_WINDOW):ptr]
@@ -240,19 +266,34 @@ def build_walk_forward_selection(report=None, rows=None) -> dict:
                 _l1_selected_features(prior_rows, list(FEATURE_KEYS)), sel_history
             )
             sel_history.append(current_features)
-            current_predictors, _elo_hfa, _blend_w = fit_candidate_pool(
+            # Nested model selection: fit the deployable stack AND plain logistic
+            # on prior-only rows, then choose per date by holdout Brier.
+            current_model, current_choice = fit_walk_forward_step(
                 prior_rows, current_features, mlp_epochs=WF_MLP_EPOCHS
             )
             current_cutoff = d
-        preds = {name: [current_predictors[name](r) for r in day_rows] for name in CANDIDATE_NAMES}
+        chosen = [
+            apply_model(current_model, r["features"], r["homeElo"], r["awayElo"])["homeWinProb"]
+            for r in day_rows
+        ]
+        cand_members = current_model.get("candidateMembers") or {}
+        elo_hfa = current_model.get("eloHfa", 30.0)
+        cand_preds = {
+            name: [_candidate_prediction(name, cand_members, r, elo_hfa) for r in day_rows]
+            for name in CANDIDATE_NAMES
+        }
         labels = [r["label"] for r in day_rows]
         feat_vals = {f: [r["features"][f] for r in day_rows] for f in FEATURE_KEYS}
         out[d] = {
             "fp": fp,
-            "candPreds": preds,
+            "chosenPreds": chosen,
+            "candPreds": cand_preds,
             "labels": labels,
             "featVals": feat_vals,
             "features": current_features,
+            "modelChoice": (current_choice or {}).get("deployed"),
+            "stackBrier": (current_choice or {}).get("stackBrier"),
+            "logisticBrier": (current_choice or {}).get("logisticBrier"),
         }
         last_features = current_features
         rep("Walk-forward selection", 30 + int(55 * (i + 1) / max(1, len(dates))),
@@ -260,35 +301,41 @@ def build_walk_forward_selection(report=None, rows=None) -> dict:
 
     cache.save_json(WF_SELECTION_FILE, {"version": WF_SELECTION_VERSION, "days": out})
 
-    # Accumulate every cached day's out-of-sample predictions (each candidate
-    # is aligned with the same labels and the same feature values).
+    # Accumulate every cached day's out-of-sample predictions: the per-date
+    # chosen model (stack or logistic) plus each diagnostic candidate.
     accum = {
+        "chosenPreds": [],
         "candPreds": {name: [] for name in CANDIDATE_NAMES},
         "labels": [],
         "featVals": {f: [] for f in FEATURE_KEYS},
+        "stackDays": 0,
+        "logisticDays": 0,
     }
     for d in sorted(out):
         day = out[d]
+        accum["chosenPreds"].extend(day.get("chosenPreds", []))
         for name in CANDIDATE_NAMES:
             accum["candPreds"][name].extend(day.get("candPreds", {}).get(name, []))
         accum["labels"].extend(day.get("labels", []))
         for f in FEATURE_KEYS:
             accum["featVals"][f].extend(day.get("featVals", {}).get(f, []))
+        if day.get("modelChoice") == "stack":
+            accum["stackDays"] += 1
+        elif day.get("modelChoice") == "logistic":
+            accum["logisticDays"] += 1
 
     labels = accum["labels"]
     n_eval = len(labels)
     if n_eval < 20:
         return _fallback_selection(today, len(out), n_eval)
 
-    # Per-candidate out-of-sample metrics.
+    # Per-candidate out-of-sample diagnostics (the raw families plus the raw
+    # multi-model blend). The headline metrics below come from the per-date
+    # chosen model, not from any single candidate.
     candidates = []
-    eligible_preds: dict[str, list[float]] = {}
-    best_single_name = "Blended ensemble"
-    best_auc = -1.0
-    best_brier = float("inf")
     for name in CANDIDATE_NAMES:
         preds = accum["candPreds"][name]
-        m = evaluate(preds, labels)
+        m = evaluate(preds, labels) if preds else {"auc": 0.0, "brier": 0.0, "logLoss": 0.0, "ece": 0.0}
         eligible = m["auc"] >= CANDIDATE_MIN_AUC
         candidates.append({
             "name": name,
@@ -300,45 +347,19 @@ def build_walk_forward_selection(report=None, rows=None) -> dict:
             "eligible": eligible,
             "note": "" if eligible else f"Below {CANDIDATE_MIN_AUC:.2f} AUC floor — excluded from selection",
         })
-        if not eligible:
-            continue
-        eligible_preds[name] = preds
-        if m["auc"] > best_auc + 0.003:
-            best_auc = m["auc"]
-            best_brier = m["brier"]
-            best_single_name = name
-        elif abs(m["auc"] - best_auc) <= 0.003 and m["brier"] < best_brier:
-            best_brier = m["brier"]
-            best_single_name = name
-    if not eligible_preds:
-        for c in candidates:
-            c["eligible"] = True
-            c["note"] = "AUC floor relaxed — no candidate cleared 0.70"
-            eligible_preds[c["name"]] = accum["candPreds"][c["name"]]
-        best_auc = -1.0
-        best_brier = float("inf")
-        for c in candidates:
-            if c["auc"] > best_auc + 0.003:
-                best_auc = c["auc"]
-                best_brier = c["brier"]
-                best_single_name = c["name"]
-            elif abs(c["auc"] - best_auc) <= 0.003 and c["brier"] < best_brier:
-                best_brier = c["brier"]
-                best_single_name = c["name"]
 
-    stacking = build_stacking_weights(eligible_preds, labels)
-    # The deployed scorer is the logistic + Elo blend — the only fully
-    # serializable ensemble that apply_model can serve. The walk-forward record
-    # still measures every candidate (and the greedy stacking) out-of-sample,
-    # but the model selected for deployment is chosen between the two deployable
-    # families: the blend when it matches or beats plain logistic on OOS Brier,
-    # else plain logistic. Everything else is reported as a diagnostic.
-    blend_eval = evaluate(accum["candPreds"]["Blended ensemble"], labels)
-    lr_eval = evaluate(accum["candPreds"]["Logistic regression"], labels)
-    best_name = "Blended ensemble" if blend_eval["brier"] <= lr_eval["brier"] else "Logistic regression"
-    chosen_preds = accum["candPreds"][best_name]
+    # Descriptive family chosen by the per-date record. The final deployed model
+    # is refit on the full history by apply_walk_forward_selection using the
+    # same stack-vs-logistic recipe; it overwrites these selected flags with the
+    # exact stack members actually served.
+    selected_model_name = (
+        "Multi-model stack" if accum["stackDays"] >= accum["logisticDays"] else "Logistic regression"
+    )
     for c in candidates:
-        c["selected"] = c["name"] == best_name
+        c["selected"] = c["name"] == selected_model_name
+
+    chosen_preds = accum["chosenPreds"]
+    chosen_eval = evaluate(chosen_preds, labels)
 
     # Today's deployed feature set = the FINAL walk-forward block's L1+stability
     # selection (nested: chosen only from games strictly before that date, so no
@@ -360,26 +381,26 @@ def build_walk_forward_selection(report=None, rows=None) -> dict:
             "active": f in selected_features,
         })
 
-    chosen_eval = evaluate(chosen_preds, labels)
     pick_probs = [max(p, 1 - p) for p in chosen_preds]
     is_correct = [1 if (p >= 0.5) == (y == 1) else 0 for p, y in zip(chosen_preds, labels)]
     high_conf = [c for p, c in zip(pick_probs, is_correct) if p >= 0.65]
 
     description = (
-        "Walk-forward per-date model: stack vs logistic chosen by holdout Brier, "
-        "L1-selected features, isotonic-calibrated."
+        "Walk-forward nested selection: per-date L1 (LASSO) features with a "
+        "3-block stability vote (λ tuned by holdout Brier), stack vs logistic "
+        "chosen per date by holdout Brier, isotonic-calibrated."
     )
 
     selection = {
         "trainedThrough": today,
         "daysEvaluated": len(out),
         "gamesEvaluated": n_eval,
-        "selectedModel": best_name,
+        "selectedModel": selected_model_name,
         "modelDescription": description,
         "featureNames": selected_features,
         "featureImportances": feature_importances,
         "candidates": candidates,
-        "stackingWeights": stacking["weights"],
+        "stackingWeights": [],
         "crossValidation": cross_validate(fe_rows, selected_features, 5),
         "auc": chosen_eval["auc"],
         "brier": chosen_eval["brier"],
@@ -395,6 +416,8 @@ def build_walk_forward_selection(report=None, rows=None) -> dict:
             "modelSelection": "Stack vs logistic per date by holdout Brier",
             "minCandidateAuc": CANDIDATE_MIN_AUC,
             "l1LambdaGrid": list(L1_LAMBDA_GRID),
+            "stabilityWindow": STABILITY_K,
+            "stabilityVotes": STABILITY_VOTES,
             "l2Lambda": 0.001,
             "epochs": 20,
             "hfaGrid": [0, 10, 20, 30, 40, 50, 60],
@@ -444,7 +467,10 @@ def _fallback_selection(today: str, days: int, games: int) -> dict:
         "calibrationCurve": [],
         "spearmanRho": 0.0,
         "topDecileWinRate": 0.0,
-        "optimizationParams": {"featureSelection": "Full feature set (fallback)"},
+        "optimizationParams": {
+            "featureSelection": "Full feature set (fallback)",
+            "modelSelection": "Stack vs logistic per date by holdout Brier",
+        },
     }
 
 

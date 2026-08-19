@@ -1174,8 +1174,21 @@ def fit_deployable_model(
     """
     selected = list(feature_names)
     stack, blend_w = fit_stack(rows, selected, elo_hfa, mlp_epochs=mlp_epochs)
+    full_stack = stack
+    full_members = dict(stack.get("members") or {})
     lr = train_logistic(rows, selected)
     n = len(rows)
+
+    # Every deployable family (plus the ridge-logistic variants) is retained
+    # for the walk-forward candidate table, even when the per-date selector
+    # picks the pure logistic family. `__stack` keeps the full multi-model
+    # stack so the monitor can show the raw blend alongside the chosen family.
+    candidate_members = dict(full_members)
+    candidate_members["Logistic regression"] = lr
+    candidate_members["Logistic regression (L2, λ=0.1)"] = train_logistic(rows, selected, lambda_=0.1)
+    candidate_members["Logistic regression (L2, λ=0.3)"] = train_logistic(rows, selected, lambda_=0.3)
+    candidate_members["Logistic regression (L2, λ=1)"] = train_logistic(rows, selected, lambda_=1.0)
+    candidate_members["__stack"] = {"members": full_members, "weights": full_stack.get("weights", {})}
 
     lr_blend_w = 0.0
     holdout = rows[int(math.floor(n * 0.8)):] if n >= 40 else []
@@ -1228,8 +1241,46 @@ def fit_deployable_model(
         "eloHfa": elo_hfa,
         "blendW": blend_w,
         "stack": stack,
+        "candidateMembers": candidate_members,
     }
     choice = {"deployed": model_choice, "stackBrier": stack_brier, "logisticBrier": lr_brier}
+    return model, choice
+
+
+def fit_walk_forward_step(
+    train: list[dict],
+    feature_names: list[str],
+    mlp_epochs: int = 20,
+) -> tuple[dict, dict]:
+    """Fit one walk-forward block's model for the selection pass.
+
+    Mirrors `run_model_light`'s win-probability recipe exactly so every
+    dashboard's point-in-time model is identical: home-field advantage is tuned
+    on the first 70% of `train` and the deployable stack-vs-logistic family is
+    then chosen on the trailing 15% by holdout Brier (`fit_deployable_model`).
+    It skips the Poisson run-scoring layers the selection pass does not need.
+
+    `train` is chronological and strictly prior-only (games before the scored
+    day), so nothing from the scored day or any future event leaks in.
+    """
+    n = len(train)
+    elo_hfa = 30.0
+    hfa_rows = train[:int(math.floor(n * 0.7))]
+    if len(hfa_rows) >= 20:
+        best_brier = float("inf")
+        for hfa in HFA_GRID:
+            preds = [elo_prob(r, hfa) for r in hfa_rows]
+            b = compute_brier(preds, [r["label"] for r in hfa_rows])
+            if b < best_brier:
+                best_brier = b
+                elo_hfa = hfa
+    model, choice = fit_deployable_model(
+        train, feature_names, elo_hfa, mlp_epochs=mlp_epochs
+    )
+    # The selection pass scores deterministic point estimates exactly like the
+    # calibration backtest (Monte Carlo is decided later, on the deployed model).
+    model["monteCarloSigma"] = 0.0
+    model["monteCarloEnabled"] = False
     return model, choice
 
 

@@ -34,22 +34,29 @@ from mlb_streamlit.scripts.smoke_test import check, make_games  # noqa: E402
 _CHECKS = 0
 
 
-def _stub_fit_candidate_pool(train, feature_names, mlp_epochs=40):
-    """Cheap deterministic candidate pool (identical predictors) so the test
-    never pays for the pure-Python MLP / boosted-stump fits."""
-    def pred(r):
-        s = (r["homeElo"] - r["awayElo"]) / 250.0
-        s += r["features"].get("eloDiff", 0.0) * 0.4
-        s += r["features"].get("winPctDiff", 0.0) * 0.3
-        s += r["features"].get("homeField", 0.0) * 0.2
-        return 1.0 / (1.0 + math.exp(-s))
-
-    return {name: pred for name in wf_selection.CANDIDATE_NAMES}, 30.0, 0.5
+def _stub_fit_walk_forward_step(train, feature_names, mlp_epochs=40):
+    """Cheap deterministic per-date model so the test never pays for the
+    pure-Python MLP / boosted-stump fits."""
+    model = {
+        "featureNames": list(feature_names),
+        "weights": [0.0] * len(feature_names),
+        "bias": 0.0,
+        "featureStats": {f: {"mean": 0.0, "std": 1.0} for f in feature_names},
+        "isotonicPoints": [],
+        "eloHfa": 30.0,
+        "blendW": 0.0,
+        "stack": {"members": {}, "weights": {}},
+        "candidateMembers": {},
+        "monteCarloSigma": 0.0,
+        "monteCarloEnabled": False,
+    }
+    choice = {"deployed": "logistic", "stackBrier": 0.25, "logisticBrier": 0.24}
+    return model, choice
 
 
 def main() -> int:
     global _CHECKS
-    real_fit = wf_selection.fit_candidate_pool
+    real_fit = wf_selection.fit_walk_forward_step
     real_dir = cache.CACHE_DIR
     tmp = tempfile.mkdtemp(prefix="mlb_wfsel_")
     cache.CACHE_DIR = Path(tmp)
@@ -57,9 +64,9 @@ def main() -> int:
 
     def counting_fit(train, feature_names, mlp_epochs=40):
         calls["n"] += 1
-        return _stub_fit_candidate_pool(train, feature_names, mlp_epochs=mlp_epochs)
+        return _stub_fit_walk_forward_step(train, feature_names, mlp_epochs=mlp_epochs)
 
-    wf_selection.fit_candidate_pool = counting_fit
+    wf_selection.fit_walk_forward_step = counting_fit
     try:
         games = make_games(120, seed=7)
         rows = compute_elo_and_features(games)["rows"]
@@ -127,7 +134,7 @@ def main() -> int:
         check("result carries walk-forward selection metadata",
               result.get("walkForwardSelection") is sel)
     finally:
-        wf_selection.fit_candidate_pool = real_fit
+        wf_selection.fit_walk_forward_step = real_fit
         cache.CACHE_DIR = real_dir
         shutil.rmtree(tmp, ignore_errors=True)
 

@@ -80,16 +80,21 @@ Any date the user picks in the Games tab is predicted on demand via
   interaction, lineup batter momentum (recent OPS vs season) and 7-day
   fatigue. Trajectory features populate only where real data exists (same
   fresh-window gating as lineups), so older history never gets junk values.
-- **Feature selection**: L2-regularized logistic regression (Newton–Raphson /
-  IRLS) with greedy backward elimination on a calibration split.
+- **Feature selection**: nested, per-date L1 (LASSO) logistic regression — the
+  λ penalty is tuned on a chronological holdout by Brier — followed by a
+  3-block stability vote (features selected in ≥2 of the last 3 blocks
+  survive). Selection runs strictly inside each walk-forward date's prior-only
+  training window, so no future result influences the feature set.
 - **Candidates**: Elo, logistic regression (3 ridge strengths), distance-
   weighted k-NN, L2-boosted decision stumps, a compact two-hidden-layer
-  neural network (MLP, deterministic seed, L2 + early stopping), and a
-  blended ensemble with an Elo-weight tuned on the calibration set. Only
-  candidates clearing a 0.70 calibration AUC floor are eligible for
-  selection/stacking.
-- **Stacking**: greedy forward selection solves convex combination weights that
-  minimize calibration-set Brier loss (high AUC, low risk).
+  neural network (MLP, deterministic seed, L2 + early stopping), and Gaussian
+  naive Bayes. Only candidates clearing a 0.70 out-of-sample AUC floor are
+  eligible for selection/stacking.
+- **Model selection / stacking**: each walk-forward date fits both the
+  deployable multi-model stack (logistic / k-NN / boosted stumps / MLP /
+  naive Bayes) and a pure logistic, then chooses stack vs logistic by holdout
+  Brier (fit on Brier). Stack weights are solved with greedy forward selection
+  that minimizes holdout Brier loss.
 - **Calibration**: isotonic regression (PAV) enforced monotonic on the
   calibration set; ECE is reported.
 - **Monte Carlo**: a Gaussian logit-noise sigma grid is tested; the stochastic
@@ -116,7 +121,7 @@ Any date the user picks in the Games tab is predicted on demand via
 ## Testing
 
 ```bash
-python3 mlb_streamlit/scripts/smoke_test.py          # engine + data pipeline (296 checks)
+python3 mlb_streamlit/scripts/smoke_test.py          # engine + data pipeline (298 checks)
 python3 mlb_streamlit/scripts/ui_render_test.py       # Streamlit UI panels with stubbed streamlit/plotly
 ```
 

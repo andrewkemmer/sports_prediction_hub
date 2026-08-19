@@ -1508,9 +1508,10 @@ _FEATURE_DESCRIPTIONS = {
 
 def _automl_panel(ms: dict) -> None:
     candidates = ms.get("candidates") or []
-    selected = next((c for c in candidates if c.get("selected")), candidates[0] if candidates else None)
-    ensemble_auc = selected["auc"] if selected else ms.get("auc", 0)
-    ensemble_brier = selected["brier"] if selected else ms.get("brier", 0)
+    # Headline cards report the walk-forward chosen model's out-of-sample
+    # record, not any single diagnostic candidate.
+    ensemble_auc = ms.get("auc", 0)
+    ensemble_brier = ms.get("brier", 0)
     spearman = ms.get("spearmanRho") or 0
     top_decile = ms.get("topDecileWinRate") or 0
 
@@ -1523,9 +1524,9 @@ def _automl_panel(ms: dict) -> None:
         f"{ui.pill('5-Fold Cross-Validated', ui.EMERALD, 'rgba(52,211,153,0.15)')}</div>"
         f"<h3 style='margin:0;font-size:17px;font-weight:700;color:{ui.TEXT}'>Empirical Feature Selection &amp; Model Stacking Optimizer</h3>"
         f"<p style='margin:8px 0 0;font-size:13px;color:{ui.MUTED};line-height:1.6;max-width:720px;'>"
-        f"Machine Learning algorithms automatically assess feature predictive signal (via L2-regularized logistic regression "
-        f"with greedy backward elimination) and solve for optimal ensemble weights by minimizing calibration-set Brier loss to "
-        f"maximize out-of-sample AUC (&gt; 0.70 floor) while enforcing monotonic probability calibration.</p></div></div></div>",
+        f"Each walk-forward date selects its own features with L1 (LASSO) logistic regression plus a 3-block stability vote, "
+        f"then chooses between the multi-model stack and plain logistic by holdout Brier loss to maximize out-of-sample AUC "
+        f"(&gt; 0.70 floor) while enforcing monotonic probability calibration.</p></div></div></div>",
         unsafe_allow_html=True,
     )
     if st.button("🔄 Run Auto-ML Optimization", type="primary", key="automl_btn"):
@@ -1580,9 +1581,9 @@ def _automl_panel(ms: dict) -> None:
     if sub.startswith("Learned Feature Decisions"):
         st.info(
             "**How Machine Learning Decided Feature Inclusion & Weights:** "
-            "L2-regularized logistic regression with greedy backward elimination evaluated each candidate "
-            "feature set. Features were retained only when they measurably reduced calibration-set Brier loss; "
-            "the final coefficients are the learned weights."
+            "Per-date L1 (LASSO) logistic regression tuned λ on a chronological holdout by Brier loss, then a "
+            "3-block stability vote kept features selected in at least 2 of the last 3 blocks. Only features with "
+            "stable out-of-sample signal survive; the final coefficients are the learned weights."
         )
         if inactive:
             st.markdown(
@@ -1617,7 +1618,7 @@ def _automl_panel(ms: dict) -> None:
             f"<div style='background:{ui._card_bg()};border:1px solid {ui.BORDER};border-radius:16px;padding:18px;'>"
             f"<h3 style='margin:0;font-size:14px;font-weight:600;color:{ui.TEXT}'>Optimal Model Stacking Weights</h3>"
             f"<p style='margin:6px 0 14px;font-size:12px;color:{ui.MUTED};line-height:1.5;max-width:760px;'>"
-            f"Greedy forward-selection solves for convex-combination weights that minimize calibration-set Brier loss. "
+            f"Greedy forward-selection solves for convex-combination weights that minimize holdout Brier loss. "
             f"Only models that measurably reduce risk are added to the stack; the remainder carry zero weight.</p>"
             + "".join(rows) + "</div>",
             unsafe_allow_html=True,
@@ -1750,7 +1751,7 @@ def _ensemble_panel(ms: dict) -> None:
         ])
     st.markdown(
         f"<div style='background:{ui._card_bg()};border:1px solid {ui.BORDER};border-radius:16px;padding:18px;margin-top:12px;'>"
-        f"<h3 style='margin:0 0 12px;font-size:14px;font-weight:600;color:{ui.TEXT}'>Candidate Models (Cross-Validated)</h3>"
+        f"<h3 style='margin:0 0 12px;font-size:14px;font-weight:600;color:{ui.TEXT}'>Candidate Models (Walk-Forward Out-of-Sample)</h3>"
         + ui.html_table(
             ["Model", "AUC", "Brier", "Log-Loss", "ECE", "Status"],
             cand_rows,
@@ -1783,7 +1784,7 @@ def monitor_tab(bundle) -> None:
     record = ms.get("todaysRecord") or {}
     ui.section(
         "Auto-ML & Model Monitor",
-        "Automated feature selection, regularized weighting, model ensemble optimization (AUC > 0.60), and calibration diagnostics.",
+        "Nested L1 feature selection with stability voting, per-date stack-vs-logistic model selection (fit on Brier), and calibration diagnostics.",
     )
 
     sub = st.segmented_control(
