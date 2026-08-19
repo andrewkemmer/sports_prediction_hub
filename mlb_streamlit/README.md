@@ -18,8 +18,10 @@ Everything lives in this directory and runs on a plain Python interpreter:
 | `engine/model.py` | Auto-ML: feature selection, model stacking, calibration, Monte Carlo decision |
 | `engine/metrics.py` | AUC, Brier, log-loss, ECE, isotonic regression, calibration curves |
 | `engine/betting.py` | PIT market mapping, no-vig probabilities, EV, fractional Kelly, and safe abstention |
+| `engine/backtest.py` | Paper-trading P&L: replays point-in-time picks at a flat -110 price with quarter-Kelly sizing |
 | `scripts/smoke_test.py` | Offline engine test (no Streamlit/network required) |
 | `scripts/betting_test.py` | Offline market execution regression test |
+| `scripts/backtest_test.py` | Offline paper-trading backtest regression test |
 
 ## Run it
 
@@ -136,12 +138,21 @@ Any date the user picks in the Games tab is predicted on demand via
   the executable quote for EV, and quarter-Kelly sizing with a hard 1% cap.
   It deliberately does not backtest ROI from today’s odds feed: historical EV
   requires timestamped historical prices and a separate line-history store.
+  `engine/backtest.py` closes the *model-side* loop instead: it replays the
+  walk-forward calibration record against a flat -110 benchmark price with
+  quarter-Kelly sizing (1% cap) and reports realized ROI, hit rate, coverage,
+  bankroll growth, max drawdown, and a confidence-threshold sweep. The
+  Calibration dashboard renders this as an "Execution Backtest (paper trading)"
+  panel. Flat -110 is a strategy-ranking benchmark, not a closing-line CLV
+  claim — add timestamped closing lines to upgrade it to a true market-ROI
+  backtest.
 
 ## Testing
 
 ```bash
 python3 mlb_streamlit/scripts/smoke_test.py          # engine + data pipeline (298 checks)
 python3 mlb_streamlit/scripts/betting_test.py        # PIT EV/Kelly/market guards
+python3 mlb_streamlit/scripts/backtest_test.py       # paper-trading P&L regression
 python3 mlb_streamlit/scripts/ui_render_test.py       # Streamlit UI panels with stubbed streamlit/plotly
 ```
 

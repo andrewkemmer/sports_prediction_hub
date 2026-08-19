@@ -29,6 +29,7 @@ import streamlit as st
 
 from mlb_streamlit import cache, ui
 from mlb_streamlit.data import et_date_string, market_odds_enabled
+from mlb_streamlit.engine.backtest import build_execution_backtest
 from mlb_streamlit.engine.metrics import (
     calibration_curve_points,
     compute_auc,
@@ -1058,12 +1059,79 @@ def _calibration_range(rows: list[dict], fallback: str) -> tuple[_dt.date, _dt.d
     return _dt.date.fromisoformat(dates[0]), _dt.date.fromisoformat(dates[-1])
 
 
+def _execution_backtest_panel(rows: list[dict]) -> None:
+    """Paper-trading P&L for the base model and the concordance gate.
+
+    Replays the point-in-time predictions against a flat -110 price using
+    quarter-Kelly sizing (1% cap). This is a model-side benchmark — a model
+    that cannot clear -110 has no edge to trade against sharper closing lines.
+    """
+    if len(rows) < 10:
+        return
+    bt = build_execution_backtest(rows)
+    base = bt["base"]
+    gated = bt["gated"]
+    st.markdown(
+        f"<div style='margin-top:16px;background:{ui._card_bg()};border:1px solid {ui.BORDER};border-radius:16px;padding:16px;'>"
+        f"<div style='display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;'>"
+        f"<div><h3 style='margin:0;font-size:14px;font-weight:600;color:{ui.TEXT}'>Execution Backtest (paper trading)</h3>"
+        f"<p style='margin:5px 0 0;font-size:12px;color:{ui.MUTED};line-height:1.5'>"
+        f"Point-in-time picks replayed at a flat {bt['price']} price (breakeven {fmt_pct(bt['breakeven'], 1)}), "
+        f"quarter-Kelly staking with a 1% cap. Measures whether the model clears the vig — not historical closing-line CLV.</p></div>"
+        f"{ui.pill('PIT · -110 benchmark', ui.CYAN, 'rgba(34,211,238,0.15)')}"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+    cols = st.columns(6)
+    roi_color = ui.EMERALD if base["roi"] >= 0 else ui.ROSE
+    gated_roi_color = ui.EMERALD if gated["roi"] >= 0 else ui.ROSE
+    cards = [
+        ("Base ROI", f"{base['roi']:+.1%}", roi_color, f"{base['bets']} bets · {base['wins']}-{base['losses']}"),
+        ("Base hit rate", fmt_pct(base["hitRate"], 1), ui.CYAN, f"breakeven {fmt_pct(base['breakeven'], 1)}"),
+        ("Gated ROI", f"{gated['roi']:+.1%}", gated_roi_color, f"{gated['bets']} bets · coverage {fmt_pct(gated['coverage'], 1)}"),
+        ("Gated hit rate", fmt_pct(gated["hitRate"], 1), ui.EMERALD, f"{gated['wins']}-{gated['losses']}"),
+        ("Bankroll growth", f"{base['bankrollGrowth']:+.3f}×", ui.AMBER, "per 1.0 unit, base strategy"),
+        ("Max drawdown", f"{base['maxDrawdown']:.1%}", ui.PURPLE, "peak-to-trough, base strategy"),
+    ]
+    for col, (label, value, color, sub) in zip(cols, cards):
+        with col:
+            st.markdown(ui.metric_card(label, value, color, sub), unsafe_allow_html=True)
+
+    sweep_rows = []
+    for s in bt["thresholdSweep"]:
+        roi_c = ui.EMERALD if s["roi"] >= 0 else ui.ROSE
+        sweep_rows.append([
+            f"<span style='color:{ui.TEXT};font-variant-numeric:tabular-nums'>{s['minProb']:.0%}</span>",
+            f"<span style='color:{ui.TEXT};font-variant-numeric:tabular-nums'>{s['bets']}</span>",
+            f"<span style='color:{ui.MUTED};font-variant-numeric:tabular-nums'>{fmt_pct(s['coverage'], 1)}</span>",
+            f"<span style='color:{ui.TEXT};font-variant-numeric:tabular-nums'>{fmt_pct(s['hitRate'], 1)}</span>",
+            f"<span style='color:{roi_c};font-variant-numeric:tabular-nums'>{s['roi']:+.1%}</span>",
+            f"<span style='color:{ui.MUTED};font-variant-numeric:tabular-nums'>{s['finalBankroll']:.3f}×</span>",
+        ])
+    st.markdown(
+        f"<div style='margin-top:12px;'><h4 style='margin:0 0 8px;font-size:13px;font-weight:600;color:{ui.TEXT}'>"
+        f"Confidence-threshold sweep (base model)</h4>"
+        + ui.html_table(
+            ["Min prob", "Bets", "Coverage", "Hit rate", "ROI", "Bankroll"],
+            sweep_rows,
+            align=["left", "right", "right", "right", "right", "right"],
+        ) + "</div>",
+        unsafe_allow_html=True,
+    )
+    st.caption(
+        "Flat -110 is a benchmark, not a claim about any book's closing line. "
+        "Use it to rank strategies; add timestamped closing lines to upgrade this to a CLV/ROI backtest."
+    )
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
 def _moneyline_metrics(rows: list[dict]) -> dict:
     preds = [r["pickProb"] for r in rows]
     labels = [1 if r["isCorrect"] else 0 for r in rows]
     ev = evaluate(preds, labels)
     curve = calibration_curve_points(preds, labels, 12)
     _render_concordance_gate(rows)
+    _execution_backtest_panel(rows)
     return {"ev": ev, "curve": curve if curve else ev["calibrationCurve"], "n": len(rows)}
 
 
