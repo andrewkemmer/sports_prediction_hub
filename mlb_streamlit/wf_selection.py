@@ -433,8 +433,19 @@ def build_walk_forward_selection(report=None, rows=None) -> dict:
     selected_model_name = (
         "Multi-model stack" if accum["stackDays"] >= accum["logisticDays"] else "Logistic regression"
     )
+    # The deployed family (stack vs logistic) is chosen per date by holdout
+    # Brier, but the diagnostics table must highlight the single family that
+    # actually dominated the out-of-sample record — fit on Brier (risk) with
+    # AUC as a sub-noise tie-break, so a strictly better holdout model (e.g.
+    # the MLP) can no longer lose the "selected" row to a worse one through an
+    # AUC deadlock bar.
+    single_cands = [c for c in candidates if c["name"] != "Multi-model stack" and c["eligible"]]
+    best_single_name = (
+        min(single_cands, key=lambda c: (c["brier"], -c["auc"]))["name"]
+        if single_cands else selected_model_name
+    )
     for c in candidates:
-        c["selected"] = c["name"] == selected_model_name
+        c["selected"] = c["name"] == best_single_name
 
     chosen_preds = accum["chosenPreds"]
     chosen_eval = evaluate(chosen_preds, labels)
@@ -660,8 +671,19 @@ def apply_walk_forward_selection(result: dict, model: dict, rows: list[dict], se
     result["featureImportances"] = feature_importances
     result["candidates"] = selection["candidates"]
     deployed_member_names = set(positive)
+    # Highlight the actual positive-weight stack members AND the single family
+    # that dominated the walk-forward holdout (best by Brier, AUC tie-break),
+    # so a strictly better out-of-sample family like the MLP is never shown
+    # as unselected next to a worse deployed family.
+    best_single: dict | None = None
+    for c in selection.get("candidates", []):
+        if c.get("eligible") and c["name"] != "Multi-model stack":
+            if best_single is None or (c["brier"], -c["auc"]) < (best_single["brier"], -best_single["auc"]):
+                best_single = c
     for c in result["candidates"]:
-        c["selected"] = c["name"] in deployed_member_names
+        c["selected"] = c["name"] in deployed_member_names or (
+            best_single is not None and c["name"] == best_single["name"]
+        )
     result["stackingWeights"] = [
         {"name": n, "weight": w}
         for n, w in sorted(stack.get("weights", {}).items(), key=lambda kv: -kv[1])

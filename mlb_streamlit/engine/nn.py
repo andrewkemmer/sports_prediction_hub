@@ -18,7 +18,7 @@ Design goals, matching the rest of the engine:
   * numpy-accelerated with a pure-Python fallback — identical math on both
     paths; numpy only makes the matmuls fast.
   * Same `predict(features) -> probability` closure shape as every other
-    candidate, so the Auto-ML pool treats it identically (AUC >= 0.70
+    candidate, so the Auto-ML pool treats it identically (AUC >= 0.51
     eligibility floor, stacking, calibration).
 
 Why a neural network here: on tabular win-probability data the MLP can model

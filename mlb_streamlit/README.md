@@ -104,8 +104,10 @@ Any date the user picks in the Games tab is predicted on demand via
 - **Candidates**: Elo, logistic regression (3 ridge strengths), distance-
   weighted k-NN, L2-boosted decision stumps, a compact two-hidden-layer
   neural network (MLP, deterministic seed, L2 + early stopping), and Gaussian
-  naive Bayes. Only candidates clearing a 0.70 out-of-sample AUC floor are
-  eligible for selection/stacking.
+  naive Bayes. Only candidates clearing a 0.51 out-of-sample AUC floor (above
+  the 0.5 coin-flip; MLB models sit around 0.52-0.55) are eligible for
+  selection/stacking — a stricter gate wiped the pool out before the ensemble
+  could run.
 - **Model selection / stacking**: each walk-forward date fits both the
   deployable multi-model stack (logistic / k-NN / boosted stumps / MLP /
   naive Bayes) and a pure logistic, then chooses stack vs logistic by holdout

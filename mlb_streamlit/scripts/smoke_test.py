@@ -57,6 +57,7 @@ from mlb_streamlit.engine.logistic import (  # noqa: E402
     naive_bayes_model,
     train_logistic,
 )
+from mlb_streamlit.engine.model import CANDIDATE_MIN_AUC  # noqa: E402
 from mlb_streamlit.engine.metrics import (  # noqa: E402
     american_odds,
     apply_isotonic,
@@ -1568,13 +1569,16 @@ def test_automl_pipeline() -> None:
           and r2["crossValidation"] == result["crossValidation"],
           "parallelized pipeline drifted between identical runs")
 
-    # Candidate pool floor: every eligible model clears 0.70 AUC (or the floor
-    # was relaxed because nothing cleared it on this synthetic data), selection
-    # always comes from the eligible pool, and the stronger families are in it.
+    # Candidate pool floor: every eligible model clears CANDIDATE_MIN_AUC (or
+    # the floor was relaxed because nothing cleared it on this synthetic data),
+    # selection always comes from the eligible pool, and the stronger families
+    # are in it.
     relaxed = any(c.get("note", "").startswith("AUC floor relaxed") for c in result["candidates"])
-    check("candidate floor: eligible >= 0.70 / excluded < 0.70 (or relaxed)",
-          relaxed or all((c["auc"] >= 0.70) == bool(c.get("eligible")) for c in result["candidates"]),
-          f"{[(c['name'], round(c['auc'], 3), c.get('eligible')) for c in result['candidates']]}")
+    check(
+        f"candidate floor: eligible >= {CANDIDATE_MIN_AUC:.2f} / excluded < {CANDIDATE_MIN_AUC:.2f} (or relaxed)",
+        relaxed or all((c["auc"] >= CANDIDATE_MIN_AUC) == bool(c.get("eligible")) for c in result["candidates"]),
+        f"{[(c['name'], round(c['auc'], 3), c.get('eligible')) for c in result['candidates']]}",
+    )
     sel_c = next((c for c in result["candidates"] if c.get("selected")), None)
     check("selected model eligible (or relaxed)",
           sel_c is not None and (relaxed or bool(sel_c.get("eligible"))))

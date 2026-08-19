@@ -36,6 +36,7 @@ from mlb_streamlit.engine.metrics import (
     compute_brier,
     evaluate,
 )
+from mlb_streamlit.engine.model import CANDIDATE_MIN_AUC
 from mlb_streamlit.engine.teams import team_meta
 from mlb_streamlit.refresh import (
     PREDICTION_VERSION,
@@ -1709,7 +1710,7 @@ def _automl_panel(ms: dict) -> None:
         f"<p style='margin:8px 0 0;font-size:13px;color:{ui.MUTED};line-height:1.6;max-width:720px;'>"
         f"Each walk-forward date selects its own features with L1 (LASSO) logistic regression plus a 3-block stability vote, "
         f"then chooses between the multi-model stack and plain logistic by holdout Brier loss to maximize out-of-sample AUC "
-        f"(&gt; 0.70 floor) while enforcing monotonic probability calibration.</p></div></div></div>",
+        f"(&gt; {CANDIDATE_MIN_AUC:.2f} floor) while enforcing monotonic probability calibration.</p></div></div></div>",
         unsafe_allow_html=True,
     )
     if st.button("🔄 Run Auto-ML Optimization", type="primary", key="automl_btn"):
@@ -1921,7 +1922,7 @@ def _ensemble_panel(ms: dict) -> None:
         if c.get("selected"):
             status = ui.pill("Selected", ui.EMERALD, "rgba(52,211,153,0.15)")
         elif not c.get("eligible"):
-            status = ui.pill("Excluded (<0.70)", ui.AMBER, "rgba(252,211,77,0.12)")
+            status = ui.pill(f"Excluded (<{CANDIDATE_MIN_AUC:.2f})", ui.AMBER, "rgba(252,211,77,0.12)")
         else:
             status = "<span style='color:#8b939f;font-size:12px'>—</span>"
         cand_rows.append([

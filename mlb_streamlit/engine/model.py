@@ -61,8 +61,12 @@ ELO_INIT = 1500.0
 HFA_GRID = [0, 10, 20, 30, 40, 50, 60]
 KNN_TRAIN_CAP = 1500
 # AUC floor for the candidate pool: only models that clear it are eligible for
-# selection / stacking, so every model the selector chooses among is strong.
-CANDIDATE_MIN_AUC = 0.70
+# selection / stacking. MLB single-game win-probability models sit around
+# 0.52-0.55 AUC out-of-sample, so a hard 0.70 gate (a relic from a different
+# data scale) wiped out the entire pool before the stacker could run. 0.51
+# keeps the gate honest (above the 0.5 coin-flip) without bottlenecking the
+# ensemble to a single candidate.
+CANDIDATE_MIN_AUC = 0.51
 MC_GRID = [0.1, 0.15, 0.2, 0.3, 0.45, 0.6]
 # Ridge strengths tried for the deployed logistic (selected on the calibrate set).
 LAMBDA_GRID = [0.001, 0.01, 0.1, 0.3, 1.0]
@@ -541,9 +545,6 @@ def run_model(
 
     candidates: list[dict] = []
     eligible_preds: dict[str, list[float]] = {}
-    best_single_name = "Blended ensemble"
-    best_auc = -1.0
-    best_brier = float("inf")
     for name, p in cand_preds.items():
         m = evaluate(p, calib_labels)
         eligible = m["auc"] >= CANDIDATE_MIN_AUC
@@ -557,34 +558,28 @@ def run_model(
             "eligible": eligible,
             "note": "" if eligible else f"Below {CANDIDATE_MIN_AUC:.2f} AUC floor — excluded from selection",
         })
-        if not eligible:
-            continue
-        eligible_preds[name] = p
-        if m["auc"] > best_auc + 0.003:
-            best_auc = m["auc"]
-            best_brier = m["brier"]
-            best_single_name = name
-        elif abs(m["auc"] - best_auc) <= 0.003 and m["brier"] < best_brier:
-            best_brier = m["brier"]
-            best_single_name = name
+        if eligible:
+            eligible_preds[name] = p
     if not eligible_preds:
         # Safety valve: if nothing clears the floor (e.g. a pathological small
-        # calibration set), relax it and re-run best-single selection over the
-        # full pool so the chosen model is genuinely the best of what exists.
+        # calibration set), relax it so the chosen model is genuinely the best
+        # of what exists instead of an empty pool.
         for c in candidates:
             c["eligible"] = True
-            c["note"] = "AUC floor relaxed — no candidate cleared 0.70"
+            c["note"] = f"AUC floor relaxed — no candidate cleared {CANDIDATE_MIN_AUC:.2f}"
             eligible_preds[c["name"]] = cand_preds[c["name"]]
-        best_auc = -1.0
-        best_brier = float("inf")
-        for c in candidates:
-            if c["auc"] > best_auc + 0.003:
-                best_auc = c["auc"]
-                best_brier = c["brier"]
-                best_single_name = c["name"]
-            elif abs(c["auc"] - best_auc) <= 0.003 and c["brier"] < best_brier:
-                best_brier = c["brier"]
-                best_single_name = c["name"]
+
+    # Best single family, fit on Brier (the risk metric) with AUC as a
+    # sub-noise tie-break. The old rule replaced a candidate only when its AUC
+    # beat the leader by +0.003 — on a ~400-game holdout that bar sits inside
+    # the noise itself, so the first family to tie deadlocked at 100% weight
+    # even when a strictly-better family (e.g. the MLP) sat just below the bar.
+    # Lexicographic (Brier, -AUC) selection is exact and deadlock-free.
+    best_single_name = min(
+        (c for c in candidates if c["eligible"]),
+        key=lambda c: (c["brier"], -c["auc"]),
+    )["name"]
+    best_brier = next(c["brier"] for c in candidates if c["name"] == best_single_name)
     for c in candidates:
         c["selected"] = c["name"] == best_single_name
 
