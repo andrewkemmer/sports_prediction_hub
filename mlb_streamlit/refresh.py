@@ -458,6 +458,10 @@ def _data_fingerprint(completed: list[dict], injury_counts: dict) -> str:
     # to how features are computed (e.g. a point-in-time leak fix) forces a
     # full retrain instead of reusing a model trained on stale features.
     lines.append(f"featureVersion:{FEATURE_VERSION}")
+    # Selection-algorithm version also participates: a change to L1 / stability
+    # / univariate-screen selection must rebuild the model + calibration, not
+    # reuse a state trained with the old feature set.
+    lines.append(f"wfSelectionVersion:{WF_SELECTION_VERSION}")
     lines.sort()
     return hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
 

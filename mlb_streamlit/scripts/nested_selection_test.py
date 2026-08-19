@@ -99,6 +99,31 @@ def test_early_core_fallback() -> None:
           set(sel) == set(wf_selection.CORE_FEATURES), f"{sel}")
 
 
+def test_univariate_signal_screen() -> None:
+    print("univariate signal screen")
+    rows = _make_rows(1500)
+    # Simulate an over-shrunk L1 fit that zeroes every non-core feature, and
+    # verify the nested univariate screen rescues features with genuine signal
+    # so the selector never collapses to the 3-feature core backbone.
+    real_l1 = wf_selection.train_logistic_l1
+
+    def collapsing_l1(frows, feature_names, lambda_l1=0.02, iterations=100, l2=1e-4):
+        m = real_l1(frows, feature_names, lambda_l1=lambda_l1, iterations=iterations, l2=l2)
+        m["weights"] = [
+            0.0 if f not in wf_selection.CORE_FEATURES else w
+            for f, w in zip(m["featureNames"], m["weights"])
+        ]
+        return m
+
+    wf_selection.train_logistic_l1 = collapsing_l1
+    try:
+        sel = wf_selection._l1_selected_features(rows, list(FEATURE_KEYS))
+    finally:
+        wf_selection.train_logistic_l1 = real_l1
+    check("core always retained", set(wf_selection.CORE_FEATURES) <= set(sel))
+    check("signal feature rescued by screen", "spFipDiff" in sel, f"{sel}")
+
+
 def test_deployable_choice() -> None:
     print("deployable stack vs logistic")
     rows = _make_rows(900)
@@ -211,6 +236,7 @@ def main() -> int:
     test_l1_selector()
     test_stability()
     test_early_core_fallback()
+    test_univariate_signal_screen()
     test_deployable_choice()
     test_walk_forward_records_features()
     test_calibration_records_choice()

@@ -35,7 +35,7 @@ WF_SELECTION_FILE = "walk_forward_selection.json"
 # Gate configuration is part of the per-date scoring recipe. Bump this when
 # the gate is introduced/changed so pre-gate selection caches cannot silently
 # disable the live abstention layer.
-WF_SELECTION_VERSION = 8
+WF_SELECTION_VERSION = 9
 WF_SELECTION_REFIT_DAYS = 7  # candidates share a fit within a block (matches calibration)
 WF_TRAIN_WINDOW = 2000  # rolling window of most-recent prior games for each candidate fit
 WF_MLP_EPOCHS = 20  # the MLP fit dominates backtest CPU; cap it for the repeated walk-forward fits
@@ -46,7 +46,14 @@ FEATURE_SIGNAL_EPS = 0.01  # |AUC - 0.5| threshold for a feature to stay active
 # strength is tuned on a chronological holdout by Brier (fit on Brier), and the
 # stability rule keeps features selected in >= 2 of the last 3 blocks so the
 # per-date feature sets don't churn.
-L1_LAMBDA_GRID = (0.005, 0.02, 0.05)
+#
+# The grid extends well below the old 0.005 floor. MLB feature signals are weak
+# (univariate AUC ~0.51-0.55), so the effective glmnet penalty (lambda * n,
+# n ≈ WF_TRAIN_WINDOW ≈ 2000) at 0.005 is already strong enough to soft-threshold
+# every non-core feature to zero — which is why the monitor was collapsing to
+# the 3-feature CORE_FEATURES backbone. Lighter penalties let the Brier-tuned
+# selector keep weak-but-real signals instead of throwing them away.
+L1_LAMBDA_GRID = (0.0005, 0.001, 0.002, 0.005, 0.01, 0.02, 0.05)
 L1_MIN_ROWS = 100
 STABILITY_K = 3
 STABILITY_VOTES = 2
@@ -75,20 +82,38 @@ def _l1_selected_features(prior_rows: list[dict], feature_names: list[str]) -> l
     """L1 (LASSO) logistic on prior-only rows -> features with nonzero weight.
 
     The penalty strength is tuned on the trailing 20% chronological holdout by
-    Brier (fit on Brier). The structural core features are always retained.
-    With too little history, fall back to the core features only.
+    Brier (fit on Brier). A per-feature out-of-sample univariate-AUC screen is
+    unioned with the L1 survivors so an over-shrunk L1 fit cannot discard a
+    feature that carries genuine signal; the structural core features are always
+    retained. With too little history, fall back to the core features only.
     """
     if len(prior_rows) < L1_MIN_ROWS:
         return [f for f in feature_names if f in CORE_FEATURES]
     n = len(prior_rows)
     holdout = prior_rows[int(math.floor(n * 0.8)):]
+    holdout_labels = [r["label"] for r in holdout]
+
+    # Nested univariate signal screen: computed only on the prior-only training
+    # window, so no future result influences it. A feature whose single-feature
+    # AUC clears FEATURE_SIGNAL_EPS survives even when the Brier-tuned L1 lambda
+    # shrinks its *joint* coefficient to zero. Without this, weak-but-real MLB
+    # signals (AUC ~0.51-0.53) collapse to the 3-feature core backbone. The
+    # screen uses the full prior window (not just the trailing holdout) so its
+    # AUC estimate has enough rows to separate weak signal from noise.
+    screen: set[str] = set()
+    prior_labels = [r["label"] for r in prior_rows]
+    for f in feature_names:
+        auc = compute_auc([r["features"][f] for r in prior_rows], prior_labels)
+        if abs(auc - 0.5) >= FEATURE_SIGNAL_EPS:
+            screen.add(f)
+
     best_model = None
     best_brier = float("inf")
     for lam in L1_LAMBDA_GRID:
         m = train_logistic_l1(prior_rows, feature_names, lambda_l1=lam)
         if len(holdout) >= 20:
             preds = [sigmoid(logistic_logit(m, r["features"], None)) for r in holdout]
-            b = compute_brier(preds, [r["label"] for r in holdout])
+            b = compute_brier(preds, holdout_labels)
             if b < best_brier:
                 best_brier = b
                 best_model = m
@@ -96,6 +121,7 @@ def _l1_selected_features(prior_rows: list[dict], feature_names: list[str]) -> l
             best_model = m
     m = best_model or train_logistic_l1(prior_rows, feature_names)
     sel = {f for f, w in zip(m["featureNames"], m["weights"]) if abs(w) > 1e-9}
+    sel.update(screen)
     sel.update(CORE_FEATURES)
     return [f for f in feature_names if f in sel]
 
@@ -452,9 +478,10 @@ def build_walk_forward_selection(report=None, rows=None) -> dict:
     high_conf = [c for p, c in zip(pick_probs, is_correct) if p >= 0.65]
 
     description = (
-        "Walk-forward nested selection: per-date L1 (LASSO) features with a "
-        "3-block stability vote (λ tuned by holdout Brier), stack vs logistic "
-        "chosen per date by holdout Brier, isotonic-calibrated."
+        "Walk-forward nested selection: per-date L1 (LASSO) features (λ tuned by "
+        "holdout Brier) plus a univariate out-of-sample signal screen, a 3-block "
+        "stability vote, stack vs logistic chosen per date by holdout Brier, "
+        "isotonic-calibrated."
     )
 
     selection = {

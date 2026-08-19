@@ -92,10 +92,13 @@ Any date the user picks in the Games tab is predicted on demand via
   does not expose a trustworthy lineup-publication timestamp; only lineups
   available on scheduled/upcoming games can enter the live feature vector.
 - **Feature selection**: nested, per-date L1 (LASSO) logistic regression — the
-  λ penalty is tuned on a chronological holdout by Brier — followed by a
-  3-block stability vote (features selected in ≥2 of the last 3 blocks
-  survive). Selection runs strictly inside each walk-forward date's prior-only
-  training window, so no future result influences the feature set.
+  λ penalty is tuned on a chronological holdout by Brier over a grid that
+  extends down to 0.0005 (the old 0.005 floor over-shrunk every non-core
+  feature to zero on weak-signal MLB data) — unioned with a univariate
+  out-of-sample AUC signal screen, then a 3-block stability vote (features
+  selected in ≥2 of the last 3 blocks survive). Selection runs strictly inside
+  each walk-forward date's prior-only training window, so no future result
+  influences the feature set.
 - **Candidates**: Elo, logistic regression (3 ridge strengths), distance-
   weighted k-NN, L2-boosted decision stumps, a compact two-hidden-layer
   neural network (MLP, deterministic seed, L2 + early stopping), and Gaussian
