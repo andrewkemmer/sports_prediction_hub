@@ -855,6 +855,260 @@ def run_model(
     }
 
 
+def decide_monte_carlo(rows: list[dict], model: dict) -> dict:
+    """Decide the Monte Carlo smoothing sigma on the deployed model itself.
+
+    The walk-forward selection rebuilds today's model *after* the in-sample
+    pipeline, so a sigma tuned on the pre-selection fit would describe the
+    wrong model. This evaluates the same 7-point Gauss-Hermite sigma grid on
+    the exact model `apply_model` serves (stack + Elo blend + isotonic), on
+    the chronological calibration slice — the stochastic component is enabled
+    only when it measurably reduces Brier (risk), matching run_model's rule.
+    """
+    n = len(rows)
+    calib = rows[:min(n, int(math.floor(n * 0.85)))]
+    labels = [r["label"] for r in calib]
+    preds = [
+        apply_model(model, r["features"], r["homeElo"], r["awayElo"])["homeWinProb"]
+        for r in calib
+    ]
+    base_brier = compute_brier(preds, labels)
+    mc_sigma = 0.0
+    best_brier = base_brier
+    best_sigma = 0.0
+    for s in MC_GRID:
+        b = compute_brier([monte_carlo_adjust(p, s, 10000) for p in preds], labels)
+        if b < best_brier:
+            best_brier = b
+            best_sigma = s
+        if b < base_brier - 0.0005:
+            best_brier = b
+            mc_sigma = s
+    enabled = mc_sigma > 0
+    grid_text = ", ".join(f"{s}" for s in MC_GRID)
+    if enabled:
+        rationale = (
+            f"Monte Carlo enabled: σ={mc_sigma} (grid {{{grid_text}}}) reduces calibration-set Brier "
+            f"{base_brier:.4f} → {best_brier:.4f} (calibration error shrinks toward the mean)."
+        )
+    else:
+        rationale = (
+            f"Monte Carlo disabled: no stochastic σ in {{{grid_text}}} reduced calibration-set Brier "
+            f"below {base_brier:.4f} (best {best_brier:.4f} at σ={best_sigma}). "
+            "Deterministic point estimates are kept."
+        )
+    return {
+        "sigma": mc_sigma,
+        "enabled": enabled,
+        "trials": 10000 if enabled else 0,
+        "rationale": rationale,
+    }
+
+
+def run_model_lean(
+    completed_games: list[dict],
+    season: str,
+    as_of_date: str,
+    injury_snapshots: dict | None = None,
+) -> dict:
+    """Cheap training pass for the refresh pipeline.
+
+    The refresh pipeline immediately follows this with the walk-forward
+    selection, which REPLACES the feature set, stack, isotonic points,
+    candidates, stacking weights, cross-validation and headline metrics via
+    apply_walk_forward_selection. Fitting all of those twice (here and again
+    on the walk-forward-selected recipe) was the dominant "retrains the
+    walk-forward models multiple times" cost of a refresh. This pass keeps
+    only what the walk-forward selection does not rebuild:
+
+      * the chronological feature rows + as-of team state (Elo/records/injuries),
+      * home-field advantage, a quick logistic + Elo blend + isotonic (used
+        for the run-margin / run-line calibrations and the diagnostics below),
+      * the run-scoring model state, power rankings, feature drift / rolling
+        Brier / version history and feature importances.
+
+    It skips greedy backward elimination, the ridge-lambda grid, the candidate
+    pool, the deployable stack fit, Monte Carlo and cross-validation — the
+    walk-forward selection owns all of those. Monte Carlo is decided on the
+    final deployed model by `decide_monte_carlo` right after the selection
+    pass replaces `model`.
+    """
+    fe = compute_elo_and_features(completed_games, injury_snapshots, as_of_date)
+    rows = fe["rows"]
+    team_state = fe["teamState"]
+    team_stats = fe["teamStats"]
+    n = len(rows)
+    selected = list(FEATURE_KEYS)
+
+    train_end = int(math.floor(n * 0.7))
+    calib_end = min(n, int(math.floor(n * 0.85)))
+    train = rows[:train_end]
+    calib = rows[train_end:calib_end]
+    test = rows[calib_end:]
+    calib_labels = [r["label"] for r in calib]
+    test_labels = [r["label"] for r in test]
+
+    # Home-field advantage tuned on the training slice (identical to run_model).
+    elo_hfa = 30.0
+    if len(train) >= 20:
+        best_brier = float("inf")
+        for hfa in HFA_GRID:
+            b = compute_brier([elo_prob(r, hfa) for r in train], [r["label"] for r in train])
+            if b < best_brier:
+                best_brier = b
+                elo_hfa = hfa
+
+    lr_model = train_logistic(train, selected)
+    # Logistic + Elo blend weight tuned on the calibration slice.
+    blend_w = 0.5
+    if len(calib) >= 20:
+        lr_logits = [logistic_logit(lr_model, r["features"], None) for r in calib]
+        elo_logits = [logit(elo_prob(r, elo_hfa)) for r in calib]
+        best_brier = float("inf")
+        w = 0.0
+        while w <= 1.0001:
+            preds = [sigmoid((1 - w) * l + w * e) for l, e in zip(lr_logits, elo_logits)]
+            b = compute_brier(preds, calib_labels)
+            if b < best_brier:
+                best_brier = b
+                blend_w = w
+            w += 0.05
+
+    def _served_logit(r: dict) -> float:
+        l = logistic_logit(lr_model, r["features"], None)
+        e = logit(elo_prob(r, elo_hfa))
+        return (1 - blend_w) * l + blend_w * e if blend_w > 0 else l
+
+    order = sorted(zip([sigmoid(_served_logit(r)) for r in rows], [r["label"] for r in rows]), key=lambda t: t[0])
+    isotonic_points = isotonic_regression([o[0] for o in order], [o[1] for o in order])
+
+    model: dict = {
+        "featureNames": selected,
+        "weights": lr_model["weights"],
+        "bias": lr_model["bias"],
+        "featureStats": lr_model["featureStats"],
+        "isotonicPoints": isotonic_points,
+        "eloHfa": elo_hfa,
+        "blendW": blend_w,
+        "stack": {
+            "members": {"Logistic regression": lr_model},
+            "weights": {"Logistic regression": 1.0},
+        },
+        "monteCarloSigma": 0.0,
+        "monteCarloEnabled": False,
+    }
+
+    run_margin_calibration = fit_run_margin_calibration(rows, model)
+    run_model_state = fit_run_model(completed_games)
+
+    # Run-line calibration (200-trial sims over the calibration slice), mirroring
+    # run_model's step 14 exactly.
+    calib_rows = rows[:calib_end]
+    if np is not None and len(calib_rows) > 0:
+        sims = simulate_runs_batch(
+            run_model_state,
+            [r["game"]["home"]["id"] for r in calib_rows],
+            [r["game"]["away"]["id"] for r in calib_rows],
+            [0.0] * len(calib_rows),
+            [0.0] * len(calib_rows),
+            200,
+        )
+    else:
+        sims = [
+            simulate_runs(run_model_state, r["game"]["home"]["id"], r["game"]["away"]["id"], 0, 200)
+            for r in calib_rows
+        ]
+    rl_pairs: list[tuple[float, int]] = []
+    for r, sim in zip(calib_rows, sims):
+        margin = (r["game"]["home"].get("score") or 0) - (r["game"]["away"].get("score") or 0)
+        rl_pairs.append((sim["homeRunLineProb"], 1 if margin >= 2 else 0))
+    rl_pairs.sort(key=lambda t: t[0])
+    run_line_calibration = (
+        isotonic_regression([t[0] for t in rl_pairs], [t[1] for t in rl_pairs])
+        if len(rl_pairs) >= 40 else []
+    )
+
+    test_preds = [
+        apply_model(model, r["features"], r["homeElo"], r["awayElo"])["homeWinProb"]
+        for r in test
+    ]
+    test_eval = evaluate(test_preds, test_labels)
+
+    feature_drift = compute_feature_drift(rows, selected)
+    rolling = compute_rolling_brier(rows, model, as_of_date)
+    model_versions = build_model_versions(rows, as_of_date, test_eval)
+    brier_baseline = model_versions[1]["brier"] if len(model_versions) > 1 else rolling["baseline"]
+    power_rankings = build_power_rankings(completed_games, team_state, team_stats)
+
+    full_labels = [r["label"] for r in rows]
+    feature_importances: list[dict] = []
+    for f in FEATURE_KEYS:
+        uni = compute_auc([r["features"][f] for r in rows], full_labels)
+        idx = lr_model["featureNames"].index(f) if f in lr_model["featureNames"] else -1
+        active = idx >= 0
+        w = lr_model["weights"][idx] if active else 0.0
+        feature_importances.append({
+            "feature": f,
+            "label": FEATURE_LABELS.get(f, f),
+            "weight": w,
+            "importance": abs(w),
+            "univariateAuc": uni,
+            "active": active,
+        })
+
+    result = {
+        "season": season,
+        "asOfDate": as_of_date,
+        "gamesTrained": n,
+        "holdoutCount": len(test),
+        "selectedModel": "Walk-forward selection (lean pass)",
+        "modelDescription": "Temporary in-sample fit; replaced by the walk-forward-selected model.",
+        "featureNames": selected,
+        "weights": lr_model["weights"],
+        "bias": lr_model["bias"],
+        "featureStats": lr_model["featureStats"],
+        "isotonicPoints": isotonic_points,
+        "eloHfa": elo_hfa,
+        "blendW": blend_w,
+        "stack": model["stack"],
+        "monteCarloEnabled": False,
+        "monteCarloTrials": 0,
+        "monteCarloSigma": 0.0,
+        "monteCarloRationale": "Monte Carlo is decided on the deployed model after walk-forward selection.",
+        "auc": test_eval["auc"],
+        "brier": test_eval["brier"],
+        "logLoss": test_eval["logLoss"],
+        "ece": test_eval["ece"],
+        "bins": test_eval["bins"],
+        "confidenceDistribution": test_eval["confidenceDistribution"],
+        "calibrationCurve": test_eval["calibrationCurve"],
+        "featureImportances": feature_importances,
+        "candidates": [],
+        "powerRankings": power_rankings,
+        "featureDrift": feature_drift,
+        "rollingBrier": rolling["points"],
+        "brierBaseline": brier_baseline,
+        "modelVersions": model_versions,
+        "stackingWeights": [],
+        "crossValidation": {},
+        "optimizationParams": {
+            "featureSelection": "Walk-forward nested L1 + stability (applied after this lean pass)",
+            "modelSelection": "Stack vs logistic per date by holdout Brier",
+            "isotonicMethod": "Isotonic (PAV)",
+        },
+        "runModel": run_model_state,
+        "runLineCalibration": run_line_calibration,
+        "runMarginCalibration": run_margin_calibration,
+    }
+
+    return {
+        "result": result,
+        "model": model,
+        "teamState": team_state,
+        "rows": rows,
+    }
+
+
 def build_power_rankings(
     completed_games: list[dict],
     team_state: dict,

@@ -37,6 +37,8 @@ from .data import (
 from .engine.features import FEATURE_KEYS, FEATURE_VERSION, build_features_for_game, compute_elo_and_features
 from .engine.gating import GATE_VERSION, apply_concordance_gate, default_gate_config, summarize_gate_results
 from .engine.betting import build_bet_decision, stamp_market_odds, summarize_bet_decisions
+from .engine.calib_wf import build_walk_forward_calibration_rows_v2
+from .engine.logistic import train_logistic
 from .engine.metrics import (
     apply_isotonic,
     calibration_curve_points,
@@ -49,11 +51,13 @@ from .engine.metrics import (
 from .engine.model import (
     apply_model,
     build_power_rankings,
-    run_model,
+    decide_monte_carlo,
+    fit_run_margin_calibration,
+    run_model_lean,
     run_model_light,
     simulate_runs_batch,
 )
-from .engine.runs import expected_margin, expected_total, simulate_runs
+from .engine.runs import expected_margin, expected_total, fit_run_model, simulate_runs
 from .wf_selection import (
     WF_SELECTION_FILE,
     WF_SELECTION_VERSION,
@@ -907,7 +911,12 @@ def run_refresh(
     odds_pool = ThreadPoolExecutor(max_workers=1)
     try:
         odds_future = odds_pool.submit(fetch_market_odds)
-        run = run_model(completed_enriched, season, today, injury_snapshots)
+        # Lean pass: the walk-forward selection below rebuilds the deployed
+        # model (features, stack, isotonic, candidates, CV, metrics), so the
+        # full Auto-ML run here would fit everything twice per refresh. This
+        # pass only computes rows/team state, the run-scoring model and the
+        # diagnostics the selection does not produce.
+        run = run_model_lean(completed_enriched, season, today, injury_snapshots)
         result = run["result"]
         model = run["model"]
         rows = run["rows"]
@@ -929,10 +938,21 @@ def run_refresh(
     #     be chosen by the out-of-sample walk-forward record (all prior days'
     #     models, rolled forward), not the in-sample 70/15/15 split. This
     #     rebuilds `model` + `result` so the Model Monitor and the live scorer
-    #     agree, and reuses `rows` already computed by run_model.
+    #     agree, and reuses `rows` already computed by run_model_lean.
     rep("Walk-forward selection", 72, "Selecting today's model from the walk-forward record…")
     wf_selection = build_walk_forward_selection(report=rep, rows=rows)
     apply_walk_forward_selection(result, model, rows, wf_selection)
+
+    # Monte Carlo is a property of the deployed model, which the walk-forward
+    # selection just rebuilt — decide it here (on the exact blend apply_model
+    # serves) instead of on the discarded in-sample fit.
+    mc = decide_monte_carlo(rows, model)
+    model["monteCarloSigma"] = mc["sigma"]
+    model["monteCarloEnabled"] = mc["enabled"]
+    result["monteCarloSigma"] = mc["sigma"]
+    result["monteCarloEnabled"] = mc["enabled"]
+    result["monteCarloTrials"] = mc["trials"]
+    result["monteCarloRationale"] = mc["rationale"]
 
     # 9. Calibration rows for every completed game (as-of-time predictions).
     rep("Scoring games", 74, "Generating predictions & run simulations…")
@@ -1126,7 +1146,10 @@ def run_refresh(
     # backtest when it is opened. It reuses the walk-forward-selected features,
     # so every dashboard scores with the identical model family + feature set.
     rep("Walk-forward calibration", 96, "Building point-in-time calibration rows…")
-    build_walk_forward_calibration_rows(
+    # Reuses the walk-forward selection record (stored per-date predictions +
+    # gate results) so the walk-forward models are NOT re-fit a second time;
+    # only the cheap run-scoring projections are computed here.
+    build_walk_forward_calibration_rows_v2(
         report=rep,
         feature_names=result["featureNames"],
         rows=rows,
@@ -1253,6 +1276,59 @@ def _backtest_state(target: str, report=None) -> dict | None:
     cache.save_json(BACKTEST_STATES_FILE, {"version": BACKTEST_CACHE_VERSION, "days": states})
     rep("Backtest model ready", 45, f"Walk-forward model trained through {target}.")
     return state
+
+
+def _rows_from_stored_selection(
+    day_rows: list[dict],
+    stored_preds: list[float],
+    stored_gate: list[dict],
+    run_model_state: dict,
+    run_margin_cal: dict,
+) -> list[dict]:
+    """Calibration rows built from the walk-forward SELECTION record.
+
+    The selection pass already scored every game point-in-time and stored the
+    out-of-sample home-win probabilities + full gate results per date. This
+    rebuilds the calibration row shape around those stored predictions and
+    adds the totals / run-line projections from the block's Poisson run model
+    + margin calibration — no MLP/stack fit is needed, which is what removes
+    the duplicate walk-forward training from a refresh.
+    """
+    home_ids = [r["game"]["home"]["id"] for r in day_rows]
+    away_ids = [r["game"]["away"]["id"] for r in day_rows]
+    lines = [expected_total(run_model_state, h, a) for h, a in zip(home_ids, away_ids)]
+    shifts = [
+        margin_shift_for_game(run_model_state, run_margin_cal, h, a, p)
+        for h, a, p in zip(home_ids, away_ids, stored_preds)
+    ]
+    projs = simulate_runs_batch(run_model_state, home_ids, away_ids, lines, shifts, RUN_CALIB_TRIALS)
+    out: list[dict] = []
+    for r, p, gate, proj in zip(day_rows, stored_preds, stored_gate, projs):
+        g = r["game"]
+        winner = g.get("winner")
+        pick_home = p >= 0.5
+        gated_team = gate.get("gatedPickTeam")
+        out.append({
+            "gamePk": g["gamePk"],
+            "date": g["date"],
+            "away": {"abbrev": g["away"]["abbrev"], "name": g["away"]["name"], "score": g["away"].get("score")},
+            "home": {"abbrev": g["home"]["abbrev"], "name": g["home"]["name"], "score": g["home"].get("score")},
+            "winner": winner,
+            "pickTeam": "home" if pick_home else "away",
+            "pickProb": p if pick_home else 1 - p,
+            "homeWinProb": p,
+            "isCorrect": pick_home == (winner == "home"),
+            "isUpset": pick_home != (winner == "home"),
+            **gate,
+            "gatedIsCorrect": bool(
+                gate.get("gateAccepted") and winner in ("home", "away") and gated_team == winner
+            ),
+            "predictedTotal": proj["total"],
+            "homeRunLineProb": proj["homeRunLineProb"],
+            "actualTotal": (g["away"].get("score") or 0) + (g["home"].get("score") or 0),
+            "actualMargin": (g["home"].get("score") or 0) - (g["away"].get("score") or 0),
+        })
+    return out
 
 
 CALIBRATION_WF_FILE = "calibration_rows_wf.json"

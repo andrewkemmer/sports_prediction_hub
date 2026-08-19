@@ -253,7 +253,7 @@ def boosted_stumps_params(
         min_leaf = max(8, n // 40)
     if n < 2 * min_leaf + 2:
         prior = mean([r["label"] for r in train])
-        return {"prior": prior, "learningRate": learning_rate, "trees": []}
+        return {"prior": prior, "learningRate": learning_rate, "trees": [], "featureNames": list(feature_names)}
     features = [r["features"] for r in train]
     labels = [r["label"] for r in train]
     max_features = min(max_features, len(feature_names)) or 1
@@ -269,7 +269,7 @@ def boosted_stumps_params(
         if stump["feature"] is not None:
             for i in range(n):
                 pred[i] += learning_rate * _stump_predict(stump, features[i])
-    return {"learningRate": learning_rate, "trees": trees}
+    return {"learningRate": learning_rate, "trees": trees, "featureNames": list(feature_names)}
 
 
 def boosted_stumps_predict(params: dict, features_dict: dict) -> float:

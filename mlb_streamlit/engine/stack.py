@@ -56,6 +56,60 @@ KNN_TRAIN_CAP = 1500
 MIN_STACK_TRAIN = 40
 MIN_HOLDOUT = 20
 
+# Every family below otherwise trains on the *identical* columns, so its
+# errors are near-perfectly correlated with the backbone's — a convex blend
+# then has nothing to contribute and the holdout-tuned weights collapse onto
+# a single member (the greedy forward-selection "deadlock" where several
+# models tie at the same Brier and 100% of the weight goes to the first one).
+# Giving each family a different, overlapping slice of the feature space
+# decorrelates their errors, which is the only reason a blend exists: a
+# family that is weaker overall can still cover games the backbone misreads.
+# The structural core (Elo edge / home field / record) is always kept so no
+# member is ever starved of the strongest signals. The logistic backbone
+# keeps the FULL set so apply_model's SHAP readout stays complete.
+CORE_STACK_FAMILY = ("eloDiff", "homeField", "winPctDiff")
+
+STACK_FAMILY_SUBSETS: dict[str, tuple[str, ...] | None] = {
+    # Ratings + recent form + pitching workload: matchup-driven read.
+    "Distance-weighted k-NN (k=21)": (
+        "formDiff", "restDiff", "injuryDiff", "spFipDiff", "spEraDiff",
+        "spK9Diff", "spWhipDiff", "spRecentDiff", "spTrendDiff",
+        "spRestWorkloadDiff",
+    ),
+    # Team offense + lineup construction: lineup-driven read (weak on pitching).
+    "Boosted decision stumps": (
+        "formDiff", "opsDiff", "teamEraDiff", "defEffDiff", "lineupOpsDiff",
+        "lineupWobaDiff", "lineupIsoDiff", "lineupHotDiff",
+        "lineupMomentumDiff", "lineupFatigueDiff", "lineupParkInteract",
+    ),
+    # Pitching-vs-offense interactions + environment: the MLP's nonlinear read.
+    "Neural network (MLP)": (
+        "restDiff", "injuryDiff", "spFipDiff", "spEraDiff", "spK9Diff",
+        "opsDiff", "teamEraDiff", "defEffDiff", "lineupOpsDiff",
+        "lineupHotDiff", "parkFactor", "tempDev", "windMph",
+    ),
+    # Sparse, independent-stats read (naive-Bayes independence assumption).
+    "Gaussian naive Bayes": (
+        "formDiff", "restDiff", "injuryDiff", "spFipDiff", "spEraDiff",
+        "teamEraDiff", "teamK9Diff", "teamWhipDiff", "defEffDiff",
+    ),
+}
+
+
+def member_feature_names(feature_names: list[str], family: str) -> list[str]:
+    """Per-family feature slice: core + that family's subset, filtered to the
+    caller's active feature set. The logistic backbone always keeps the full
+    active set (it powers the SHAP readout in apply_model)."""
+    active = set(feature_names)
+    if family == "Logistic regression":
+        return list(feature_names)
+    subset = STACK_FAMILY_SUBSETS.get(family)
+    if not subset:
+        return list(feature_names)
+    chosen = [f for f in CORE_STACK_FAMILY if f in active]
+    chosen += [f for f in subset if f in active and f not in chosen]
+    return chosen or list(feature_names)
+
 
 def fit_stack_members(train: list[dict], feature_names: list[str], mlp_epochs: int = 40) -> dict:
     """Fit every deployable family on `train` and return JSON-safe parameters.
@@ -68,13 +122,20 @@ def fit_stack_members(train: list[dict], feature_names: list[str], mlp_epochs: i
     keeps the full default.
     """
     knn_train = train[-KNN_TRAIN_CAP:] if len(train) > KNN_TRAIN_CAP else train
-    return {
-        "Logistic regression": train_logistic(train, feature_names),
-        "Distance-weighted k-NN (k=21)": weighted_knn_params(knn_train, feature_names, KNN_K),
-        "Boosted decision stumps": boosted_stumps_params(train, feature_names),
-        "Neural network (MLP)": mlp_params(train, feature_names, epochs=mlp_epochs),
-        "Gaussian naive Bayes": naive_bayes_params(train, feature_names),
-    }
+    members: dict[str, dict] = {}
+    for family in STACK_FAMILIES:
+        feats = member_feature_names(feature_names, family)
+        if family == "Logistic regression":
+            members[family] = train_logistic(train, feats)
+        elif family == "Distance-weighted k-NN (k=21)":
+            members[family] = weighted_knn_params(knn_train, feats, KNN_K)
+        elif family == "Boosted decision stumps":
+            members[family] = boosted_stumps_params(train, feats)
+        elif family == "Neural network (MLP)":
+            members[family] = mlp_params(train, feats, epochs=mlp_epochs)
+        elif family == "Gaussian naive Bayes":
+            members[family] = naive_bayes_params(train, feats)
+    return members
 
 
 def predict_member(name: str, member: dict, features: dict) -> float:

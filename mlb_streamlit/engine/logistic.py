@@ -446,24 +446,108 @@ def naive_bayes_model(train: list[dict], feature_names: list[str]):
     return lambda features: naive_bayes_predict(member, features)
 
 
+# Minimum holdout-Brier gain required to add a member to the stack. The
+# holdout is a few hundred games, so Brier differences below ~0.001 are pure
+# noise; accepting sub-noise gains would only overfit the blend weights to the
+# holdout. Real gains come from member diversity (see engine.stack's per-family
+# feature subsets), not from chasing ties among redundant models.
+STACK_MIN_IMPROVEMENT = 0.0005
+# Candidates within this band of the current best are considered "tied" for
+# ordering purposes; among them the greedy pass tries the least-correlated
+# model first so a slightly weaker but decorrelated member gets a chance to
+# enter the blend before a redundant one that can only add noise.
+STACK_DIVERSITY_BAND = 0.004
+# Weight-grid resolution used by the greedy step and the joint re-optimization
+# pass. Finer than the old 0.05 step, so a genuinely useful small slice of a
+# diverse member is not rounded away.
+STACK_WEIGHT_STEP = 0.02
+
+
+def _correlation(a: list[float], b: list[float]) -> float:
+    """Pearson correlation of two prediction vectors (robust enough for the
+    diversity ordering; ranks add nothing at this sample size)."""
+    n = len(a)
+    if n < 2:
+        return 0.0
+    ma = sum(a) / n
+    mb = sum(b) / n
+    sxy = sxx = syy = 0.0
+    for x, y in zip(a, b):
+        dx = x - ma
+        dy = y - mb
+        sxy += dx * dy
+        sxx += dx * dx
+        syy += dy * dy
+    denom = (sxx * syy) ** 0.5
+    return sxy / denom if denom > 1e-12 else 0.0
+
+
+def _blend_predictions(preds_by_name: dict, weights: dict, names: list[str], n: int) -> list[float]:
+    """Weighted convex combination of the named members' predictions."""
+    out = [0.0] * n
+    for name in names:
+        w = weights.get(name, 0.0)
+        if w > 0:
+            p = preds_by_name[name]
+            for j in range(n):
+                out[j] += w * p[j]
+    return out
+
+
 def build_stacking_weights(cand_preds: dict, labels: list[int]) -> dict:
-    """Greedy forward-selection stacking over candidate model predictions."""
+    """Greedy forward-selection stacking over candidate model predictions.
+
+    Ordering is Brier-first, but candidates within a noise band of the current
+    best are tried in order of *diversity* (least correlation with the running
+    ensemble first): when several models tie — the classic 0.250-deadlock —
+    the winner is no longer whichever happens to sort first, and a diverse
+    member that can actually reduce ensemble error gets a shot. After the
+    greedy pass the selected weights are re-optimized jointly (coordinate
+    descent on a fine grid), fixing the proportional-shrink approximation the
+    greedy step uses. If no blend beats the single best model beyond the
+    noise floor, the honest answer (a single-model stack) is returned.
+    """
     names = list(cand_preds.keys())
-    ranked = sorted(((n, compute_brier(cand_preds[n], labels)) for n in names), key=lambda t: t[1])
-    order = [r[0] for r in ranked]
+    n = len(labels) if labels else 0
+    if not names or n == 0:
+        return {"preds": [], "brier": float("inf"), "weights": []}
+
+    briers = {nm: compute_brier(cand_preds[nm], labels) for nm in names}
+    order = sorted(names, key=lambda nm: (briers[nm], names.index(nm)))
     first = cand_preds[order[0]]
     if not first:
         return {
             "preds": [],
             "brier": float("inf"),
-            "weights": [{"name": n, "weight": 1 if n == order[0] else 0} for n in names],
+            "weights": [{"name": nm, "weight": 1 if nm == order[0] else 0} for nm in names],
         }
+
     ensemble = list(first)
-    weights = {order[0]: 1.0}
-    cur_brier = compute_brier(ensemble, labels)
-    step = 0.05
-    for i in range(1, len(order)):
-        name = order[i]
+    weights: dict[str, float] = {order[0]: 1.0}
+    cur_brier = briers[order[0]]
+    best_single_brier = cur_brier
+    step = STACK_WEIGHT_STEP
+
+    remaining = order[1:]
+    while remaining:
+        band = [nm for nm in remaining if briers[nm] <= best_single_brier + STACK_DIVERSITY_BAND]
+        rest = [nm for nm in remaining if briers[nm] > best_single_brier + STACK_DIVERSITY_BAND]
+        if band:
+            # Diversity-first among the tied: mean |correlation| with the
+            # current weighted ensemble, ascending.
+            def _diversity_key(nm):
+                p = cand_preds[nm]
+                weighted_members = [m for m, w in weights.items() if w > 0]
+                if not weighted_members:
+                    return 0.0
+                corrs = [abs(_correlation(p, cand_preds[m])) for m in weighted_members]
+                return sum(corrs) / len(corrs)
+
+            candidates_sorted = sorted(band, key=lambda nm: (_diversity_key(nm), briers[nm]))
+        else:
+            candidates_sorted = sorted(rest, key=lambda nm: briers[nm])
+        name = candidates_sorted[0]
+        remaining = [nm for nm in remaining if nm != name]
         p = cand_preds[name]
         best_w = 0.0
         best_b = cur_brier
@@ -475,14 +559,62 @@ def build_stacking_weights(cand_preds: dict, labels: list[int]) -> dict:
                 best_b = b
                 best_w = w
             w += step
-        if best_b < cur_brier - 0.0005:
+        if best_b < cur_brier - STACK_MIN_IMPROVEMENT:
             nxt = {k: v * (1 - best_w) for k, v in weights.items()}
             nxt[name] = best_w
             weights = nxt
             ensemble = [(1 - best_w) * e + best_w * p[j] for j, e in enumerate(ensemble)]
             cur_brier = best_b
+
+    # Joint re-optimization: greedy's proportional-shrink is only an
+    # approximation. Coordinate-descent each selected member's weight on the
+    # fine grid (others keep their relative proportions) until no move helps.
+    selected = [nm for nm, w in weights.items() if w > 0]
+    if len(selected) > 1:
+        preds_by_name = {nm: cand_preds[nm] for nm in selected}
+        for _ in range(2):
+            improved = False
+            for nm in selected:
+                others = {m: w for m, w in weights.items() if m != nm and w > 0}
+                other_total = sum(others.values())
+                best_w = weights[nm]
+                best_b = cur_brier
+                w = 0.0
+                while w <= 1.0001:
+                    scale = (1.0 - w) / other_total if other_total > 0 else 1.0
+                    cand_weights = {nm: w}
+                    for m, ww in others.items():
+                        cand_weights[m] = ww * scale
+                    b = compute_brier(_blend_predictions(preds_by_name, cand_weights, selected, n), labels)
+                    if b < best_b - 1e-12:
+                        best_b = b
+                        best_w = w
+                    w += step
+                if abs(best_w - weights[nm]) > 1e-9 and best_b < cur_brier - 1e-12:
+                    cand_weights = {nm: best_w}
+                    for m, ww in others.items():
+                        cand_weights[m] = ww * ((1.0 - best_w) / other_total if other_total > 0 else 1.0)
+                    weights = cand_weights
+                    cur_brier = best_b
+                    improved = True
+            if not improved:
+                break
+        # Renormalize and rebuild the served blend from the final weights.
+        total = sum(weights.values()) or 1.0
+        weights = {k: v / total for k, v in weights.items()}
+        ensemble = _blend_predictions(cand_preds, weights, names, n)
+        cur_brier = compute_brier(ensemble, labels)
+
+    # Honesty floor: never deploy a blend that does not beat the single best
+    # model beyond the noise bar — a redundant blend only adds holdout
+    # overfitting risk for no measured gain.
+    if cur_brier > best_single_brier - STACK_MIN_IMPROVEMENT:
+        weights = {order[0]: 1.0}
+        ensemble = list(cand_preds[order[0]])
+        cur_brier = best_single_brier
+
     total = sum(weights.values()) or 1
-    weight_list = [{"name": n, "weight": roundn((weights.get(n) or 0) / total, 3)} for n in names]
+    weight_list = [{"name": nm, "weight": roundn((weights.get(nm) or 0) / total, 3)} for nm in names]
     return {"preds": ensemble, "brier": cur_brier, "weights": weight_list}
 
 

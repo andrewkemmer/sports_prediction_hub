@@ -34,8 +34,10 @@ from .engine.stack import predict_member, stack_probability
 WF_SELECTION_FILE = "walk_forward_selection.json"
 # Gate configuration is part of the per-date scoring recipe. Bump this when
 # the gate is introduced/changed so pre-gate selection caches cannot silently
-# disable the live abstention layer.
-WF_SELECTION_VERSION = 9
+# disable the live abstention layer. Version 10 adds per-date `gateDetails`
+# (the full compact gate result per game) so the walk-forward calibration
+# backtest can reuse these predictions instead of re-fitting the same models.
+WF_SELECTION_VERSION = 10
 WF_SELECTION_REFIT_DAYS = 7  # candidates share a fit within a block (matches calibration)
 WF_TRAIN_WINDOW = 2000  # rolling window of most-recent prior games for each candidate fit
 WF_MLP_EPOCHS = 20  # the MLP fit dominates backtest CPU; cap it for the repeated walk-forward fits
@@ -349,6 +351,10 @@ def build_walk_forward_selection(report=None, rows=None) -> dict:
             "stackBrier": (current_choice or {}).get("stackBrier"),
             "logisticBrier": (current_choice or {}).get("logisticBrier"),
             "gate": current_gate or default_gate_config(),
+            "gateDetails": [
+                {k: v for k, v in g.items() if k != "gateSignals"}
+                for g in gate_results
+            ],
             "gateAccepted": [g["gateAccepted"] for g in gate_results],
             "gateConcordance": [g["concordance"] for g in gate_results],
             "gateSignalCounts": [g["gateSignalCount"] for g in gate_results],
