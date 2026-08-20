@@ -30,14 +30,13 @@ from .features import (
     build_features_for_game,
     compute_elo_and_features,
 )
-from .ensemble import boosted_stumps_model, weighted_knn_calib_preds, weighted_knn_model
 from .logistic import (
     build_stacking_weights,
     cross_validate,
     logistic_logit,
-    naive_bayes_model,
     train_logistic,
 )
+from .tree_ensemble import rf_model, xgb_model, lgbm_model
 from .markets import normalized_weight_rows
 from .metrics import (
     apply_isotonic,
@@ -529,33 +528,24 @@ def run_model(
             w += 0.05
 
     # 5. Candidate models. The pool deliberately spans model families:
-    #    Elo (pure ratings), regularized logistic at three ridge strengths,
-    #    distance-weighted k-NN, L2-boosted decision stumps, a compact
-    #    two-hidden-layer neural network (MLP), and the blended ensemble.
-    #    Only candidates that clear the AUC floor (CANDIDATE_MIN_AUC) are
-    #    eligible for selection / stacking, so every model the selector
-    #    chooses among is strong; the rest stay visible with an "excluded"
-    #    note for transparency.
-    knn_train = train[-KNN_TRAIN_CAP:] if len(train) > KNN_TRAIN_CAP else train
+    #    regularized logistic (the interpretable backbone), a compact
+    #    two-hidden-layer neural network (MLP), Random Forest, XGBoost, and
+    #    LightGBM.  Only candidates that clear the AUC floor
+    #    (CANDIDATE_MIN_AUC) are eligible for selection / stacking, so every
+    #    model the selector chooses among is strong; the rest stay visible
+    #    with an "excluded" note for transparency.
     lr_strong = train_logistic(train, selected, lambda_=0.1)
-    lr_mid = train_logistic(train, selected, lambda_=0.3)
-    lr_stronger = train_logistic(train, selected, lambda_=1.0)
-    wknn = weighted_knn_model(knn_train, selected)
-    boost = boosted_stumps_model(train, selected)
     nn = mlp_model(train, selected)
-    nb = naive_bayes_model(train, selected)
+    rf = rf_model(train, selected)
+    xgb = xgb_model(train, selected)
+    lgbm = lgbm_model(train, selected)
 
     cand_preds: dict[str, list[float]] = {
-        "Elo rating": [elo_prob(r, elo_hfa) for r in calib],
-        "Logistic regression": [sigmoid(logistic_logit(lr_model, r["features"], None)) for r in calib],
-        "Logistic regression (L2, λ=0.1)": [sigmoid(logistic_logit(lr_strong, r["features"], None)) for r in calib],
-        "Logistic regression (L2, λ=0.3)": [sigmoid(logistic_logit(lr_mid, r["features"], None)) for r in calib],
-        "Logistic regression (L2, λ=1)": [sigmoid(logistic_logit(lr_stronger, r["features"], None)) for r in calib],
-        "Distance-weighted k-NN (k=21)": weighted_knn_calib_preds(knn_train, calib, selected, model=wknn),
-        "Boosted decision stumps": [boost(r["features"]) for r in calib],
+        "Logistic regression": [sigmoid(logistic_logit(lr_strong, r["features"], None)) for r in calib],
         "Neural network (MLP)": [nn(r["features"]) for r in calib],
-        "Gaussian naive Bayes": [nb(r["features"]) for r in calib],
-        "Blended ensemble": [sigmoid((1 - blend_w) * l + blend_w * e) for l, e in zip(lr_logits, elo_logits)],
+        "Random Forest": [rf(r["features"]) for r in calib],
+        "XGBoost": [xgb(r["features"]) for r in calib],
+        "LightGBM": [lgbm(r["features"]) for r in calib],
     }
 
     candidates: list[dict] = []
@@ -1336,16 +1326,11 @@ def fit_candidate_pool(train: list[dict], feature_names: list[str], mlp_epochs: 
     if n == 0:
         return (
             {
-                "Elo rating": lambda f: prior,
                 "Logistic regression": lambda f: prior,
-                "Logistic regression (L2, λ=0.1)": lambda f: prior,
-                "Logistic regression (L2, λ=0.3)": lambda f: prior,
-                "Logistic regression (L2, λ=1)": lambda f: prior,
-                "Distance-weighted k-NN (k=21)": lambda f: prior,
-                "Boosted decision stumps": lambda f: prior,
                 "Neural network (MLP)": lambda f: prior,
-                "Gaussian naive Bayes": lambda f: prior,
-                "Blended ensemble": lambda f: prior,
+                "Random Forest": lambda f: prior,
+                "XGBoost": lambda f: prior,
+                "LightGBM": lambda f: prior,
             },
             30.0,
             0.5,
@@ -1362,15 +1347,11 @@ def fit_candidate_pool(train: list[dict], feature_names: list[str], mlp_epochs: 
                 best_brier = b
                 elo_hfa = hfa
 
-    lr_model = train_logistic(train, feature_names)
     lr_strong = train_logistic(train, feature_names, lambda_=0.1)
-    lr_mid = train_logistic(train, feature_names, lambda_=0.3)
-    lr_stronger = train_logistic(train, feature_names, lambda_=1.0)
-    knn_train = train[-KNN_TRAIN_CAP:] if n > KNN_TRAIN_CAP else train
-    wknn = weighted_knn_model(knn_train, feature_names)
-    boost = boosted_stumps_model(train, feature_names)
     nn = mlp_model(train, feature_names, epochs=mlp_epochs)
-    nb = naive_bayes_model(train, feature_names)
+    rf = rf_model(train, feature_names)
+    xgb = xgb_model(train, feature_names)
+    lgbm = lgbm_model(train, feature_names)
 
     # Blend weight tuned on the trailing 20% of the prior window (chronological
     # holdout) — mirrors run_model's calib-set blend tuning, but stays strictly
@@ -1395,19 +1376,11 @@ def fit_candidate_pool(train: list[dict], feature_names: list[str], mlp_epochs: 
             w += 0.05
 
     predictors = {
-        "Elo rating": lambda r: elo_prob(r, elo_hfa),
-        "Logistic regression": lambda r: sigmoid(logistic_logit(lr_model, r["features"], None)),
-        "Logistic regression (L2, λ=0.1)": lambda r: sigmoid(logistic_logit(lr_strong, r["features"], None)),
-        "Logistic regression (L2, λ=0.3)": lambda r: sigmoid(logistic_logit(lr_mid, r["features"], None)),
-        "Logistic regression (L2, λ=1)": lambda r: sigmoid(logistic_logit(lr_stronger, r["features"], None)),
-        "Distance-weighted k-NN (k=21)": lambda r: wknn(r["features"]),
-        "Boosted decision stumps": lambda r: boost(r["features"]),
+        "Logistic regression": lambda r: sigmoid(logistic_logit(lr_strong, r["features"], None)),
         "Neural network (MLP)": lambda r: nn(r["features"]),
-        "Gaussian naive Bayes": lambda r: nb(r["features"]),
-        "Blended ensemble": lambda r: sigmoid(
-            (1 - blend_w) * logistic_logit(lr_model, r["features"], None)
-            + blend_w * logit(elo_prob(r, elo_hfa))
-        ),
+        "Random Forest": lambda r: rf(r["features"]),
+        "XGBoost": lambda r: xgb(r["features"]),
+        "LightGBM": lambda r: lgbm(r["features"]),
     }
     return predictors, elo_hfa, blend_w
 
@@ -1457,15 +1430,12 @@ def fit_deployable_model(
     lr = train_logistic(rows, selected)
     n = len(rows)
 
-    # Every deployable family (plus the ridge-logistic variants) is retained
-    # for the walk-forward candidate table, even when the per-date selector
-    # picks the pure logistic family. `__stack` keeps the full multi-model
-    # stack so the monitor can show the raw blend alongside the chosen family.
+    # Every deployable family is retained for the walk-forward candidate table,
+    # even when the per-date selector picks the pure logistic family.
+    # `__stack` keeps the full multi-model stack so the monitor can show the
+    # raw blend alongside the chosen family.
     candidate_members = dict(full_members)
     candidate_members["Logistic regression"] = lr
-    candidate_members["Logistic regression (L2, λ=0.1)"] = train_logistic(rows, selected, lambda_=0.1)
-    candidate_members["Logistic regression (L2, λ=0.3)"] = train_logistic(rows, selected, lambda_=0.3)
-    candidate_members["Logistic regression (L2, λ=1)"] = train_logistic(rows, selected, lambda_=1.0)
     candidate_members["__stack"] = {"members": full_members, "weights": full_stack.get("weights", {})}
 
     lr_blend_w = 0.0

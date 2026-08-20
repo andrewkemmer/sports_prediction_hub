@@ -73,11 +73,11 @@ def test_stack_member_diversity() -> None:
     check("five families fitted", len(members) == 5, f"{len(members)}")
     check("logistic backbone keeps the full feature set",
           set(members["Logistic regression"]["featureNames"]) == full)
-    knn_feats = set(members["Distance-weighted k-NN (k=21)"]["featureNames"])
+    rf_feats = set(members["Random Forest"]["featureNames"])
     mlp_feats = set(members["Neural network (MLP)"]["featureNames"])
-    check("kNN member trains on a reduced subset", knn_feats < full and len(knn_feats) >= 3,
-          f"{len(knn_feats)}/{len(full)}")
-    check("family subsets differ", knn_feats != mlp_feats)
+    check("RF member trains on a reduced subset", rf_feats < full and len(rf_feats) >= 3,
+          f"{len(rf_feats)}/{len(full)}")
+    check("family subsets differ", rf_feats != mlp_feats)
     check("structural core retained in every subset",
           all(core <= set(m["featureNames"]) for m in members.values()))
 

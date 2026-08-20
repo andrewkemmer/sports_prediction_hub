@@ -24,20 +24,17 @@ from __future__ import annotations
 import math
 
 from .ensemble import (
-    boosted_stumps_params,
-    boosted_stumps_predict,
     weighted_knn_params,
     weighted_knn_predict,
 )
 from .logistic import (
     build_stacking_weights,
     logistic_logit,
-    naive_bayes_params,
-    naive_bayes_predict,
     train_logistic,
 )
 from .metrics import EPS, clamp, compute_brier, logit, sigmoid
 from .nn import mlp_params, mlp_predict
+from .tree_ensemble import rf_params, rf_predict, xgb_params, xgb_predict, lgbm_params, lgbm_predict
 
 # The five serializable families the deployed stack can blend. Elo is handled
 # separately through blendW (it is already a two-number state, not a fitted
@@ -45,10 +42,10 @@ from .nn import mlp_params, mlp_predict
 # the monitor's stacking weights line up with the deployed members.
 STACK_FAMILIES = [
     "Logistic regression",
-    "Distance-weighted k-NN (k=21)",
-    "Boosted decision stumps",
+    "Random Forest",
     "Neural network (MLP)",
-    "Gaussian naive Bayes",
+    "XGBoost",
+    "LightGBM",
 ]
 
 KNN_K = 21
@@ -56,35 +53,27 @@ KNN_TRAIN_CAP = 1500
 MIN_STACK_TRAIN = 40
 MIN_HOLDOUT = 20
 
+# Per-family feature subsets to decorrelate errors across the stack.
 # Every family below otherwise trains on the *identical* columns, so its
 # errors are near-perfectly correlated with the backbone's — a convex blend
 # then has nothing to contribute and the holdout-tuned weights collapse onto
-# a single member (the greedy forward-selection "deadlock" where several
-# models tie at the same Brier and 100% of the weight goes to the first one).
-# Giving each family a different, overlapping slice of the feature space
-# decorrelates their errors, which is the only reason a blend exists: a
-# family that is weaker overall can still cover games the backbone misreads.
-# The structural core (Elo edge / record) is always kept so no member is
-# starved of the strongest varying signals. `homeField` is retained only when
-# a legacy caller supplies the full schema; production MODEL_FEATURE_KEYS
-# excludes the constant row indicator before fitting. The logistic backbone
-# keeps the FULL active set for compatibility and SHAP output.
-# Keep the structural reference when a caller supplies the legacy full schema;
-# production model matrices use MODEL_FEATURE_KEYS and therefore omit it.
+# a single member.  Giving each family a different, overlapping slice of the
+# feature space decorrelates their errors, which is the only reason a blend
+# exists: a family that is weaker overall can still cover games the backbone
+# misreads.  The structural core (Elo edge / record) is always kept so no
+# member is starved of the strongest varying signals. `homeField` is retained
+# only when a legacy caller supplies the full schema; production
+# MODEL_FEATURE_KEYS excludes the constant row indicator before fitting.  The
+# logistic backbone keeps the FULL active set for compatibility and SHAP
+# output.
 CORE_STACK_FAMILY = ("eloDiff", "winPctDiff", "homeField")
 
 STACK_FAMILY_SUBSETS: dict[str, tuple[str, ...] | None] = {
     # Ratings + recent form + pitching workload: matchup-driven read.
-    "Distance-weighted k-NN (k=21)": (
-        "formDiff", "restDiff", "injuryDiff", "spFipDiff", "spEraDiff",
-        "spK9Diff", "spWhipDiff", "spRecentDiff", "spTrendDiff",
-        "spRestWorkloadDiff",
-    ),
-    # Team offense + lineup construction: lineup-driven read (weak on pitching).
-    "Boosted decision stumps": (
-        "formDiff", "opsDiff", "teamEraDiff", "defEffDiff", "lineupKnown", "lineupOpsDiff",
-        "lineupWobaDiff", "lineupIsoDiff", "lineupHotDiff",
-        "lineupMomentumDiff", "lineupFatigueDiff", "lineupParkInteract",
+    "Random Forest": (
+        "eloDiff", "winPctDiff", "formDiff", "restDiff", "injuryDiff",
+        "spFipDiff", "spEraDiff", "spK9Diff", "spWhipDiff", "spRecentDiff",
+        "spTrendDiff", "spRestWorkloadDiff", "opsDiff", "teamEraDiff",
     ),
     # Pitching-vs-offense interactions + environment: the MLP's nonlinear read.
     "Neural network (MLP)": (
@@ -92,10 +81,20 @@ STACK_FAMILY_SUBSETS: dict[str, tuple[str, ...] | None] = {
         "opsDiff", "teamEraDiff", "defEffDiff", "lineupKnown", "lineupOpsDiff",
         "lineupHotDiff", "parkFactor", "tempDev", "windMph",
     ),
-    # Sparse, independent-stats read (naive-Bayes independence assumption).
-    "Gaussian naive Bayes": (
+    # Gradient-boosted trees excel at nonlinear feature interactions:
+    # lineup + offense + environment gives XGBoost a complementary read.
+    "XGBoost": (
+        "formDiff", "opsDiff", "teamEraDiff", "defEffDiff", "parkFactor",
+        "tempDev", "windMph", "lineupKnown", "lineupOpsDiff",
+        "lineupWobaDiff", "lineupIsoDiff", "lineupHotDiff",
+        "lineupMomentumDiff", "lineupFatigueDiff", "lineupParkInteract",
+    ),
+    # LightGBM sees a different slice: pitching + matchup + rest interactions.
+    "LightGBM": (
         "formDiff", "restDiff", "injuryDiff", "spFipDiff", "spEraDiff",
-        "teamEraDiff", "teamK9Diff", "teamWhipDiff", "defEffDiff",
+        "spK9Diff", "spWhipDiff", "spRecentDiff", "spTrendDiff",
+        "spRestWorkloadDiff", "spFipRestInteract", "eloWinPctInteract",
+        "bvpOpsDiff", "platoonOpsDiff", "vsTeamOpsDiff",
     ),
 }
 
@@ -119,26 +118,23 @@ def fit_stack_members(train: list[dict], feature_names: list[str], mlp_epochs: i
     """Fit every deployable family on `train` and return JSON-safe parameters.
 
     `train` is chronological and prior-only (the caller guarantees no lookahead
-    by construction). k-NN is capped to the most recent KNN_TRAIN_CAP rows so
-    the serialized state stays small and prediction stays fast. `mlp_epochs`
-    lets the repeated walk-forward fits trade a little MLP capacity for a
-    large speedup (the MLP fit dominates backtest CPU); the deployed model
-    keeps the full default.
+    by construction). `mlp_epochs` lets the repeated walk-forward fits trade a
+    little MLP capacity for a large speedup (the MLP fit dominates backtest
+    CPU); the deployed model keeps the full default.
     """
-    knn_train = train[-KNN_TRAIN_CAP:] if len(train) > KNN_TRAIN_CAP else train
     members: dict[str, dict] = {}
     for family in STACK_FAMILIES:
         feats = member_feature_names(feature_names, family)
         if family == "Logistic regression":
             members[family] = train_logistic(train, feats)
-        elif family == "Distance-weighted k-NN (k=21)":
-            members[family] = weighted_knn_params(knn_train, feats, KNN_K)
-        elif family == "Boosted decision stumps":
-            members[family] = boosted_stumps_params(train, feats)
+        elif family == "Random Forest":
+            members[family] = rf_params(train, feats)
         elif family == "Neural network (MLP)":
             members[family] = mlp_params(train, feats, epochs=mlp_epochs)
-        elif family == "Gaussian naive Bayes":
-            members[family] = naive_bayes_params(train, feats)
+        elif family == "XGBoost":
+            members[family] = xgb_params(train, feats)
+        elif family == "LightGBM":
+            members[family] = lgbm_params(train, feats)
     return members
 
 
@@ -169,14 +165,14 @@ def predict_member(name: str, member: dict, features: dict) -> float:
     """Score one serialized ensemble member."""
     if name == "Logistic regression":
         return sigmoid(logistic_logit(member, features, None))
-    if name == "Distance-weighted k-NN (k=21)":
-        return weighted_knn_predict(member, features)
-    if name == "Boosted decision stumps":
-        return boosted_stumps_predict(member, features)
+    if name == "Random Forest":
+        return rf_predict(member, features)
     if name == "Neural network (MLP)":
         return mlp_predict(member, features)
-    if name == "Gaussian naive Bayes":
-        return naive_bayes_predict(member, features)
+    if name == "XGBoost":
+        return xgb_predict(member, features)
+    if name == "LightGBM":
+        return lgbm_predict(member, features)
     raise KeyError(f"unknown stack member: {name}")
 
 

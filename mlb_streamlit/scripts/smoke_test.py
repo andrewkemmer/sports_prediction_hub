@@ -1604,7 +1604,7 @@ def test_automl_pipeline() -> None:
     check("selected model eligible (or relaxed)",
           sel_c is not None and (relaxed or bool(sel_c.get("eligible"))))
     pool_names = [c["name"] for c in result["candidates"]]
-    for want in ("Distance-weighted k-NN (k=21)", "Boosted decision stumps", "Neural network (MLP)", "Logistic regression (L2, λ=1)"):
+    for want in ("Random Forest", "XGBoost", "LightGBM", "Neural network (MLP)", "Logistic regression"):
         check(f"candidate pool includes {want}", want in pool_names, f"{pool_names}")
     check("mc rationale reports the actual sigma grid",
           "0.1" in result["monteCarloRationale"] and "0.6" in result["monteCarloRationale"],
