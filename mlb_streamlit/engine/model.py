@@ -5,9 +5,8 @@ Faithful port of `runModel` from src/convex/ml/model.ts. The pipeline is:
   1. Chronological Elo ratings + as-of-game-time features (no lookahead).
   2. Chronological 70/15/15 split: train / calibrate / test.
   3. Feature selection via greedy backward elimination on the calibrate set.
-  4. Candidate models (5-model pool): Logistic Regression (L2, λ=0.1),
-     Neural Network (MLP), Random Forest, XGBoost, and LightGBM.
-     Only candidates clearing CANDIDATE_MIN_AUC are eligible for stacking.
+  4. Candidate models drawn from the active pipeline configuration;
+     only candidates clearing CANDIDATE_MIN_AUC are eligible for stacking.
   5. Model selection: lexicographic (Brier, -AUC) for best single family;
      greedy-forward selection for the stacked ensemble.
   6. Isotonic calibration (PAV) to reduce Brier / calibration error.
