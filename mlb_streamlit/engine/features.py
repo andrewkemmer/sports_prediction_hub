@@ -19,9 +19,10 @@ ELO_HFA_UPDATE = 30.0  # home advantage baked into Elo updates only
 FEATURE_VERSION = 11  # schedule-clock provenance + same-day state isolation
 
 # Fixed physical scales keep live weather and interaction terms in the same
-# numeric domain as the training matrix. Logistic/MLP/kNN still fit their own
-# train-only z-scores, but these bounds prevent raw API units (°F, mph, innings)
-# from leaking into drift views or dominating non-linear members.
+# numeric domain as the training matrix. Logistic/MLP/RF/XGB/LGBM still fit
+# their own train-only z-scores, but these bounds prevent raw API units
+# (°F, mph, innings) from leaking into drift views or dominating non-linear
+# members. (kNN was a PRUNED legacy family.)
 TEMP_REFERENCE_F = 72.0
 TEMP_SCALE_F = 15.0
 WIND_SCALE_MPH = 15.0

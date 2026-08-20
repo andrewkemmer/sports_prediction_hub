@@ -120,7 +120,12 @@ def fit_stack_members(train: list[dict], feature_names: list[str], mlp_epochs: i
     for family in STACK_FAMILIES:
         feats = member_feature_names(feature_names, family)
         if family == "Logistic regression":
-            members[family] = train_logistic(train, feats)
+            # Canonical production ridge per policy: λ=0.1. Aligns the stack
+            # member with the per-date candidate pool (which already trains
+            # the LR variant at λ=0.1) so the dashboard's "logistic" row is a
+            # single, consistent model rather than a default-ridge vs tuned
+            # mismatch.
+            members[family] = train_logistic(train, feats, lambda_=0.1)
         elif family == "Random Forest":
             members[family] = rf_params(train, feats)
         elif family == "Neural network (MLP)":
@@ -149,15 +154,24 @@ def normalize_stack_weights(weights: dict | None, member_names: list[str] | None
     }
     total = sum(positive.values())
     if total <= 0:
-        if "Logistic regression" in allowed:
-            return {"Logistic regression": 1.0}
+        # Prefer the canonical lambda=0.1 label when allowed; fall back to the
+        # bare logistic name for back-compat.
+        for canon_name in ("Logistic regression (L2, λ=0.1)", "Logistic regression"):
+            if canon_name in allowed:
+                return {canon_name: 1.0}
         return {}
     return {name: value / total for name, value in positive.items()}
 
 
 def predict_member(name: str, member: dict, features: dict) -> float:
-    """Score one serialized ensemble member."""
-    if name == "Logistic regression":
+    """Score one serialized ensemble member.
+
+    The canonical production label for the logistic family is
+    "Logistic regression (L2, λ=0.1)" (per policy); the bare "Logistic regression"
+    alias is also accepted for backward-compat with any consumer that stored
+    under the short name. Both routes hit the same logistic_logit decoder.
+    """
+    if name in ("Logistic regression", "Logistic regression (L2, λ=0.1)"):
         return sigmoid(logistic_logit(member, features, None))
     if name == "Random Forest":
         return rf_predict(member, features)

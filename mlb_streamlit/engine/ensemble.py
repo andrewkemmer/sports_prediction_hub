@@ -1,19 +1,24 @@
-"""Stronger candidate model families for the Auto-ML pool.
+"""DEPRECATED module — pruned families retained only for unit-test coverage.
 
-Two additions beyond the original five candidates:
+The production candidate pool (`engine.stack.STACK_FAMILIES`) is exactly these
+five model families: Logistic regression (lambda=0.1), Random Forest,
+Neural network (MLP), XGBoost, LightGBM. The legacy families below are NO
+LONGER part of production:
 
-  * Distance-weighted k-NN — the k nearest neighbors vote with weight 1/(d+ε)
-    instead of a hard majority, which consistently lifts kNN AUC on dense
-    standardized feature spaces (plain majority kNN tends to sit near 0.60).
-  * L2-boosted decision stumps — shallow (depth-1) regression trees fit to the
-    residuals of the previous ensemble (squared-error boosting, the classic
-    tabular-data baseline). Each stump searches a deterministic random subset
-    of the features, so training is reproducible with a fixed seed and needs
-    only the standard library; numpy (when present) accelerates the split
-    search with prefix sums.
+    * Distance-weighted k-NN (k=21)              -> PRUNED
+    * Boosted decision stumps                    -> PRUNED
+    * Gaussian Naive Bayes                       -> PRUNED
+    * Logistic regression L2 variants at lambda=0.3 / lambda=1 -> PRUNED
 
-Both return a `predict(features) -> probability` closure in the same shape as
-the other candidate models, so the pipeline treats them identically.
+They remain in this module purely so `scripts/smoke_test.py` and
+`scripts/data_pipeline_test.py` can still import their reference names.
+Do NOT add new uses of these families. The dashboard and the walk-forward
+selection pass never evaluate them.
+
+For the production models, see:
+    engine.stack.fit_stack_members   - the canonical 5-family pool
+    engine.model.fit_deployable_model - the deployed wrapper + diagnostics
+    engine.model.fit_candidate_pool  - the walk-forward candidate pool
 """
 
 from __future__ import annotations

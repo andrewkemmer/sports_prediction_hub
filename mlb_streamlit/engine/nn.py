@@ -392,9 +392,11 @@ def mlp_params(
     for f in feature_names:
         vals = [r["features"][f] for r in train]
         stats[f] = {"mean": mean(vals), "std": std(vals) or 1}
-    # Use the same train-only winsorized z-score contract as logistic, kNN,
-    # naive Bayes, and boosted stumps. This prevents a malformed live weather
-    # or workload value from reaching the MLP on a different scale.
+    # Use the same train-only winsorized z-score contract as logistic and the
+    # tree ensembles (RF/XGB/LGBM). (PRUNED families — kNN, naive Bayes, and
+    # boosted stumps — are no longer in the candidate pool.) This prevents a
+    # malformed live weather or workload value from reaching the MLP on a
+    # different scale.
     X = [[zscore(r["features"][f], stats[f]["mean"], stats[f]["std"]) for f in feature_names] for r in train]
 
     rng = random.Random(seed)

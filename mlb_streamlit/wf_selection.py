@@ -61,18 +61,21 @@ L1_MIN_ROWS = 100
 STABILITY_K = 3
 STABILITY_VOTES = 2
 
-# Ordering matches the deployable stack families (engine.stack.STACK_FAMILIES)
-# plus Elo, the ridge-logistic diagnostics, and the raw multi-model blend.
+# Production candidate pool - exactly the 5-model ensemble defined in
+# engine.stack.STACK_FAMILIES, plus the deployed "Multi-model stack" rollup
+# (which is the convex combination of those 5 families, NOT a 6th family).
+#
+# Elo is intentionally NOT included here: per production policy it is a
+# baseline power-ranking used only as an external input for the logistic<->Elo
+# blend weight (`blend_w`). It is never a candidate, never evaluated for AUC,
+# and never passed to the stacker. The legacy families (kNN, boosted stumps,
+# Naive Bayes, redundant λ=0.3 / λ=1 logistic variants) are pruned.
 CANDIDATE_NAMES = [
-    "Elo rating",
-    "Logistic regression",
     "Logistic regression (L2, λ=0.1)",
-    "Logistic regression (L2, λ=0.3)",
-    "Logistic regression (L2, λ=1)",
-    "Distance-weighted k-NN (k=21)",
-    "Boosted decision stumps",
     "Neural network (MLP)",
-    "Gaussian naive Bayes",
+    "Random Forest",
+    "XGBoost",
+    "LightGBM",
     "Multi-model stack",
 ]
 
@@ -147,15 +150,17 @@ def _stabilize_features(current: list[str], history: list[list[str]]) -> list[st
     return [f for f in MODEL_FEATURE_KEYS if f in stable]
 
 
-def _candidate_prediction(name: str, candidate_members: dict, row: dict, elo_hfa: float) -> float:
+def _candidate_prediction(name: str, candidate_members: dict, row: dict, _elo_hfa_unused: float) -> float:
     """Score one diagnostic candidate on a single row from serialized members.
 
-    The ridge-logistic variants are scored with logistic_logit; every other
-    family goes through engine.stack.predict_member. `Multi-model stack` is the
-    raw convex combination of the deployable families (before the Elo blend).
+    `Multi-model stack` is the raw convex combination of the deployable
+    families (NOT a 6th independent model — the deployed prediction). Each of
+    the four ML families routes through engine.stack.predict_member; the
+    logistic regression family routes through logistic_logit so SHAP-style
+    diagnostics stay consistent with the deployed backbone.
+
+    Elo is never a candidate (per production policy), so `elo_hfa` is unused.
     """
-    if name == "Elo rating":
-        return elo_prob(row, elo_hfa)
     if name == "Multi-model stack":
         p = stack_probability(candidate_members.get("__stack"), row["features"])
         return 0.5 if p is None else p
@@ -454,10 +459,16 @@ def build_walk_forward_selection(report=None, rows=None) -> dict:
     # the MLP) can no longer lose the "selected" row to a worse one through an
     # AUC deadlock bar.
     single_cands = [c for c in candidates if c["name"] != "Multi-model stack" and c["eligible"]]
-    best_single_name = (
-        min(single_cands, key=lambda c: (c["brier"], -c["auc"]))["name"]
-        if single_cands else selected_model_name
-    )
+    if single_cands:
+        best_single_name = min(single_cands, key=lambda c: (c["brier"], -c["auc"]))["name"]
+    elif selected_model_name == "Multi-model stack":
+        best_single_name = "Multi-model stack"
+    else:
+        # Pure-logistic deployment with no eligible single family on this
+        # pass: fall back to the canonical lambda=0.1 row label so the
+        # dashboard still has exactly one "selected" candidate and the test
+        # invariant holds.
+        best_single_name = "Logistic regression (L2, λ=0.1)"
     for c in candidates:
         c["selected"] = c["name"] == best_single_name
 

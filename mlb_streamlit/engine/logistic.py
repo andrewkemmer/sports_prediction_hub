@@ -1,6 +1,10 @@
-"""Logistic regression (L2, IRLS), kNN, Naive Bayes, stacking, CV.
+"""Logistic regression (L2 IRLS), L1 LASSO selection, stacking, K-fold CV.
 
-Faithful port of the candidate-model section of src/convex/ml/model.ts.
+Production truth: the logistic-family candidate is trained at L2 ridge
+lambda=0.1 (canonical production ridge per policy). Other L2 lambdas
+(0.3, 1.0) and the legacy kNN / Naive Bayes fits are PRUNED — they
+are not imported by the dashboard pipeline.
+
 """
 
 from __future__ import annotations

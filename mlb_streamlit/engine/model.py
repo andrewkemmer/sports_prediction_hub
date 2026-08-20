@@ -1347,6 +1347,10 @@ def fit_candidate_pool(train: list[dict], feature_names: list[str], mlp_epochs: 
                 best_brier = b
                 elo_hfa = hfa
 
+    # Canonical production logistic ridge per policy: λ=0.1. Train the
+    # LR family at the canonical ridge prior to scoring so the candidate
+    # pool diagnostics reflect the production-mandated ridge, not the
+    # default 0.001 floor.
     lr_strong = train_logistic(train, feature_names, lambda_=0.1)
     nn = mlp_model(train, feature_names, epochs=mlp_epochs)
     rf = rf_model(train, feature_names)
@@ -1427,15 +1431,21 @@ def fit_deployable_model(
     stack, blend_w = fit_stack(rows, selected, elo_hfa, mlp_epochs=mlp_epochs)
     full_stack = stack
     full_members = dict(stack.get("members") or {})
-    lr = train_logistic(rows, selected)
+    # Canonical production logistic ridge per policy: λ=0.1. This is the
+    # single source of truth for the dashboard's Logistic regression row.
+    lr = train_logistic(rows, selected, lambda_=0.1)
     n = len(rows)
 
     # Every deployable family is retained for the walk-forward candidate table,
     # even when the per-date selector picks the pure logistic family.
     # `__stack` keeps the full multi-model stack so the monitor can show the
-    # raw blend alongside the chosen family.
+    # raw blend alongside the chosen family. The candidate key uses the
+    # canonical λ=0.1 label so wf_selection.CANDIDATE_NAMES lookups land
+    # directly on the tuned fit. The bare "Logistic regression" key from the
+    # underlying stack members is intentionally NOT mirrored here, since the
+    # dashboard only ever reads under the canonical label.
     candidate_members = dict(full_members)
-    candidate_members["Logistic regression"] = lr
+    candidate_members["Logistic regression (L2, λ=0.1)"] = lr
     candidate_members["__stack"] = {"members": full_members, "weights": full_stack.get("weights", {})}
 
     lr_blend_w = 0.0
@@ -1467,6 +1477,11 @@ def fit_deployable_model(
         model_choice = "logistic" if lr_brier < stack_brier - 1e-4 else "stack"
 
     if model_choice == "logistic":
+        # Pure-logistic fallback: the deployed stack is a single-member pool.
+        # Use the bare "Logistic regression" key so the per-date selection
+        # round-trip stays consistent with the underlying stack members
+        # (which are keyed under the bare label by fit_stack_members). The
+        # ridge is the canonical λ=0.1 per production policy.
         stack = {"members": {"Logistic regression": lr}, "weights": {"Logistic regression": 1.0}}
         blend_w = lr_blend_w
         lr_member = lr
