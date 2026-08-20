@@ -88,13 +88,17 @@ def _shared_fetch_pool() -> ThreadPoolExecutor:
     return _FETCH_EXECUTOR
 
 
-async def gather_json(urls: list[str], concurrency: int = 6) -> list[dict]:
+async def gather_json(urls: list[str], concurrency: int = 6, soft: bool = False) -> list[dict]:
     """Concurrent JSON fetch using stdlib asyncio + ThreadPoolExecutor.
 
     Falls back to ThreadPoolExecutor-only when `aiohttp` is unavailable
     (Streamlit Cloud free-tier). The `asyncio.gather` loop is bounded by
     `concurrency` so we never open more than `concurrency` sockets at
     once during the network fan-out.
+
+    `soft=True` never raises: a failed URL returns `{}` in its slot so a
+    single flaky endpoint cannot abort the whole batch (matches the old
+    per-item retry-and-zero contract).
     """
     loop = asyncio.get_event_loop()
     pool = _shared_fetch_pool()
@@ -102,29 +106,31 @@ async def gather_json(urls: list[str], concurrency: int = 6) -> list[dict]:
 
     async def _one(url: str) -> dict:
         async with sem:
-            return await loop.run_in_executor(pool, fetch_json, url)
+            fetcher = _soft_fetch_json if soft else fetch_json
+            return await loop.run_in_executor(pool, fetcher, url)
 
     tasks = [_one(u) for u in urls]
     return await asyncio.gather(*tasks, return_exceptions=False)
 
 
-def fetch_json_batch(urls: list[str], concurrency: int = 6) -> list[dict]:
+def fetch_json_batch(urls: list[str], concurrency: int = 6, soft: bool = False) -> list[dict]:
     """Synchronous wrapper around `gather_json` for non-async call sites.
 
     Streams the asyncio loop until all `urls` are fetched in parallel,
     each gated by the `concurrency` semaphore. Returns the deserialized
-    JSON payloads in input order. Raises the first exception if any
-    worker fails (matches the strict-error contract used elsewhere).
+    JSON payloads in input order. With `soft=True`, failures yield `{}`
+    instead of raising.
     """
     if not urls:
         return []
     if len(urls) <= 1:
         # Single request: skip the loop setup cost.
-        return [fetch_json(urls[0])]
+        fetcher = _soft_fetch_json if soft else fetch_json
+        return [fetcher(urls[0])]
     try:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        result = loop.run_until_complete(gather_json(urls, concurrency=concurrency))
+        result = loop.run_until_complete(gather_json(urls, concurrency=concurrency, soft=soft))
         return result
     finally:
         try:
@@ -1058,10 +1064,40 @@ def fetch_injury_snapshots(
     return {str(k): v for k, v in out.items()}
 
 
+def _soft_fetch_json(url: str) -> dict:
+    """fetch_json that never raises — callers treat `{}` as a missing payload.
+
+    The async batch path cannot swallow one bad URL and still return every
+    other row, so the tolerance moves inside the per-URL fetch (identical to
+    the old `fetch_injury_count` contract of returning 0 on failure).
+    """
+    try:
+        return fetch_json(url)
+    except Exception:  # noqa: BLE001
+        return {}
+
+
 def fetch_current_injury_snapshot(team_ids: list[int], d: str, season: str) -> dict:
+    """Current per-team IL counts via the async batch fetcher.
+
+    The refresh fast-path runs this on every click (~30 small roster calls).
+    `fetch_json_batch` fans them out through the shared 8-worker pool with an
+    asyncio semaphore capped at `concurrency=6`, so a 5-minute pipeline
+    becomes a ~1-2 s warm check without spawning extra threads.
+    """
     pairs = sorted(set(tid for tid in team_ids if tid > 0))
-    results = map_limit(pairs, 16, lambda tid: (tid, fetch_injury_count(tid, d, season)))
-    return {tid: count for tid, count in results}
+    urls = [
+        f"{MLB_BASE}/api/v1/teams/{tid}/roster?rosterType=40Man&season={season}&date={d}"
+        for tid in pairs
+    ]
+    payloads = fetch_json_batch(urls, concurrency=6, soft=True)
+    return {
+        tid: sum(
+            1 for entry in (payload.get("roster") or [])
+            if is_injured_status(entry.get("status"))
+        )
+        for tid, payload in zip(pairs, payloads)
+    }
 
 
 # ---------------------------------------------------------------------------

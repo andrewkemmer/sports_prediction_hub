@@ -41,11 +41,13 @@ from mlb_streamlit.engine.metrics import (
     compute_brier,
     evaluate,
 )
+from mlb_streamlit.engine.gating import GATE_VERSION
 from mlb_streamlit.engine.model import CANDIDATE_MIN_AUC
 from mlb_streamlit.engine.teams import team_meta
 from mlb_streamlit.refresh import (
     PREDICTION_VERSION,
     SEASON_START,
+    _data_fingerprint as refresh_data_fingerprint,
     build_walk_forward_calibration_rows_v2 as build_walk_forward_calibration_rows,
     load_bundle,
     power_rankings_as_of,
@@ -76,6 +78,48 @@ def _cached_load_bundle() -> dict | None:
 def _invalidate_bundle_cache() -> None:
     """Drop the session cache right before a reload after refresh/build."""
     _cached_load_bundle.clear()
+
+
+def _ui_data_fingerprint() -> str | None:
+    """SHA256 over the on-disk training state (games + injuries + lineups).
+
+    Reuses `refresh._data_fingerprint` (same digest as the backend fast
+    path), fed from the JSON caches instead of the live MLB Stats API. When
+    the stored model state carries this exact fingerprint, a retrain would
+    reproduce the identical model, so the UI can rehydrate from disk in
+    <1 s instead of walking the 5-minute pipeline.
+    """
+    games = cache.load_games()
+    completed = [
+        g for g in games
+        if g.get("winner") in ("home", "away")
+        and (g.get("home") or {}).get("id") and (g.get("away") or {}).get("id")
+    ]
+    if not completed:
+        return None
+    # Latest cached IL count per team (the live check inside run_refresh may
+    # still differ intraday — a mismatch just falls through to that path).
+    injury: dict = {}
+    for team_key, snaps in (cache.load_injury_snapshots() or {}).items():
+        if snaps:
+            injury[team_key] = max(int(s.get("count") or 0) for s in snaps)
+    lineups = cache.load_lineups() or {}
+    return refresh_data_fingerprint(completed, injury, lineups)
+
+
+def _bundle_is_fresh(state: dict | None, fp: str | None) -> bool:
+    """True when the stored model was trained on exactly today's data.
+
+    Matches the backend fast-path predicate (dataFingerprint + gate
+    version), so the UI gate and the pipeline agree on when a retrain is
+    required.
+    """
+    return bool(
+        fp
+        and state
+        and state.get("dataFingerprint") == fp
+        and (state.get("concordanceGate") or {}).get("version") == GATE_VERSION
+    )
 
 
 
@@ -370,7 +414,31 @@ def rolling_brier_chart(points: list[dict], baseline: float) -> go.Figure:
 # ---------------------------------------------------------------------------
 
 def do_refresh() -> None:
-    """Run the full refresh pipeline with a live progress bar."""
+    """Rehydrate-First refresh: retrain only when the data actually changed.
+
+    1. Compute the current data fingerprint (SHA256 over games/injuries/
+       lineups + feature/selection versions) — a pure disk-cache read.
+    2. If the stored model state was trained on exactly this fingerprint,
+       the trained artifacts are already current: reload the bundle from
+       disk in <1 s, show the fingerprint token, and never touch the
+       5-minute pipeline.
+    3. Only on a fingerprint mismatch does the blocking pipeline run (its
+       internal walk-forward loop is itself cache-first, so a single new
+       game retrains one block, not the season).
+    """
+    fp = _ui_data_fingerprint()
+    state = cache.load_model_state()
+    if _bundle_is_fresh(state, fp):
+        _invalidate_bundle_cache()
+        st.session_state.bundle = _cached_load_bundle()
+        st.session_state.pop("requested_dates", None)
+        st.toast(
+            f"♻️ Model rehydrated from cache · fingerprint `{fp[:16]}…` · "
+            "no retrain needed"
+        )
+        st.rerun()
+        return
+
     bar = st.progress(4, text="Starting refresh…")
 
     def report(stage: str, pct: int, message: str) -> None:
@@ -390,7 +458,8 @@ def do_refresh() -> None:
     bar.progress(100, text="Complete")
     st.toast(
         f"Model refreshed · {fmt_number(summary['gamesTrained'])} games trained · "
-        f"AUC {summary['auc']:.3f} · Brier {summary['brier']:.3f}"
+        f"AUC {summary['auc']:.3f} · Brier {summary['brier']:.3f} · "
+        f"fingerprint `{(fp or 'n/a')[:16]}…`"
     )
     st.rerun()
 
@@ -461,14 +530,15 @@ def render_empty_state() -> None:
             f"<div style='text-align:center;'>"
             f"<div style='display:inline-flex;width:56px;height:56px;border-radius:16px;align-items:center;justify-content:center;"
             f"border:1px solid {ui.BORDER};background:{ui._card_bg()};font-size:26px;'>🔄</div>"
-            f"<h2 style='margin-top:18px;font-size:20px;font-weight:700;color:{ui.TEXT}'>Train your prediction model</h2>"
+            f"<h2 style='margin-top:18px;font-size:20px;font-weight:700;color:{ui.TEXT}'>Rehydrate your prediction model</h2>"
             f"<p style='margin:10px auto 0;max-width:440px;font-size:13px;color:{ui.MUTED};line-height:1.6'>"
-            f"Pull every 2026 regular-season game from the MLB Stats API, fit and calibrate the model, "
-            f"and generate win probabilities for the rest of the season.</p></div>",
+            f"First check the on-disk data fingerprint (SHA256). If the trained artifacts already match today's "
+            f"games, the dashboard rehydrates in under a second — no 5-minute retrain. A fingerprint mismatch "
+            f"pulls new data and retrains only the affected walk-forward blocks.</p></div>",
             unsafe_allow_html=True,
         )
         st.markdown("<div style='height:22px'></div>", unsafe_allow_html=True)
-        if st.button("🔄 Refresh & train model", type="primary", use_container_width=True, key="train_btn"):
+        if st.button("♻️ Rehydrate / refresh model", type="primary", use_container_width=True, key="train_btn"):
             do_refresh()
 
 
