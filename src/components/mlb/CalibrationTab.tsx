@@ -1,10 +1,9 @@
-import { api } from "@/convex/_generated/api";
 import type { CalibrationBin, ConfidencePoint, CurvePoint, ModelStateDoc } from "@/lib/mlb-ui-types";
+import type { GameDoc } from "@/convex/ml/types";
 import { formatNumber, formatPct, formatTrainedAt } from "@/lib/format";
 import { cn } from "@/lib/utils";
-import { useQuery } from "convex/react";
 import { Check, X, Zap } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   Area,
   Bar,
@@ -36,26 +35,17 @@ interface GameResultRow {
   actualMargin?: number;
 }
 
-interface CalibrationQueryResult {
-  metrics: {
-    auc: number;
-    brier: number;
-    logLoss: number;
-    ece: number;
-    bins: CalibrationBin[];
-    confidenceDistribution: ConfidencePoint[];
-    calibrationCurve: CurvePoint[];
-  };
+interface CalibrationTabProps {
+  modelState: ModelStateDoc;
+  gameCards: Record<string, GameDoc>;
+  calibrationBins: CalibrationBin[];
+  confidenceDistribution: ConfidencePoint[];
+  calibrationCurve: CurvePoint[];
   totalsMetrics: { n: number; mae: number; rmse: number; bias: number };
   runLineMetrics: { n: number; auc: number; brier: number; accuracy: number };
-  total: number;
-  correct: number;
-  accuracy: number;
-}
-
-interface CalibrationGamesPage {
-  games: GameResultRow[];
-  cursor: string | null;
+  moneylineTotal: number;
+  moneylineCorrect: number;
+  moneylineAccuracy: number;
 }
 
 type CalibView = "moneyline" | "totals" | "runline";
@@ -107,51 +97,190 @@ function gapColor(gap: number): string {
   return "text-rose-400";
 }
 
-export function CalibrationTab({ modelState }: { modelState: ModelStateDoc }) {
+export function CalibrationTab({
+  modelState,
+  gameCards,
+  calibrationBins,
+  confidenceDistribution,
+  calibrationCurve,
+  totalsMetrics: fullRangeTotalsMetrics,
+  runLineMetrics: fullRangeRunLineMetrics,
+  moneylineTotal,
+  moneylineCorrect,
+  moneylineAccuracy,
+}: CalibrationTabProps) {
   const record = modelState.todaysRecord;
   const trainStart = "2022-03-15";
   const [view, setView] = useState<CalibView>("moneyline");
   const [startDate, setStartDate] = useState(trainStart);
   const [endDate, setEndDate] = useState(modelState.asOfDate);
   const [search, setSearch] = useState("");
-  const [pageCursor, setPageCursor] = useState<string | null>(null);
-  const [nextCursor, setNextCursor] = useState<string | null>(null);
-  const [rows, setRows] = useState<GameResultRow[]>([]);
 
-  const results = useQuery(api.mlb.getCalibrationResults, {
-    startDate,
-    endDate,
-  }) as CalibrationQueryResult | undefined;
+  // ── Client-side calibration game filtering ──────────────────────────────
+  // Convert the flat gameCards map to an array filtered by date range.
+  const allCalibGames = useMemo(() => {
+    const cards = Object.values(gameCards);
+    return cards.filter((g) => {
+      if (!g.date) return false;
+      if (g.date < startDate || g.date > endDate) return false;
+      // Only include completed games with a valid winner
+      return g.winner === "home" || g.winner === "away";
+    });
+  }, [gameCards, startDate, endDate]);
 
-  const gamesPage = useQuery(
-    api.mlb.getCalibrationGames,
-    { startDate, endDate, cursor: pageCursor, limit: 100 },
-  ) as CalibrationGamesPage | undefined;
+  // Compute calibration metrics over the filtered date range.
+  const computedMetrics = useMemo(() => {
+    const preds: number[] = [];
+    const labels: number[] = [];
+    let tN = 0;
+    let tAbs = 0;
+    let tSq = 0;
+    let tBias = 0;
+    const rlPreds: number[] = [];
+    const rlLabels: number[] = [];
 
-  // Reset pagination whenever the selected range changes.
-  useEffect(() => {
-    setRows([]);
-    setPageCursor(null);
-    setNextCursor(null);
-  }, [startDate, endDate]);
+    for (const g of allCalibGames) {
+      preds.push(g.pickProb);
+      labels.push(g.isCorrect ? 1 : 0);
 
-  // Accumulate loaded pages (dedupe by gamePk).
-  useEffect(() => {
-    if (!gamesPage) return;
-    if (pageCursor === null) {
-      setRows(gamesPage.games);
-    } else {
-      setRows((prev) => {
-        const ids = new Set(prev.map((g) => g.gamePk));
-        return [...prev, ...gamesPage.games.filter((g) => !ids.has(g.gamePk))];
-      });
+      const predictedTotal = (g.runProjection as { total?: number } | undefined)?.total;
+      if (typeof predictedTotal === "number") {
+        tN += 1;
+        const actual = (g.away.score ?? 0) + (g.home.score ?? 0);
+        const err = predictedTotal - actual;
+        tAbs += Math.abs(err);
+        tSq += err * err;
+        tBias += err;
+      }
+
+      const homeRunLineProb = (g.runProjection as { homeRunLineProb?: number } | undefined)
+        ?.homeRunLineProb;
+      if (typeof homeRunLineProb === "number") {
+        const margin = (g.home.score ?? 0) - (g.away.score ?? 0);
+        rlPreds.push(homeRunLineProb);
+        rlLabels.push(margin >= 2 ? 1 : 0);
+      }
     }
-    setNextCursor(gamesPage.cursor);
-  }, [gamesPage, pageCursor]);
 
-  const metrics = results?.metrics;
-  const totalsMetrics = results?.totalsMetrics;
-  const runLineMetrics = results?.runLineMetrics;
+    // For the full range, use the pre-computed summary from CDN props
+    const isFullRange =
+      startDate <= trainStart && endDate >= modelState.asOfDate;
+
+    if (isFullRange) {
+      return {
+        metrics: {
+          auc: modelState.auc,
+          brier: modelState.brier,
+          logLoss: modelState.logLoss,
+          ece: modelState.ece,
+          bins: calibrationBins,
+          confidenceDistribution,
+          calibrationCurve,
+        },
+        totalsMetrics: fullRangeTotalsMetrics,
+        runLineMetrics: fullRangeRunLineMetrics,
+        total: moneylineTotal,
+        correct: moneylineCorrect,
+        accuracy: moneylineAccuracy,
+      };
+    }
+
+    // For narrower ranges, compute metrics from the filtered games
+    const total = allCalibGames.length;
+    const correct = allCalibGames.filter((g) => g.isCorrect).length;
+
+    // Simple AUC via trapezoidal rule (replaces server-side computeAuc)
+    let auc = 0;
+    if (preds.length >= 2) {
+      const sorted = preds
+        .map((p, i) => ({ p, l: labels[i] }))
+        .sort((a, b) => a.p - b.p);
+      const pos = sorted.filter((x) => x.l === 1).length;
+      const neg = sorted.length - pos;
+      if (pos > 0 && neg > 0) {
+        let rankSum = 0;
+        let i = 0;
+        while (i < sorted.length) {
+          let j = i;
+          while (j < sorted.length && sorted[j].p === sorted[i].p) j++;
+          const avgRank = (i + j - 1) / 2 + 1;
+          for (let k = i; k < j; k++) {
+            if (sorted[k].l === 1) rankSum += avgRank;
+          }
+          i = j;
+        }
+        auc = (rankSum - (pos * (pos + 1)) / 2) / (pos * neg);
+      }
+    }
+
+    const brier =
+      preds.length > 0
+        ? preds.reduce((s, p, i) => s + (p - labels[i]) ** 2, 0) / preds.length
+        : 0;
+    const logLoss =
+      preds.length > 0
+        ? preds.reduce((s, p, i) => {
+            const pClamped = Math.min(Math.max(p, 1e-15), 1 - 1e-15);
+            return s - (labels[i] * Math.log(pClamped) + (1 - labels[i]) * Math.log(1 - pClamped));
+          }, 0) / preds.length
+        : 0;
+    // ECE
+    const nBins = 8;
+    const bins: CalibrationBin[] = [];
+    for (let b = 0; b < nBins; b++) {
+      const lo = b / nBins;
+      const hi = (b + 1) / nBins;
+      const inBin = preds.map((p, i) => ({ p, l: labels[i] })).filter((x) => x.p >= lo && x.p < hi);
+      if (inBin.length > 0) {
+        const meanP = inBin.reduce((s, x) => s + x.p, 0) / inBin.length;
+        const meanA = inBin.reduce((s, x) => s + x.l, 0) / inBin.length;
+        bins.push({
+          label: `${(lo * 100).toFixed(0)}–${(hi * 100).toFixed(0)}%`,
+          meanPredicted: meanP,
+          meanActual: meanA,
+          count: inBin.length,
+          gap: meanP - meanA,
+        });
+      }
+    }
+
+    return {
+      metrics: {
+        auc,
+        brier,
+        logLoss,
+        ece: bins.length > 0 ? bins.reduce((s, b) => s + Math.abs(b.gap) * b.count, 0) / total : 0,
+        bins,
+        confidenceDistribution: confidenceDistribution,
+        calibrationCurve: calibrationCurve,
+      },
+      totalsMetrics: {
+        n: tN,
+        mae: tN > 0 ? tAbs / tN : 0,
+        rmse: tN > 0 ? Math.sqrt(tSq / tN) : 0,
+        bias: tN > 0 ? tBias / tN : 0,
+      },
+      runLineMetrics: {
+        n: rlPreds.length,
+        auc: 0,
+        brier: 0,
+        accuracy: rlPreds.length > 0
+          ? rlPreds.filter((p, i) => (p >= 0.5 ? 1 : 0) === rlLabels[i]).length / rlPreds.length
+          : 0,
+      },
+      total,
+      correct,
+      accuracy: total > 0 ? correct / total : 0,
+    };
+  }, [
+    allCalibGames, startDate, endDate, modelState, calibrationBins,
+    confidenceDistribution, calibrationCurve, fullRangeTotalsMetrics,
+    fullRangeRunLineMetrics, moneylineTotal, moneylineCorrect, moneylineAccuracy,
+  ]);
+
+  const metrics = computedMetrics.metrics;
+  const totalsMetrics = computedMetrics.totalsMetrics;
+  const runLineMetrics = computedMetrics.runLineMetrics;
   const bins: CalibrationBin[] = metrics?.bins ?? [];
   const distribution = metrics?.confidenceDistribution ?? [];
   const curve = metrics?.calibrationCurve ?? [];
@@ -160,9 +289,9 @@ export function CalibrationTab({ modelState }: { modelState: ModelStateDoc }) {
   const logLoss = metrics?.logLoss ?? modelState.logLoss;
   const ece = metrics?.ece ?? modelState.ece;
 
-  const allGames = rows;
-  const totalGames = results?.total ?? 0;
-  const correctCount = results?.correct ?? 0;
+  const allGames = allCalibGames as unknown as GameResultRow[];
+  const totalGames = computedMetrics.total;
+  const correctCount = computedMetrics.correct;
   const q = search.trim().toLowerCase();
   const filteredGames = q
     ? allGames.filter((g) =>
@@ -170,22 +299,17 @@ export function CalibrationTab({ modelState }: { modelState: ModelStateDoc }) {
       )
     : allGames;
   const visibleGames = filteredGames;
-  const listLoading = gamesPage === undefined && rows.length === 0;
 
   const resetPagination = () => {
-    setRows([]);
-    setPageCursor(null);
-    setNextCursor(null);
+    // No-op: client-side, all games are already loaded
   };
 
   const onStartChange = (v: string) => {
     setStartDate(v);
-    resetPagination();
     if (v && endDate && v > endDate) setEndDate(v);
   };
   const onEndChange = (v: string) => {
     setEndDate(v);
-    resetPagination();
     if (v && startDate && v < startDate) setStartDate(v);
   };
 
@@ -251,7 +375,7 @@ export function CalibrationTab({ modelState }: { modelState: ModelStateDoc }) {
           />
           <span className="text-xs text-muted-foreground">
             {formatNumber(totalGames)} completed game{totalGames === 1 ? "" : "s"} ·{" "}
-            {formatPct(results?.accuracy ?? 0, 1)} accuracy
+            {formatPct(computedMetrics.accuracy, 1)} accuracy
           </span>
         </div>
       </div>
@@ -636,27 +760,13 @@ export function CalibrationTab({ modelState }: { modelState: ModelStateDoc }) {
                     colSpan={view === "moneyline" ? 6 : 5}
                     className="py-8 text-center text-sm text-muted-foreground"
                   >
-                    {listLoading
-                      ? "Loading games…"
-                      : allGames.length === 0
-                        ? "No completed games in this range — adjust the dates or click Refresh."
-                        : "No games match your filter."}
+                    No games found in this range.
                   </td>
                 </tr>
               )}
             </tbody>
           </table>
         </div>
-
-        {nextCursor && (
-          <button
-            type="button"
-            onClick={() => setPageCursor(nextCursor)}
-            className="mt-3 w-full cursor-pointer rounded-lg border border-border/80 bg-white/[0.02] py-2 text-xs font-medium text-blue-400 transition-colors hover:bg-blue-500/10"
-          >
-            Load more games
-          </button>
-        )}
       </div>
     </div>
   );

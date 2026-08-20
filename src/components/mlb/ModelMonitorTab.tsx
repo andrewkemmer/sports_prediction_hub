@@ -1,8 +1,7 @@
-import { api } from "@/convex/_generated/api";
 import type { ModelStateDoc } from "@/lib/mlb-ui-types";
 import { formatMonthDayYear, formatNumber, formatPct } from "@/lib/format";
 import { cn } from "@/lib/utils";
-import { useAction } from "convex/react";
+
 import {
   AlertTriangle,
   BarChart3,
@@ -426,7 +425,6 @@ function CrossValidationPanel({ modelState }: { modelState: ModelStateDoc }) {
 // ---------------------------------------------------------------------------
 
 function AutoMlPanel({ modelState }: { modelState: ModelStateDoc }) {
-  const runAutoMl = useAction(api.mlbRetrain.retrainModel);
   const [running, setRunning] = useState(false);
 
   const [autoSub, setAutoSub] = useState<"features" | "stacking" | "params" | "cv">("features");
@@ -447,20 +445,9 @@ function AutoMlPanel({ modelState }: { modelState: ModelStateDoc }) {
   const sortedFeatures = [...activeFeatures].sort((a, b) => b.importance - a.importance);
 
   const handleRun = async () => {
-    if (running) return;
-    setRunning(true);
-    try {
-      const res = await runAutoMl();
-      toast.success("Auto-ML optimization complete", {
-        description: `Trained on ${formatNumber(res.gamesTrained)} games · Ensemble AUC ${res.auc.toFixed(3)}`,
-      });
-    } catch (e) {
-      toast.error("Auto-ML run failed", {
-        description: e instanceof Error ? e.message : "Unknown error",
-      });
-    } finally {
-      setRunning(false);
-    }
+    toast.info("Auto-ML run", {
+      description: "Auto-ML is not available in CDN mode — refresh to reload the latest pre-computed model.",
+    });
   };
 
   return (
