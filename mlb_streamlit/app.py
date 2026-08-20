@@ -23,6 +23,7 @@ import hashlib
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -196,46 +197,107 @@ def _should_auto_warm() -> bool:
     return _cache_selection_version() != str(WF_SELECTION_VERSION)
 
 
+# Daemon-thread progress store: primitives only, written under the GIL.
+# Streamlit's `st.session_state` is bound to the script-run context
+# (thread-local), so a background daemon thread CANNOT write it reliably —
+# doing so risks `MissingScriptRunContext`. The worker publishes plain ints /
+# strs here; the main UI thread mirrors them into `st.session_state` on every
+# rerun and paints the progress bar (Step A -> Step B hand-off).
+_WARM_STATE: dict = {
+    "pct": 0,
+    "stage": "",
+    "message": "",
+}
+
+
+def _publish_warm(pct: int, stage: str, message: str = "") -> None:
+    """Daemon-thread safe publish (primitives only, never calls st.*).
+
+    Always updates the module store (the reliable channel). Also best-effort
+    mirrors into `st.session_state` so code that reads the session key
+    directly (e.g. `st.session_state.get("warm_progress_pct", 0)`) still sees
+    fresh values on Streamlit builds where session_state writes from a
+    non-main thread are tolerated.
+    """
+    _WARM_STATE["pct"] = int(min(100, max(0, pct)))
+    _WARM_STATE["stage"] = str(stage)
+    _WARM_STATE["message"] = str(message)
+    try:
+        st.session_state["warm_progress_pct"] = _WARM_STATE["pct"]
+        st.session_state["warm_stage"] = _WARM_STATE["stage"]
+        st.session_state["warm_message"] = _WARM_STATE["message"]
+    except Exception:  # noqa: BLE001 — missing script-run context; store covers it
+        pass
+
+
 def _background_warm() -> None:
     """Headless warmer run on a daemon thread (never touches st.*).
 
-    Order matters:
-      1. `run_refresh` makes the data / model-state / calibration artifacts
-         current (its fast path is cheap when the data fingerprint matches).
-      2. If the walk-forward record is STILL stale after that, rebuild it
-         explicitly — the soft-migration layer reuses every day whose
-         per-date fingerprint is byte-identical, so this is seconds when the
-         data is unchanged and only the recipe version moved.
+    Progress comes from the pipeline's own `report(stage, pct, message)`
+    callbacks, rescaled across two phases:
+      Phase 1 (0-70%)  `run_refresh` — fetch / enrich / train / calibrate.
+      Phase 2 (70-100%) walk-forward record rebuild — only when it is STILL
+                       stale after phase 1 (fast-path migration case). The
+                       soft-migration layer reuses every byte-identical day,
+                       so this is seconds when only the recipe version moved.
+
+    Every update flows through `_publish_warm` -> module store -> main thread.
     Any failure is non-fatal: the manual Refresh button remains the fallback.
     """
     try:
         from mlb_streamlit.refresh import run_refresh
         from mlb_streamlit.wf_selection import build_walk_forward_selection
-        run_refresh(report=None)
+
+        def _rep(stage: str, pct: int, message: str, base: int, span: int) -> None:
+            _publish_warm(base + int(span * max(0, min(100, pct)) / 100.0), stage, message)
+
+        _publish_warm(1, "Starting", "Checking data fingerprint…")
+        run_refresh(report=lambda s, p, m: _rep(s, p, m, 0, 70))
         if _should_auto_warm():
-            build_walk_forward_selection()
+            _publish_warm(72, "Walk-forward selection", "Rebuilding engine record (soft migration)…")
+            build_walk_forward_selection(
+                report=lambda s, p, m: _rep(s, p, m, 70, 30)
+            )
+        _publish_warm(100, "Complete", "Engine cache is current")
     except Exception:  # noqa: BLE001 — background warm must never crash the app
-        pass
+        _publish_warm(100, "Warm-up skipped", "Background warm failed — use Refresh")
 
 
 def _manage_auto_warm() -> None:
     """Boot-time self-warm orchestration (one daemon thread per session).
 
-    * Cache current  -> nothing to do.
-    * Cache stale    -> spawn ONE background thread; show a non-blocking
-      info banner; the dashboard keeps rendering with the existing bundle.
-    * Thread done    -> invalidate + reload the bundle so the next render
-      serves the freshly warmed artifacts.
+    Thread-safety contract:
+      * The background daemon thread NEVER touches `st.*` — it only writes
+        primitive markers into `_WARM_STATE` (via `_publish_warm`).
+      * This function runs on the MAIN UI thread on every rerun: it mirrors
+        the store into `st.session_state` (Step A -> B) and paints a live
+        `st.progress` bar. No `st.spinner` over the page, so every tab stays
+        interactive.
+      * The throttled silent auto-rerun (Step C) lives at the END of `main()`
+        so the tabs render and remain clickable between refreshes.
+
+    States:
+      * Cache current  -> nothing to do.
+      * Thread active  -> paint progress bar from the store.
+      * Thread done    -> flip `warm_complete`, invalidate + reload bundle.
     """
     if st.session_state.get("warm_complete"):
         return
     thread = st.session_state.get("warm_thread")
     if thread is not None:
         if thread.is_alive():
-            st.info(
-                "⏳ Background warm-up in progress — training artifacts are "
-                "being rebuilt to the current engine version. The dashboard "
-                "is live with the existing cache and will refresh when done."
+            # Step B: mirror daemon store -> session_state, then paint.
+            pct = int(_WARM_STATE["pct"])
+            st.session_state["warm_progress_pct"] = pct
+            st.session_state["warm_stage"] = _WARM_STATE["stage"]
+            st.session_state["warm_message"] = _WARM_STATE["message"]
+            stage = _WARM_STATE["stage"]
+            msg = _WARM_STATE["message"]
+            detail = f" · {msg}" if msg and msg != stage else ""
+            st.progress(
+                pct / 100.0,
+                text=f"📥 Rebuilding engine cache to v{WF_SELECTION_VERSION}: "
+                     f"{pct}% complete — {stage}{detail}",
             )
             return
         # Thread finished: swap in the freshly written artifacts.
@@ -248,12 +310,28 @@ def _manage_auto_warm() -> None:
         t = threading.Thread(target=_background_warm, name="cache-warm", daemon=True)
         st.session_state["warm_thread"] = t
         t.start()
-        st.info(
-            "⏳ Background warm-up started — the engine cache is being rebuilt "
-            "headlessly (no manual script needed). The UI remains interactive."
+        # First paint immediately so the user sees the bar right away.
+        st.session_state["warm_progress_pct"] = 0
+        st.progress(
+            0.0,
+            text=f"📥 Rebuilding engine cache to v{WF_SELECTION_VERSION}: 0% complete…",
         )
     else:
         st.session_state["warm_complete"] = True
+
+
+def _maybe_auto_rerun_warm() -> None:
+    """Step C: silent, throttled auto-refresh while the warm thread is alive.
+
+    Painted at the END of `main()` (after the tabs render) so the progress
+    bar advances every ~3 s without freezing or greying out the UI. The loop
+    shuts off the instant the thread dies: `warm_complete` flips on the next
+    rerun and the guard is skipped.
+    """
+    thread = st.session_state.get("warm_thread")
+    if thread is not None and thread.is_alive() and not st.session_state.get("warm_complete"):
+        time.sleep(3)   # throttle — avoid CPU burn on the 1 vCPU container
+        st.rerun()
 
 
 def _render_engine_footer() -> None:
@@ -2451,6 +2529,9 @@ def main() -> None:
         calibration_tab(bundle)
     else:
         monitor_tab(bundle)
+
+    # Step C: keep the warm-up progress bar moving without blocking the tabs.
+    _maybe_auto_rerun_warm()
 
 
 main()
