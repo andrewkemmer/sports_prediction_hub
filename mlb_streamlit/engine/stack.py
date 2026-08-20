@@ -23,10 +23,6 @@ from __future__ import annotations
 
 import math
 
-from .ensemble import (
-    weighted_knn_params,
-    weighted_knn_predict,
-)
 from .logistic import (
     build_stacking_weights,
     logistic_logit,
@@ -48,8 +44,6 @@ STACK_FAMILIES = [
     "LightGBM",
 ]
 
-KNN_K = 21
-KNN_TRAIN_CAP = 1500
 MIN_STACK_TRAIN = 40
 MIN_HOLDOUT = 20
 
