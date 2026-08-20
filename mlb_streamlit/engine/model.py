@@ -192,7 +192,7 @@ def compute_feature_drift(rows: list[dict], selected: list[str]) -> list[dict]:
             "currentMean": roundn(c_mean, 3),
             "baselineMean": roundn(b_mean, 3),
             "psi": roundn(psi, 3),
-            "status": "WARN" if psi >= 0.1 else "OK",
+            "status": "ALERT" if psi >= 0.25 else "WARN" if psi >= 0.1 else "OK",
         })
     return out
 

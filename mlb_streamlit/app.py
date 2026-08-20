@@ -2058,8 +2058,9 @@ def monitor_tab(bundle) -> None:
     ui.section("Model & Data Drift Monitor", "Tracking model health, feature drift, and performance over time")
 
     drift = ms.get("featureDrift") or []
+    alerts = [d for d in drift if d["status"] == "ALERT"]
     warns = [d for d in drift if d["status"] == "WARN"]
-    first_warn = warns[0] if warns else None
+    first_issue = (alerts + warns)[0] if (alerts + warns) else None
     trained_at = ms.get("trainedAt", 0)
     now_ms = int(_dt.datetime.now().timestamp() * 1000)
     days_ago = max(0, (now_ms - trained_at) // 86400000) if trained_at else 0
@@ -2070,9 +2071,11 @@ def monitor_tab(bundle) -> None:
          f"Model healthy — {'today' if days_ago == 0 else f'{days_ago} day' + ('s' if days_ago != 1 else '') + ' ago'}", ui.EMERALD),
         (cols[1], ui.ACCENT, "Next Retrain", fmt_trained_at(next_retrain),
          "Nightly schedule — tonight", ui.MUTED),
-        (cols[2], ui.AMBER if warns else ui.EMERALD, "Drift Alerts", f"{len(warns)} Warning" + ("s" if len(warns) != 1 else ""),
-         f"{first_warn['label']} — elevated PSI" if first_warn else "All features stable",
-         ui.AMBER if first_warn else ui.EMERALD),
+        (cols[2], ui.ROSE if alerts else ui.AMBER if warns else ui.EMERALD, "Drift Alerts",
+         (f"{len(alerts)} Alert" + ("s" if len(alerts) != 1 else "") + ", " if alerts else "") +
+         f"{len(warns)} Warning" + ("s" if len(warns) != 1 else ""),
+         f"{first_issue['label']} — {'critical drift' if first_issue['status'] == 'ALERT' else 'elevated PSI'}" if first_issue else "All features stable",
+         ui.ROSE if alerts else ui.AMBER if first_issue else ui.EMERALD),
     ]:
         with col:
             st.markdown(ui.stat_card(dot, label, value, sub_text, sub_color), unsafe_allow_html=True)
@@ -2100,9 +2103,9 @@ def monitor_tab(bundle) -> None:
             f"<span style='color:{ui.TEXT};font-weight:500'>{d['label']}</span>",
             f"<span style='color:{ui.TEXT};font-variant-numeric:tabular-nums'>{d['currentMean']:.3f}</span>",
             f"<span style='color:{ui.MUTED};font-variant-numeric:tabular-nums'>{d['baselineMean']:.3f}</span>",
-            f"<span style='color:{ui.AMBER if d['status'] == 'WARN' else ui.TEXT};font-variant-numeric:tabular-nums'>{d['psi']:.3f}</span>",
-            ui.pill(d["status"], ui.AMBER if d["status"] == "WARN" else ui.EMERALD,
-                    "rgba(252,211,77,0.15)" if d["status"] == "WARN" else "rgba(52,211,153,0.15)"),
+            f"<span style='color:{ui.ROSE if d['status'] == 'ALERT' else ui.AMBER if d['status'] == 'WARN' else ui.TEXT};font-variant-numeric:tabular-nums'>{d['psi']:.3f}</span>",
+            ui.pill(d["status"], ui.ROSE if d["status"] == "ALERT" else ui.AMBER if d["status"] == "WARN" else ui.EMERALD,
+                    "rgba(251,113,133,0.15)" if d["status"] == "ALERT" else "rgba(252,211,77,0.15)" if d["status"] == "WARN" else "rgba(52,211,153,0.15)"),
         ]
         for d in drift
     ]
