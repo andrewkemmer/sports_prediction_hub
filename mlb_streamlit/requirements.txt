@@ -1,6 +1,7 @@
 streamlit>=1.42.0
 plotly>=5.20.0
-xgboost>=1.7.0
-lightgbm>=4.0.0
 numpy>=1.22.0
-# scikit-learn and pandas are intentionally omitted to prevent cloud deployment crashes
+# Heavy C-extension packages (xgboost, lightgbm, scikit-learn) are
+# intentionally omitted: they require compilation tools and frequently
+# timeout or OOM on Streamlit Cloud free-tier builds.  The engine has
+# pure-Python fallback implementations for all three (engine/tree_ensemble.py).
