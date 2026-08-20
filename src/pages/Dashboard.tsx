@@ -189,10 +189,10 @@ function EmptyState({ loading, onRefresh, error }: { loading: boolean; onRefresh
       <div className="flex size-14 items-center justify-center rounded-2xl border border-border bg-card">
         <RefreshCw className="size-6 text-primary" />
       </div>
-      <h2 className="mt-5 text-xl font-bold tracking-tight">Train your prediction model</h2>
+      <h2 className="mt-5 text-xl font-bold tracking-tight">MLB Predictions Dashboard</h2>
       <p className="mt-2 max-w-md text-sm text-muted-foreground">
-        Pull every 2026 regular-season game from the MLB Stats API, fit and calibrate the model,
-        and generate win probabilities for the rest of the season.
+        Loading pre-computed model predictions from the CDN.
+        This may take a moment on first load.
       </p>
       {error && (
         <p className="mt-2 max-w-md text-sm text-rose-400">{error}</p>
@@ -204,7 +204,7 @@ function EmptyState({ loading, onRefresh, error }: { loading: boolean; onRefresh
         className="mt-6 flex cursor-pointer items-center gap-2 rounded-lg bg-primary px-5 py-2.5 text-sm font-semibold text-primary-foreground transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-60"
       >
         <RefreshCw className={cn("size-4", loading && "animate-spin")} />
-        {loading ? "Fetching data…" : "Refresh & train model"}
+        {loading ? "Fetching data…" : "Reload predictions"}
       </button>
     </div>
   );
