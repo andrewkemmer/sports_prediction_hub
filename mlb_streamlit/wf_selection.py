@@ -25,7 +25,7 @@ import math
 from . import cache
 from .data import add_days, attach_as_of_stats, attach_lineups_as_of, et_date_string
 from .engine.features import MODEL_FEATURE_KEYS, FEATURE_KEYS, FEATURE_LABELS, compute_elo_and_features
-from .engine.gating import apply_concordance_gate, default_gate_config, summarize_gate_results, tune_concordance_gate
+from .engine.gating import GATE_VERSION, apply_concordance_gate, default_gate_config, summarize_gate_results, tune_concordance_gate
 from .engine.logistic import cross_validate, logistic_logit, train_logistic_l1
 from .engine.metrics import compute_auc, compute_brier, evaluate, roundn, sigmoid, spearman_rank
 from .engine.model import CANDIDATE_MIN_AUC, apply_model, elo_prob, fit_walk_forward_step, refit_stack_model
@@ -256,7 +256,27 @@ def build_walk_forward_selection(report=None, rows=None) -> dict:
 
     existing_raw = cache.load_json(WF_SELECTION_FILE, {}) or {}
     existing = existing_raw.get("days", {}) if isinstance(existing_raw, dict) and "days" in existing_raw else {}
-    if (existing_raw.get("version") if isinstance(existing_raw, dict) else None) != WF_SELECTION_VERSION:
+    stored_version = (existing_raw.get("version") if isinstance(existing_raw, dict) else None)
+    # ---- Soft version migration (v10 -> v13 and future recipe shifts) ----
+    # A top-level WF_SELECTION_VERSION mismatch no longer discards the entire
+    # historical record. Days are validated GRANULARLY below: each day is
+    # reused only when BOTH of these hold:
+    #   * the day's stored fingerprint equals the fingerprint recomputed from
+    #     the current replay (byte-identical game lines + feature vector), and
+    #   * the day's stored gate config carries the current GATE_VERSION
+    #     (a stale gate must never silently disable the abstention layer).
+    # Days whose feature inputs structurally shifted under the new recipe
+    # recompute a different fp -> that single day refits in place while its
+    # unchanged neighbours are preserved.
+    #
+    # The only remaining hard wipe: when the GATE recipe itself moved
+    # (GATE_VERSION bumped), every stored gate config is stale, so the whole
+    # record must be re-derived.
+    stored_gate_version = None
+    if isinstance(existing_raw, dict):
+        _first_day = next(iter((existing_raw.get("days") or {}).values()), None)
+        stored_gate_version = ((_first_day or {}).get("gate") or {}).get("version")
+    if stored_version != WF_SELECTION_VERSION and stored_gate_version != GATE_VERSION:
         existing = {}
 
     # Amortized O(n) prior-games pointer, matching the calibration build.
@@ -303,7 +323,11 @@ def build_walk_forward_selection(report=None, rows=None) -> dict:
         ).hexdigest()
         fp = hashlib.sha256((prior_hash.hexdigest() + "|" + day_hash).encode("utf-8")).hexdigest()
         cached_day = existing.get(d)
-        if cached_day and cached_day.get("fp") == fp:
+        if (
+            cached_day
+            and cached_day.get("fp") == fp
+            and ((cached_day.get("gate") or {}).get("version") == GATE_VERSION)
+        ):
             out[d] = cached_day
             last_features = cached_day.get("features") or last_features
             last_gate = cached_day.get("gate") or last_gate
