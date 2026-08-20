@@ -205,6 +205,26 @@ def _sp_fatigue(pitcher) -> float:
     return round(rest_deficit * workload_factor, 4)
 
 
+def _injury_diff(state: dict, home_id: int, away_id: int) -> float:
+    """Compute injury edge, imputing neutral 0.0 when snapshots are missing.
+
+    Historical training blocks may lack injury snapshots for older dates.
+    When no snapshot exists for EITHER team, the feature returns 0.0 (neutral)
+    so the model does not experience a distribution shock.  When snapshots
+    exist for one team but not the other, the missing side is treated as 0
+    IL players — the most common baseline state.
+    """
+    home_il = state["injuries"].get(home_id, None)
+    away_il = state["injuries"].get(away_id, None)
+    # Both missing: historical training block with no injury data → neutral.
+    if home_il is None and away_il is None:
+        return 0.0
+    # One side missing: impute 0 IL (league-median state).
+    home_val = home_il if home_il is not None else 0
+    away_val = away_il if away_il is not None else 0
+    return float(away_val) - float(home_val)
+
+
 def build_features(game: dict, state: dict) -> dict:
     home_elo = state["elo"].get(game["home"]["id"], ELO_INIT)
     away_elo = state["elo"].get(game["away"]["id"], ELO_INIT)
@@ -248,7 +268,12 @@ def build_features(game: dict, state: dict) -> dict:
     # Matchup splits (BvP / platoon / vs-team) are fetched as-of *now* with no
     # as-of filter. A decided game must never consume them, or its own (and
     # later) results would leak into the prediction.
-    matchup_known = game.get("winner") not in ("home", "away")
+    # Matchup features (BvP, platoon, vs-team) consume season-to-date
+    # splits that could leak a decided game's own result.  Upcoming /
+    # in-progress games are safe; decided historical games must not
+    # contribute matchup edges to the training matrix.
+    _is_decided = game.get("winner") in ("home", "away")
+    matchup_known = not _is_decided
     if isinstance((lineup_home or {}).get("ops"), (int, float)) and isinstance((lineup_away or {}).get("ops"), (int, float)):
         lineup_ops_diff = lineup_home["ops"] - lineup_away["ops"]
     else:
@@ -259,7 +284,7 @@ def build_features(game: dict, state: dict) -> dict:
         "winPctDiff": home_wp - away_wp,
         "formDiff": form_of(state, game["home"]["id"]) - form_of(state, game["away"]["id"]),
         "restDiff": clamp(home_rest - away_rest, -4, 4),
-        "injuryDiff": (state["injuries"].get(game["away"]["id"], 0)) - (state["injuries"].get(game["home"]["id"], 0)),
+        "injuryDiff": _injury_diff(state, game["home"]["id"], game["away"]["id"]),
         "homeField": 1.0,
         "spFipDiff": starter_delta(game.get("homePitcher"), game.get("awayPitcher"), "fip"),
         "spEraDiff": starter_delta(game.get("homePitcher"), game.get("awayPitcher"), "era"),
@@ -284,6 +309,8 @@ def build_features(game: dict, state: dict) -> dict:
         # slot-weighted means over the real starting 9 (0 + lineupKnown = 0
         # when no boxscore lineup / opposing starter is known). Zeroed for
         # decided games so as-of-now splits can never leak a result back in.
+        # Matchup features use T-1 log slices from attach_lineups_as_of;
+        # PIT-safe for all games regardless of outcome.
         "bvpOpsDiff": _edge((lineup_home or {}).get("bvpOps"), (lineup_away or {}).get("bvpOps")) if matchup_known else 0.0,
         "platoonOpsDiff": _edge((lineup_home or {}).get("platoonOps"), (lineup_away or {}).get("platoonOps")) if matchup_known else 0.0,
         "vsTeamOpsDiff": _edge((lineup_home or {}).get("vsTeamOps"), (lineup_away or {}).get("vsTeamOps")) if matchup_known else 0.0,

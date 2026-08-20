@@ -1608,7 +1608,98 @@ def attach_lineups_as_of(
         # the signature but cannot authorize a final boxscore.
         lu = lineups.get(g["gamePk"]) or lineups.get(str(g["gamePk"]))
         if not is_pregame_lineup_snapshot(lu, g):
-            out[i] = g
+            # Fallback: for completed games without strict pre-game provenance,
+            # still compute lineup stats from whatever batting order is available
+            # (boxscore data).  Mark known=False so downstream consumers can
+            # distinguish pre-game cards from fallback boxscore data.
+            # Only used for historical training (pregame_only=False) so live
+            # dashboard calls with the default pregame_only=True still exclude
+            # unprovenanced boxscore data.
+            if (
+                not pregame_only
+                and isinstance(lu, dict)
+                and ((lu.get("home") or {}).get("battingOrder")
+                      or (lu.get("away") or {}).get("battingOrder"))
+            ):
+                season_fb = g.get("season")
+                ymd_fb = g["date"]
+                lineup_provenance_fb = dict(_lineup_provenance(lu))
+
+                def _fallback_batter(p, team_id, opponent_id, starter):
+                    target_hand = (starter or {}).get("pitchHand")
+                    stats = _batter_prefix(
+                        batter_logs.get(f"{p['id']}|{season_fb}"),
+                        ymd_fb, bacc, f"{p['id']}|{season_fb}",
+                        team_id=team_id, opponent_id=opponent_id,
+                        pitcher_id=(starter or {}).get("id"),
+                        contexts={**contexts, "targetHand": target_hand},
+                    )
+                    return {
+                        **p,
+                        "ops": stats["ops"],
+                        "woba": stats["woba"],
+                        "iso": stats["iso"],
+                        "recentOps": stats["recentOps"],
+                        "momentum": stats["momentum"],
+                        "games7": stats["games7"],
+                        "bvpOps": stats["bvpOps"],
+                        "bvpPA": stats["bvpPA"],
+                        "platoonOps": stats["platoonOps"],
+                        "vsTeamOps": stats["vsTeamOps"],
+                    }
+
+                def _fallback_side(side, team_id, opp_id, starter):
+                    if not side:
+                        return side
+                    return {
+                        "battingOrder": [_fallback_batter(p, team_id, opp_id, starter) for p in side["battingOrder"]],
+                        "bench": [_fallback_batter(p, team_id, opp_id, starter) for p in side["bench"]],
+                    }
+
+                home_fb = _fallback_side(
+                    lu.get("home"), (g.get("home") or {}).get("id"),
+                    (g.get("away") or {}).get("id"), g.get("awayPitcher"),
+                )
+                away_fb = _fallback_side(
+                    lu.get("away"), (g.get("away") or {}).get("id"),
+                    (g.get("home") or {}).get("id"), g.get("homePitcher"),
+                )
+                home_ops_fb = lineup_ops(home_fb["battingOrder"]) if home_fb else 0.0
+                away_ops_fb = lineup_ops(away_fb["battingOrder"]) if away_fb else 0.0
+                home_known_fb = bool(home_fb and any(isinstance(p.get("ops"), (int, float)) for p in home_fb["battingOrder"]))
+                away_known_fb = bool(away_fb and any(isinstance(p.get("ops"), (int, float)) for p in away_fb["battingOrder"]))
+                out[i] = {
+                    **g,
+                    "lineups": {"home": home_fb, "away": away_fb, "provenance": lineup_provenance_fb},
+                    "lineupStats": {
+                        "home": {
+                            "known": False,
+                            "ops": home_ops_fb,
+                            "woba": _lineup_weighted(home_fb["battingOrder"], "woba") if home_known_fb else 0.0,
+                            "iso": _lineup_weighted(home_fb["battingOrder"], "iso") if home_known_fb else 0.0,
+                            "recentOps": _lineup_weighted(home_fb["battingOrder"], "recentOps") if home_known_fb else 0.0,
+                            "momentum": _lineup_weighted(home_fb["battingOrder"], "momentum") if home_known_fb else 0.0,
+                            "games7": _lineup_weighted(home_fb["battingOrder"], "games7") if home_known_fb else 0.0,
+                            "bvpOps": matchup_lineup_mean(home_fb["battingOrder"], "bvpOps", "bvpPA") if home_known_fb else 0.0,
+                            "platoonOps": matchup_lineup_mean(home_fb["battingOrder"], "platoonOps") if home_known_fb else 0.0,
+                            "vsTeamOps": matchup_lineup_mean(home_fb["battingOrder"], "vsTeamOps") if home_known_fb else 0.0,
+                        },
+                        "away": {
+                            "known": False,
+                            "ops": away_ops_fb,
+                            "woba": _lineup_weighted(away_fb["battingOrder"], "woba") if away_known_fb else 0.0,
+                            "iso": _lineup_weighted(away_fb["battingOrder"], "iso") if away_known_fb else 0.0,
+                            "recentOps": _lineup_weighted(away_fb["battingOrder"], "recentOps") if away_known_fb else 0.0,
+                            "momentum": _lineup_weighted(away_fb["battingOrder"], "momentum") if away_known_fb else 0.0,
+                            "games7": _lineup_weighted(away_fb["battingOrder"], "games7") if away_known_fb else 0.0,
+                            "bvpOps": matchup_lineup_mean(away_fb["battingOrder"], "bvpOps", "bvpPA") if away_known_fb else 0.0,
+                            "platoonOps": matchup_lineup_mean(away_fb["battingOrder"], "platoonOps") if away_known_fb else 0.0,
+                            "vsTeamOps": matchup_lineup_mean(away_fb["battingOrder"], "vsTeamOps") if away_known_fb else 0.0,
+                        },
+                    },
+                }
+            else:
+                out[i] = g
             continue
         season = g.get("season")
         ymd = g["date"]
@@ -1678,6 +1769,9 @@ def attach_lineups_as_of(
                     "recentOps": _lineup_weighted(home["battingOrder"], "recentOps") if home_known else 0.0,
                     "momentum": _lineup_weighted(home["battingOrder"], "momentum") if home_known else 0.0,
                     "games7": _lineup_weighted(home["battingOrder"], "games7") if home_known else 0.0,
+                    "bvpOps": matchup_lineup_mean(home["battingOrder"], "bvpOps", "bvpPA") if home_known else 0.0,
+                    "platoonOps": matchup_lineup_mean(home["battingOrder"], "platoonOps") if home_known else 0.0,
+                    "vsTeamOps": matchup_lineup_mean(home["battingOrder"], "vsTeamOps") if home_known else 0.0,
                 },
                 "away": {
                     "known": away_known,
@@ -1687,6 +1781,9 @@ def attach_lineups_as_of(
                     "recentOps": _lineup_weighted(away["battingOrder"], "recentOps") if away_known else 0.0,
                     "momentum": _lineup_weighted(away["battingOrder"], "momentum") if away_known else 0.0,
                     "games7": _lineup_weighted(away["battingOrder"], "games7") if away_known else 0.0,
+                    "bvpOps": matchup_lineup_mean(away["battingOrder"], "bvpOps", "bvpPA") if away_known else 0.0,
+                    "platoonOps": matchup_lineup_mean(away["battingOrder"], "platoonOps") if away_known else 0.0,
+                    "vsTeamOps": matchup_lineup_mean(away["battingOrder"], "vsTeamOps") if away_known else 0.0,
                 },
             },
         }

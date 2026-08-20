@@ -1248,6 +1248,9 @@ def test_as_of_pointer_equiv() -> None:
                     "recentOps": data._lineup_weighted(order, "recentOps") if known else 0.0,
                     "momentum": data._lineup_weighted(order, "momentum") if known else 0.0,
                     "games7": data._lineup_weighted(order, "games7") if known else 0.0,
+                    "bvpOps": data.matchup_lineup_mean(order, "bvpOps", "bvpPA") if known else 0.0,
+                    "platoonOps": data.matchup_lineup_mean(order, "platoonOps") if known else 0.0,
+                    "vsTeamOps": data.matchup_lineup_mean(order, "vsTeamOps") if known else 0.0,
                 }
 
             out.append({
