@@ -7,7 +7,7 @@ import { GamesTab } from "@/components/mlb/GamesTab";
 import { ModelMonitorTab } from "@/components/mlb/ModelMonitorTab";
 import { PowerRankingsTab } from "@/components/mlb/PowerRankingsTab";
 import { Progress } from "@/components/ui/progress";
-import { LogOut, RefreshCw } from "lucide-react";
+import { LogOut, RefreshCw, Loader2 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 import { cn } from "@/lib/utils";
@@ -57,7 +57,7 @@ export default function Dashboard() {
   const [dateLoading, setDateLoading] = useState(false);
 
   // Games for the selected date, sourced from CDN
-  const games = payload?.gamesByDate[selectedDate] ?? undefined;
+  const games = payload?.gamesByDate?.[selectedDate] ?? undefined;
   const loading = cdnLoading || dateLoading;
 
   // Stable empty set for date-request guard
@@ -86,6 +86,21 @@ export default function Dashboard() {
   const handleSignOut = async () => {
     await signOut();
   };
+
+  // ── Loading / error guard ──────────────────────────────────────────────
+  // Block all downstream rendering until the CDN payload has finished
+  // downloading. Without this guard, child components attempt to iterate
+  // over undefined arrays (e.g. payload.gamesByDate) and crash.
+  if (cdnLoading && !payload) {
+    return (
+      <main className="min-h-screen bg-background text-foreground">
+        <div className="flex min-h-[60vh] flex-col items-center justify-center text-center">
+          <Loader2 className="size-8 animate-spin text-primary" />
+          <p className="mt-4 text-sm text-muted-foreground">Loading dashboard data…</p>
+        </div>
+      </main>
+    );
+  }
 
   return (
     <main className="min-h-screen bg-background text-foreground">
@@ -162,18 +177,18 @@ export default function Dashboard() {
             {tab === "calibration" && payload && (
               <CalibrationTab
                 modelState={modelState as unknown as ModelStateDoc}
-                gameCards={payload.gameCards}
-                calibrationBins={payload.calibrationBins}
-                confidenceDistribution={payload.confidenceDistribution}
-                calibrationCurve={payload.calibrationCurve}
-                totalsMetrics={payload.totalsMetrics}
-                runLineMetrics={payload.runLineMetrics}
-                moneylineTotal={payload.moneylineTotal}
-                moneylineCorrect={payload.moneylineCorrect}
-                moneylineAccuracy={payload.moneylineAccuracy}
+                gameCards={payload?.gameCards ?? {}}
+                calibrationBins={payload?.calibrationBins ?? []}
+                confidenceDistribution={payload?.confidenceDistribution ?? []}
+                calibrationCurve={payload?.calibrationCurve ?? []}
+                totalsMetrics={payload?.totalsMetrics ?? { n: 0, mae: 0, rmse: 0, bias: 0 }}
+                runLineMetrics={payload?.runLineMetrics ?? { n: 0, auc: 0, brier: 0, accuracy: 0 }}
+                moneylineTotal={payload?.moneylineTotal ?? 0}
+                moneylineCorrect={payload?.moneylineCorrect ?? 0}
+                moneylineAccuracy={payload?.moneylineAccuracy ?? 0}
               />
             )}
-            {tab === "monitor" && (
+            {tab === "monitor" && modelState && (
               <ModelMonitorTab modelState={modelState as unknown as ModelStateDoc} />
             )}
           </>
