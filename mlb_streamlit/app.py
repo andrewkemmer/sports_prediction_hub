@@ -19,7 +19,10 @@ Run:  pip install -r mlb_streamlit/requirements.txt
 from __future__ import annotations
 
 import datetime as _dt
+import hashlib
+import subprocess
 import sys
+import threading
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -44,6 +47,7 @@ from mlb_streamlit.engine.metrics import (
 from mlb_streamlit.engine.gating import GATE_VERSION
 from mlb_streamlit.engine.model import CANDIDATE_MIN_AUC
 from mlb_streamlit.engine.teams import team_meta
+from mlb_streamlit.wf_selection import WF_SELECTION_VERSION
 from mlb_streamlit.refresh import (
     PREDICTION_VERSION,
     SEASON_START,
@@ -121,6 +125,144 @@ def _bundle_is_fresh(state: dict | None, fp: str | None) -> bool:
         and (state.get("concordanceGate") or {}).get("version") == GATE_VERSION
     )
 
+
+# ---------------------------------------------------------------------------
+# DevOps safety rails: self-warming boot + engine version footer
+# ---------------------------------------------------------------------------
+
+_ENGINE_SOURCE_FILES = (
+    "mlb_streamlit/app.py",
+    "mlb_streamlit/refresh.py",
+    "mlb_streamlit/wf_selection.py",
+    "mlb_streamlit/engine/model.py",
+    "mlb_streamlit/engine/stack.py",
+    "mlb_streamlit/engine/calib_wf.py",
+    "mlb_streamlit/engine/features.py",
+)
+
+
+def _app_hash() -> str:
+    """Deterministic SHA256 over the engine source files.
+
+    This is the "App Hash" for the sidebar footer. It changes whenever any
+    shipped .py module changes, so it works even when Streamlit Cloud's
+    build does not ship the `.git` directory.
+    """
+    h = hashlib.sha256()
+    root = Path(__file__).resolve().parent.parent
+    for rel in _ENGINE_SOURCE_FILES:
+        try:
+            h.update((root / rel).read_bytes())
+        except OSError:
+            h.update(b"missing")
+    return h.hexdigest()
+
+
+def _current_git_commit() -> str:
+    """Best-effort short git SHA, falling back to the source-file hash.
+
+    Lets the developer verify with 100% certainty whether Streamlit Cloud
+    compiled the latest code: if the sidebar hash differs from a fresh local
+    `git rev-parse --short HEAD`, the deployed bundle is stale.
+    """
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=2,
+            cwd=str(Path(__file__).resolve().parent.parent),
+        )
+        if out.returncode == 0 and out.stdout.strip():
+            return out.stdout.strip()
+    except Exception:  # noqa: BLE001 — git missing in the build container
+        pass
+    return _app_hash()[:7]
+
+
+def _cache_selection_version() -> str:
+    """The walk-forward recipe version stamped on disk (or '?' when absent)."""
+    raw = cache.load_json("walk_forward_selection.json", {}) or {}
+    if not isinstance(raw, dict):
+        return "?"
+    return str(raw.get("version", "?"))
+
+
+def _should_auto_warm() -> bool:
+    """True when the on-disk walk-forward record is absent or stale.
+
+    A mismatch (or missing record) is exactly the state that used to force a
+    blocking 5-minute replay on the first refresh. With the background warm
+    thread below, that work happens headlessly while the UI stays live.
+    """
+    return _cache_selection_version() != str(WF_SELECTION_VERSION)
+
+
+def _background_warm() -> None:
+    """Headless warmer run on a daemon thread (never touches st.*).
+
+    Order matters:
+      1. `run_refresh` makes the data / model-state / calibration artifacts
+         current (its fast path is cheap when the data fingerprint matches).
+      2. If the walk-forward record is STILL stale after that, rebuild it
+         explicitly — the soft-migration layer reuses every day whose
+         per-date fingerprint is byte-identical, so this is seconds when the
+         data is unchanged and only the recipe version moved.
+    Any failure is non-fatal: the manual Refresh button remains the fallback.
+    """
+    try:
+        from mlb_streamlit.refresh import run_refresh
+        from mlb_streamlit.wf_selection import build_walk_forward_selection
+        run_refresh(report=None)
+        if _should_auto_warm():
+            build_walk_forward_selection()
+    except Exception:  # noqa: BLE001 — background warm must never crash the app
+        pass
+
+
+def _manage_auto_warm() -> None:
+    """Boot-time self-warm orchestration (one daemon thread per session).
+
+    * Cache current  -> nothing to do.
+    * Cache stale    -> spawn ONE background thread; show a non-blocking
+      info banner; the dashboard keeps rendering with the existing bundle.
+    * Thread done    -> invalidate + reload the bundle so the next render
+      serves the freshly warmed artifacts.
+    """
+    if st.session_state.get("warm_complete"):
+        return
+    thread = st.session_state.get("warm_thread")
+    if thread is not None:
+        if thread.is_alive():
+            st.info(
+                "⏳ Background warm-up in progress — training artifacts are "
+                "being rebuilt to the current engine version. The dashboard "
+                "is live with the existing cache and will refresh when done."
+            )
+            return
+        # Thread finished: swap in the freshly written artifacts.
+        st.session_state["warm_complete"] = True
+        _invalidate_bundle_cache()
+        st.session_state.bundle = _cached_load_bundle()
+        st.toast("♻️ Cache warmed to the current engine version in the background.")
+        return
+    if _should_auto_warm():
+        t = threading.Thread(target=_background_warm, name="cache-warm", daemon=True)
+        st.session_state["warm_thread"] = t
+        t.start()
+        st.info(
+            "⏳ Background warm-up started — the engine cache is being rebuilt "
+            "headlessly (no manual script needed). The UI remains interactive."
+        )
+    else:
+        st.session_state["warm_complete"] = True
+
+
+def _render_engine_footer() -> None:
+    """Sidebar engineering header — eliminates stale-deployment confusion."""
+    st.sidebar.caption(
+        f"Engine Version: v{WF_SELECTION_VERSION} | "
+        f"App Hash: {_current_git_commit()[:7]} | "
+        f"WF Cache: v{_cache_selection_version()}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2272,6 +2414,12 @@ def monitor_tab(bundle) -> None:
 def main() -> None:
     if "bundle" not in st.session_state:
         st.session_state.bundle = _cached_load_bundle()
+
+    # DevOps safety rail: self-warm on boot when the on-disk recipe version
+    # is stale (background thread, non-blocking). May swap in a fresh bundle
+    # after the warm thread completes.
+    _manage_auto_warm()
+    _render_engine_footer()
 
     # Auto-ML button sets this flag (callbacks cannot render a progress bar);
     # run the pipeline here in the main flow, then rerun to show fresh results.
