@@ -13,7 +13,7 @@ import type { ModelStateDoc } from "@/lib/mlb-ui-types";
 // Replace this with the actual raw.githubusercontent.com URL pointing to
 // the pre-computed JSON artifact (produced by the Python backend's export
 // step). The JSON shape must match CdnPayload below.
-export const CDN_URL = "https://githubusercontent.com";
+export const CDN_URL = "https://raw.githubusercontent.com/andrewkemmer/sports_prediction_hub/main/mlb_streamlit/cache/dashboard_payload.json";
 
 // ─── CDN payload shape ──────────────────────────────────────────────────
 // This is the top-level JSON structure the CDN endpoint returns.
