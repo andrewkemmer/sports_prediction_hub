@@ -1,20 +1,6 @@
-# MLB Predictions — Streamlit dashboard runtime
-#
-# The entire data + ML engine runs on the Python standard library; only the
-# UI layer needs these packages.
-
-streamlit>=1.42.0      # st.segmented_control (1.42+) / st.container(border=True) / st.toast
-plotly>=5.20.0         # calibration & rolling-Brier charts
-
-# Optional accelerator used by engine/model.py; the engine falls back to
-# pure Python when numpy is not installed.
-numpy>=1.24.0
-
-# Optional tree ensemble accelerators — INSTALLED ONLY in Docker or locally.
-# The engine has pure-Python fallback implementations for all three;
-# installing these gives a 10-50x speedup on the candidate-pool training.
-# Streamlit Cloud builds these are excluded to avoid C++ compilation timeouts;
-# add them back in the Docker image or local environment for best performance.
-# scikit-learn>=1.3.0    # RandomForestClassifier
-# xgboost>=2.0.0         # XGBClassifier
-# lightgbm>=4.0.0        # LGBMClassifier
+streamlit>=1.42.0
+plotly>=5.20.0
+xgboost>=1.7.0
+lightgbm>=4.0.0
+numpy>=1.22.0
+# scikit-learn and pandas are intentionally omitted to prevent cloud deployment crashes
