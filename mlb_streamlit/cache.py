@@ -40,7 +40,7 @@ _MARKET_ODDS = "market_odds.json"
 
 # Bump to invalidate stale backtest caches (calibration_rows_wf.json).
 # refresh.py reads this value as its source of truth.
-BACKTEST_CACHE_VERSION = 12
+BACKTEST_CACHE_VERSION = 13
 
 
 def _path(name: str) -> Path:
@@ -231,8 +231,25 @@ def save_pitcher_hands(hands: dict) -> None:
 
 
 def load_lineups() -> dict:
-    """{gamePk} -> parsed lineup, or None for completed games with no posted lineups."""
-    return load_json(_LINEUPS, {}) or {}
+    """Return a lineup cache keyed by integer ``gamePk`` values.
+
+    JSON object keys are always strings on disk.  The schedule parser and the
+    lineup attachers use integer gamePk values, so returning the raw decoded
+    object silently made every cached lineup miss after the first refresh.
+    Normalize at the cache boundary and preserve explicit ``None`` markers for
+    completed games whose boxscore has no lineup.
+    """
+    raw = load_json(_LINEUPS, {}) or {}
+    if not isinstance(raw, dict):
+        return {}
+    normalized: dict = {}
+    for key, value in raw.items():
+        try:
+            normalized[int(key)] = value
+        except (TypeError, ValueError):
+            # Ignore malformed cache keys rather than making every refresh fail.
+            continue
+    return normalized
 
 
 def save_lineups(lineups: dict) -> None:

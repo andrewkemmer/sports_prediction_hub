@@ -24,7 +24,7 @@ import math
 
 from . import cache
 from .data import add_days, attach_as_of_stats, attach_lineups_as_of, et_date_string
-from .engine.features import FEATURE_KEYS, FEATURE_LABELS, compute_elo_and_features
+from .engine.features import MODEL_FEATURE_KEYS, FEATURE_KEYS, FEATURE_LABELS, compute_elo_and_features
 from .engine.gating import apply_concordance_gate, default_gate_config, summarize_gate_results, tune_concordance_gate
 from .engine.logistic import cross_validate, logistic_logit, train_logistic_l1
 from .engine.metrics import compute_auc, compute_brier, evaluate, roundn, sigmoid, spearman_rank
@@ -37,7 +37,7 @@ WF_SELECTION_FILE = "walk_forward_selection.json"
 # disable the live abstention layer. Version 10 adds per-date `gateDetails`
 # (the full compact gate result per game) so the walk-forward calibration
 # backtest can reuse these predictions instead of re-fitting the same models.
-WF_SELECTION_VERSION = 10
+WF_SELECTION_VERSION = 11
 WF_SELECTION_REFIT_DAYS = 7  # candidates share a fit within a block (matches calibration)
 WF_TRAIN_WINDOW = 2000  # rolling window of most-recent prior games for each candidate fit
 WF_MLP_EPOCHS = 20  # the MLP fit dominates backtest CPU; cap it for the repeated walk-forward fits
@@ -77,7 +77,7 @@ CANDIDATE_NAMES = [
 
 # These features are always retained: they are the structural backbone of the
 # model and their out-of-sample signal is stable by construction.
-CORE_FEATURES = ("eloDiff", "homeField", "winPctDiff")
+CORE_FEATURES = ("eloDiff", "winPctDiff")
 
 
 def _l1_selected_features(prior_rows: list[dict], feature_names: list[str]) -> list[str]:
@@ -143,7 +143,7 @@ def _stabilize_features(current: list[str], history: list[list[str]]) -> list[st
             votes[f] = votes.get(f, 0) + 1
     stable = set(current) | {f for f, c in votes.items() if c >= STABILITY_VOTES}
     stable.update(CORE_FEATURES)
-    return [f for f in FEATURE_KEYS if f in stable]
+    return [f for f in MODEL_FEATURE_KEYS if f in stable]
 
 
 def _candidate_prediction(name: str, candidate_members: dict, row: dict, elo_hfa: float) -> float:
@@ -190,7 +190,7 @@ def _load_completed_rows(today: str) -> list[dict]:
                 lineups[int(pk)] = lu
             except (TypeError, ValueError):
                 pass
-    enriched = attach_lineups_as_of(enriched, lineups, cache.load_batter_logs())
+    enriched = attach_lineups_as_of(enriched, lineups, cache.load_batter_logs(), pregame_only=False)
     enriched = [g for g in enriched if (g.get("date") or "") < today]
     return compute_elo_and_features(enriched, cache.load_injury_snapshots(), today)["rows"]
 
@@ -300,7 +300,7 @@ def build_walk_forward_selection(report=None, rows=None) -> dict:
             # Nested feature selection: L1 logistic on prior-only rows, λ tuned
             # by holdout Brier, then a stability vote across the last 3 blocks.
             current_features = _stabilize_features(
-                _l1_selected_features(prior_rows, list(FEATURE_KEYS)), sel_history
+                _l1_selected_features(prior_rows, list(MODEL_FEATURE_KEYS)), sel_history
             )
             sel_history.append(current_features)
             # Nested model selection: fit the deployable stack AND plain logistic
@@ -454,7 +454,7 @@ def build_walk_forward_selection(report=None, rows=None) -> dict:
     # selection (nested: chosen only from games strictly before that date, so no
     # future result influences it). The pooled univariate AUCs below remain as
     # the per-feature importance readout for the monitor.
-    selected_features = last_features or [f for f in FEATURE_KEYS if f in CORE_FEATURES]
+    selected_features = last_features or [f for f in MODEL_FEATURE_KEYS if f in CORE_FEATURES]
     gate_config = last_gate or default_gate_config()
     gate_accepted = accum["gateAccepted"]
     gated_correct = accum["gatedCorrect"]
@@ -566,7 +566,7 @@ def _fallback_selection(today: str, days: int, games: int) -> dict:
         "gamesEvaluated": games,
         "selectedModel": "Logistic + Elo (walk-forward)",
         "modelDescription": "Walk-forward selection pending — not enough completed history yet.",
-        "featureNames": list(FEATURE_KEYS),
+        "featureNames": list(MODEL_FEATURE_KEYS),
         "featureImportances": feature_importances,
         "candidates": [],
         "stackingWeights": [],

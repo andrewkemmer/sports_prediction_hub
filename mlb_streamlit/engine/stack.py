@@ -64,10 +64,14 @@ MIN_HOLDOUT = 20
 # Giving each family a different, overlapping slice of the feature space
 # decorrelates their errors, which is the only reason a blend exists: a
 # family that is weaker overall can still cover games the backbone misreads.
-# The structural core (Elo edge / home field / record) is always kept so no
-# member is ever starved of the strongest signals. The logistic backbone
-# keeps the FULL set so apply_model's SHAP readout stays complete.
-CORE_STACK_FAMILY = ("eloDiff", "homeField", "winPctDiff")
+# The structural core (Elo edge / record) is always kept so no member is
+# starved of the strongest varying signals. `homeField` is retained only when
+# a legacy caller supplies the full schema; production MODEL_FEATURE_KEYS
+# excludes the constant row indicator before fitting. The logistic backbone
+# keeps the FULL active set for compatibility and SHAP output.
+# Keep the structural reference when a caller supplies the legacy full schema;
+# production model matrices use MODEL_FEATURE_KEYS and therefore omit it.
+CORE_STACK_FAMILY = ("eloDiff", "winPctDiff", "homeField")
 
 STACK_FAMILY_SUBSETS: dict[str, tuple[str, ...] | None] = {
     # Ratings + recent form + pitching workload: matchup-driven read.
@@ -78,14 +82,14 @@ STACK_FAMILY_SUBSETS: dict[str, tuple[str, ...] | None] = {
     ),
     # Team offense + lineup construction: lineup-driven read (weak on pitching).
     "Boosted decision stumps": (
-        "formDiff", "opsDiff", "teamEraDiff", "defEffDiff", "lineupOpsDiff",
+        "formDiff", "opsDiff", "teamEraDiff", "defEffDiff", "lineupKnown", "lineupOpsDiff",
         "lineupWobaDiff", "lineupIsoDiff", "lineupHotDiff",
         "lineupMomentumDiff", "lineupFatigueDiff", "lineupParkInteract",
     ),
     # Pitching-vs-offense interactions + environment: the MLP's nonlinear read.
     "Neural network (MLP)": (
         "restDiff", "injuryDiff", "spFipDiff", "spEraDiff", "spK9Diff",
-        "opsDiff", "teamEraDiff", "defEffDiff", "lineupOpsDiff",
+        "opsDiff", "teamEraDiff", "defEffDiff", "lineupKnown", "lineupOpsDiff",
         "lineupHotDiff", "parkFactor", "tempDev", "windMph",
     ),
     # Sparse, independent-stats read (naive-Bayes independence assumption).
@@ -138,6 +142,29 @@ def fit_stack_members(train: list[dict], feature_names: list[str], mlp_epochs: i
     return members
 
 
+def normalize_stack_weights(weights: dict | None, member_names: list[str] | None = None) -> dict[str, float]:
+    """Return one finite, non-negative simplex vector for the stack.
+
+    Weight tuning and JSON round-tripping happen in several layers. Normalize
+    once at the serving boundary so a stale/rounded payload can never make the
+    execution layer treat separate families as independent 100% models.
+    """
+    allowed = list(member_names or (weights or {}).keys())
+    positive = {
+        name: float((weights or {}).get(name, 0.0))
+        for name in allowed
+        if isinstance((weights or {}).get(name, 0.0), (int, float))
+        and math.isfinite(float((weights or {}).get(name, 0.0)))
+        and float((weights or {}).get(name, 0.0)) > 0
+    }
+    total = sum(positive.values())
+    if total <= 0:
+        if "Logistic regression" in allowed:
+            return {"Logistic regression": 1.0}
+        return {}
+    return {name: value / total for name, value in positive.items()}
+
+
 def predict_member(name: str, member: dict, features: dict) -> float:
     """Score one serialized ensemble member."""
     if name == "Logistic regression":
@@ -161,16 +188,16 @@ def stack_probability(stack: dict | None, features: dict) -> float:
     """
     if not stack or not stack.get("members") or not stack.get("weights"):
         return None
-    total_w = 0.0
-    total_p = 0.0
-    for name, weight in stack["weights"].items():
-        if weight <= 0 or name not in stack["members"]:
-            continue
-        p = predict_member(name, stack["members"][name], features)
-        total_w += weight
-        total_p += weight * p
+    weights = normalize_stack_weights(stack.get("weights"), list(stack.get("members", {}).keys()))
+    total_w = sum(weights.values())
     if total_w <= 0:
         return None
+    total_p = 0.0
+    for name, weight in weights.items():
+        if name not in stack["members"]:
+            continue
+        p = predict_member(name, stack["members"][name], features)
+        total_p += weight * p
     return total_p / total_w
 
 
@@ -229,8 +256,7 @@ def fit_stack(train: list[dict], feature_names: list[str], elo_hfa: float = 30.0
             weights_oos[w["name"]] = w["weight"]
     if not weights_oos:
         weights_oos = {"Logistic regression": 1.0}
-    total = sum(weights_oos.values()) or 1.0
-    weights_oos = {k: v / total for k, v in weights_oos.items()}
+    weights_oos = normalize_stack_weights(weights_oos, list(fit_members.keys()))
 
     # Tune the Elo blend against the out-of-sample stack (fit-slice members,
     # holdout games) so the weight never sees the holdout outcomes.
@@ -260,6 +286,5 @@ def fit_stack(train: list[dict], feature_names: list[str], elo_hfa: float = 30.0
         weights["Logistic regression"] = 0.0
     if not weights:
         weights = {"Logistic regression": 1.0}
-    total = sum(weights.values()) or 1.0
-    weights = {k: v / total for k, v in weights.items()}
+    weights = normalize_stack_weights(weights, list(members.keys()))
     return {"members": members, "weights": weights}, blend_w

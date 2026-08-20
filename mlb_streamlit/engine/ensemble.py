@@ -22,7 +22,7 @@ import heapq
 import math
 import random
 
-from .logistic import standardized
+from .logistic import standardized, zscore
 from .metrics import mean, sigmoid, std
 
 try:  # numpy is optional; only used as an accelerator for the stump search
@@ -249,12 +249,31 @@ def boosted_stumps_params(
     be persisted and served later (a deployable ensemble member).
     """
     n = len(train)
+    stats = {
+        f: {
+            "mean": mean([r["features"].get(f, 0.0) for r in train]),
+            "std": std([r["features"].get(f, 0.0) for r in train]) or 1.0,
+        }
+        for f in feature_names
+    }
     if min_leaf is None:
         min_leaf = max(8, n // 40)
     if n < 2 * min_leaf + 2:
-        prior = mean([r["label"] for r in train])
-        return {"prior": prior, "learningRate": learning_rate, "trees": [], "featureNames": list(feature_names)}
-    features = [r["features"] for r in train]
+        prior = mean([r["label"] for r in train]) if train else 0.5
+        return {
+            "prior": prior,
+            "learningRate": learning_rate,
+            "trees": [],
+            "featureNames": list(feature_names),
+            "stats": stats,
+        }
+    # Stumps are sensitive to feature scale just like kNN/MLP.  Fit on the
+    # same train-only, winsorized z-space used by the other stack members and
+    # persist the stats so serving applies the identical transform.
+    features = [
+        {f: zscore(r["features"].get(f, 0.0), stats[f]["mean"], stats[f]["std"]) for f in feature_names}
+        for r in train
+    ]
     labels = [r["label"] for r in train]
     max_features = min(max_features, len(feature_names)) or 1
     rng = random.Random(seed)
@@ -269,14 +288,30 @@ def boosted_stumps_params(
         if stump["feature"] is not None:
             for i in range(n):
                 pred[i] += learning_rate * _stump_predict(stump, features[i])
-    return {"learningRate": learning_rate, "trees": trees, "featureNames": list(feature_names)}
+    return {
+        "learningRate": learning_rate,
+        "trees": trees,
+        "featureNames": list(feature_names),
+        "stats": stats,
+    }
 
 
 def boosted_stumps_predict(params: dict, features_dict: dict) -> float:
     """Predict from serialized boosted_stumps_params (identical math to the
-    closure returned by boosted_stumps_model)."""
+    closure returned by boosted_stumps_model).
+
+    Older cached members without ``stats`` are still readable as raw-feature
+    models; every newly fitted member uses the shared train-only z-score path.
+    """
     if "prior" in params:
         return params["prior"]
+    feature_names = params.get("featureNames") or []
+    stats = params.get("stats") or {}
+    if stats:
+        features_dict = {
+            f: zscore(features_dict.get(f, 0.0), stats[f]["mean"], stats[f]["std"])
+            for f in feature_names
+        }
     s = 0.0
     learning_rate = params["learningRate"]
     for stump in params["trees"]:

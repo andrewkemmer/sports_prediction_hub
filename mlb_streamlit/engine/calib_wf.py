@@ -39,7 +39,7 @@ from ..data import (
     et_date_string,
 )
 from ..wf_selection import load_selection_days
-from .features import FEATURE_KEYS, FEATURE_VERSION, compute_elo_and_features
+from .features import FEATURE_KEYS, FEATURE_VERSION, MODEL_FEATURE_KEYS, compute_elo_and_features
 from .logistic import train_logistic
 from .metrics import logit
 from .model import (
@@ -152,7 +152,7 @@ def build_walk_forward_calibration_rows_v2(
     today = et_date_string()
     if feature_names is None:
         state = cache.load_model_state()
-        feature_names = (state or {}).get("featureNames") or list(FEATURE_KEYS)
+        feature_names = (state or {}).get("featureNames") or list(MODEL_FEATURE_KEYS)
     feature_names = list(feature_names)
     if rows is not None:
         # Reuse the already-computed chronological feature rows (they include
@@ -180,7 +180,7 @@ def build_walk_forward_calibration_rows_v2(
                     lineups[int(pk)] = lu
                 except (TypeError, ValueError):
                     pass
-        enriched = attach_lineups_as_of(enriched, lineups, cache.load_batter_logs(), pregame_only=True)
+        enriched = attach_lineups_as_of(enriched, lineups, cache.load_batter_logs(), pregame_only=False)
         enriched = [g for g in enriched if (g.get("date") or "") < today]
         if not enriched:
             return []

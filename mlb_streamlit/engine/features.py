@@ -16,7 +16,24 @@ ELO_HFA_UPDATE = 30.0  # home advantage baked into Elo updates only
 
 # Bump whenever feature engineering changes so refresh fingerprints and every
 # cached prediction/backtest are invalidated and rebuilt point-in-time.
-FEATURE_VERSION = 7
+FEATURE_VERSION = 9
+
+# Fixed physical scales keep live weather and interaction terms in the same
+# numeric domain as the training matrix. Logistic/MLP/kNN still fit their own
+# train-only z-scores, but these bounds prevent raw API units (°F, mph, innings)
+# from leaking into drift views or dominating non-linear members.
+TEMP_REFERENCE_F = 72.0
+TEMP_SCALE_F = 15.0
+WIND_SCALE_MPH = 15.0
+LINEUP_FATIGUE_GAMES = 7.0
+FATIGUE_REST_DAYS = 4.0
+FATIGUE_WORKLOAD_IP = 18.0
+
+# This dataset is framed as one home-vs-away row per game. `homeField` is a
+# structural reference row indicator (always 1), not a varying observation;
+# it is retained in the serialized schema for compatibility but excluded from
+# PSI/drift statistics below.
+STRUCTURAL_FEATURES = frozenset(("homeField",))
 
 # Canonical feature order (27 features). Every feature is computed as-of the
 # game's own date (no lookahead) and flows into the ML candidate set; greedy
@@ -57,6 +74,11 @@ FEATURE_KEYS = [
     "spFipRestInteract",
     "lineupParkInteract",
 ]
+
+# `homeField` is retained in FEATURE_KEYS for schema/UI compatibility, but it
+# is a constant reference column in this one-row-per-game home perspective and
+# must not enter a fitted statistical matrix alongside the intercept.
+MODEL_FEATURE_KEYS = [f for f in FEATURE_KEYS if f not in STRUCTURAL_FEATURES]
 
 FEATURE_LABELS = {
     "eloDiff": "Elo rating edge",
@@ -154,19 +176,33 @@ def _edge(home, away, lower_better: bool = False) -> float:
     return (away - home) if lower_better else (home - away)
 
 
-def _sp_fatigue(pitcher) -> float:
-    """Short-rest × workload interaction for one starter.
+def _finite_float(value) -> float | None:
+    """Coerce numeric/string API values without admitting NaN or infinities."""
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number == number and abs(number) != float("inf") else None
 
-    Penalty = max(0, 5 - restDays) * inningsInLast3Starts — a well-rested
-    starter (restDays >= 5) pays nothing regardless of workload, and a
-    starter on short rest only pays when he has actually been throwing a lot.
-    0 when either piece is missing (no prior starts -> no fatigue signal).
+
+def _sp_fatigue(pitcher) -> float:
+    """Normalized short-rest × recent-workload interaction in ``[0, 1]``.
+
+    The previous product ``rest deficit * innings`` was unbounded (a starter
+    with a large recent workload could create a 100+ feature value), which
+    made the live interaction distribution incomparable with the baseline.
+    Both factors now use fixed baseball-domain scales and are clipped before
+    multiplication. Missing prior starts remain neutral at zero.
     """
     rest = (pitcher or {}).get("restDays")
     workload = (pitcher or {}).get("workload")
     if not isinstance(rest, (int, float)) or not isinstance(workload, (int, float)):
         return 0.0
-    return max(0.0, 5.0 - rest) * workload
+    rest_deficit = clamp((5.0 - rest) / FATIGUE_REST_DAYS, 0.0, 1.0)
+    workload_factor = clamp(workload / FATIGUE_WORKLOAD_IP, 0.0, 1.0)
+    return round(rest_deficit * workload_factor, 4)
 
 
 def build_features(game: dict, state: dict) -> dict:
@@ -199,8 +235,8 @@ def build_features(game: dict, state: dict) -> dict:
     away_k9 = game["away"].get("k9")
     home_whip = game["home"].get("whip")
     away_whip = game["away"].get("whip")
-    temp_f = (game.get("weather") or {}).get("tempF")
-    wind = (game.get("weather") or {}).get("windMph")
+    temp_f = _finite_float((game.get("weather") or {}).get("tempF"))
+    wind = _finite_float((game.get("weather") or {}).get("windMph"))
 
     # Actual starting-9 / bench data. When lineups are missing (older
     # historical games) the feature defaults to 0 with lineupKnown = 0.
@@ -231,8 +267,13 @@ def build_features(game: dict, state: dict) -> dict:
         "teamEraDiff": (away_team_era - home_team_era) if isinstance(away_team_era, (int, float)) and isinstance(home_team_era, (int, float)) else 0.0,
         "defEffDiff": (home_fielding - away_fielding) if isinstance(home_fielding, (int, float)) and isinstance(away_fielding, (int, float)) else 0.0,
         "parkFactor": PARK_FACTORS.get(game["home"]["id"], 1.0),
-        "tempDev": (temp_f - 72) if isinstance(temp_f, (int, float)) else 0.0,
-        "windMph": wind if isinstance(wind, (int, float)) else 0.0,
+        # Store weather in bounded, dimensionless units. The raw API payload
+        # remains Fahrenheit/mph in the game document; only the model vector is
+        # normalized here so baseline and live feeds share one contract.
+        "tempDev": clamp((temp_f - TEMP_REFERENCE_F) / TEMP_SCALE_F, -3.0, 3.0)
+        if temp_f is not None else 0.0,
+        "windMph": clamp(wind / WIND_SCALE_MPH, 0.0, 3.0)
+        if wind is not None else 0.0,
         "lineupKnown": lineup_known,
         "lineupOpsDiff": lineup_ops_diff,
         "lineupWobaDiff": _edge((lineup_home or {}).get("woba"), (lineup_away or {}).get("woba")),
@@ -258,11 +299,21 @@ def build_features(game: dict, state: dict) -> dict:
         "spTrendDiff": _edge((game.get("homePitcher") or {}).get("trendFip"), (game.get("awayPitcher") or {}).get("trendFip"), True),
         "spRestWorkloadDiff": _edge(_sp_fatigue(game.get("homePitcher")), _sp_fatigue(game.get("awayPitcher")), True),
         "lineupMomentumDiff": _edge((lineup_home or {}).get("momentum"), (lineup_away or {}).get("momentum")),
-        "lineupFatigueDiff": _edge((lineup_home or {}).get("games7"), (lineup_away or {}).get("games7"), True),
+        "lineupFatigueDiff": clamp(
+            _edge((lineup_home or {}).get("games7"), (lineup_away or {}).get("games7"), True)
+            / LINEUP_FATIGUE_GAMES,
+            -1.0,
+            1.0,
+        ),
         # Interaction features (combinations of the point-in-time edges above,
         # so they are themselves strictly prior to first pitch).
         "eloWinPctInteract": ((home_elo - away_elo) / 100) * (home_wp - away_wp),
-        "spFipRestInteract": starter_delta(game.get("homePitcher"), game.get("awayPitcher"), "fip") * clamp(home_rest - away_rest, -4, 4),
+        "spFipRestInteract": clamp(
+            (starter_delta(game.get("homePitcher"), game.get("awayPitcher"), "fip") / 3.0)
+            * (clamp(home_rest - away_rest, -4, 4) / 4.0),
+            -3.0,
+            3.0,
+        ),
         "lineupParkInteract": lineup_ops_diff * (PARK_FACTORS.get(game["home"]["id"], 1.0) - 1.0),
     }
 
@@ -326,7 +377,10 @@ def lookup_injuries(team_id: int, date: str, snapshots) -> int:
     """Most recent injury snapshot on or before `date` (no lookahead)."""
     if not snapshots:
         return 0
-    lst = snapshots.get(team_id)
+    # JSON object keys are strings; accept both in-memory integer maps and
+    # disk-loaded snapshots so injury features do not silently become zero
+    # after a restart.
+    lst = snapshots.get(team_id) or snapshots.get(str(team_id))
     if not lst:
         return 0
     best = 0

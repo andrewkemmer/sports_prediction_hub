@@ -34,6 +34,7 @@ from __future__ import annotations
 import math
 import random
 
+from .logistic import zscore
 from .metrics import mean, sigmoid, std
 
 try:  # numpy is optional; only used as an accelerator
@@ -278,11 +279,11 @@ def _fit_pure(
             dh2 = [[dzi[0] * W3[0][j] * (1 - h2i[j] * h2i[j]) for j in range(h2n)] for dzi, h2i in zip(dz, h2)]
             da2 = dh2
             gW2 = [[sum(da2i[j] * h1i[k] for da2i, h1i in zip(da2, h1)) for k in range(h1n)] for j in range(h2n)]
-            gb2 = _row_sums(da2)
+            gb2 = [sum(row[j] for row in da2) for j in range(h2n)]
             dh1 = _mm(da2, W2)
             da1 = [[dh1i[j] * (1 - h1i[j] * h1i[j]) for j in range(h1n)] for dh1i, h1i in zip(dh1, h1)]
             gW1 = [[sum(da1i[j] * Xb_i[k] for da1i, Xb_i in zip(da1, Xb)) for k in range(d0)] for j in range(h1n)]
-            gb1 = _row_sums(da1)
+            gb1 = [sum(row[j] for row in da1) for j in range(h1n)]
             for j in range(h1n):
                 for k in range(d0):
                     gW1[j][k] += lr2 * W1[j][k]
@@ -391,7 +392,10 @@ def mlp_params(
     for f in feature_names:
         vals = [r["features"][f] for r in train]
         stats[f] = {"mean": mean(vals), "std": std(vals) or 1}
-    X = [[(r["features"][f] - stats[f]["mean"]) / stats[f]["std"] for f in feature_names] for r in train]
+    # Use the same train-only winsorized z-score contract as logistic, kNN,
+    # naive Bayes, and boosted stumps. This prevents a malformed live weather
+    # or workload value from reaching the MLP on a different scale.
+    X = [[zscore(r["features"][f], stats[f]["mean"], stats[f]["std"]) for f in feature_names] for r in train]
 
     rng = random.Random(seed)
     h1n, h2n = hidden
@@ -415,7 +419,7 @@ def mlp_predict(member: dict, features: dict) -> float:
     feature_names = member["featureNames"]
     stats = member["stats"]
     h1n, h2n = member["hidden"]
-    z = [(features[f] - stats[f]["mean"]) / stats[f]["std"] for f in feature_names]
+    z = [zscore(features[f], stats[f]["mean"], stats[f]["std"]) for f in feature_names]
     if _np is not None:
         return _predict_numpy(member["params"], z, h1n, h2n)
     return _predict_pure(member["params"], z, h1n, h2n)

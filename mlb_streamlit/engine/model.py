@@ -22,7 +22,14 @@ from __future__ import annotations
 import math
 import warnings
 
-from .features import FEATURE_KEYS, FEATURE_LABELS, build_features_for_game, compute_elo_and_features
+from .features import (
+    FEATURE_KEYS,
+    FEATURE_LABELS,
+    MODEL_FEATURE_KEYS,
+    STRUCTURAL_FEATURES,
+    build_features_for_game,
+    compute_elo_and_features,
+)
 from .ensemble import boosted_stumps_model, weighted_knn_calib_preds, weighted_knn_model
 from .logistic import (
     build_stacking_weights,
@@ -166,6 +173,13 @@ def compute_feature_drift(rows: list[dict], selected: list[str]) -> list[dict]:
     recent = rows[recent_start:]
     out: list[dict] = []
     for f in selected:
+        # The home-vs-away table has one canonical home perspective, so
+        # ``homeField`` is a structural row indicator (always 1.0). Including
+        # it in PSI creates a meaningless zero-variance drift row and can mask
+        # real upstream changes; it remains available to legacy model payloads
+        # but is intentionally excluded from statistical drift tracking.
+        if f in STRUCTURAL_FEATURES:
+            continue
         bvals = [r["features"][f] for r in baseline]
         cvals = [r["features"][f] for r in recent]
         b_mean = mean(bvals)
@@ -412,7 +426,7 @@ def run_model(
     #    already near-optimal), so each refit converges in a couple of
     #    iterations. No feature is removed from the candidate set — the same
     #    full FEATURE_KEYS universe always enters selection.
-    selected = list(FEATURE_KEYS)
+    selected = list(MODEL_FEATURE_KEYS)
     if len(calib) >= 20 and len(train) >= 20:
         current_model = train_logistic(train, selected, iterations=10)
         current_preds = [sigmoid(logistic_logit(current_model, r["features"], None)) for r in calib]
@@ -945,7 +959,7 @@ def run_model_lean(
     team_state = fe["teamState"]
     team_stats = fe["teamStats"]
     n = len(rows)
-    selected = list(FEATURE_KEYS)
+    selected = list(MODEL_FEATURE_KEYS)
 
     train_end = int(math.floor(n * 0.7))
     calib_end = min(n, int(math.floor(n * 0.85)))
@@ -1190,7 +1204,9 @@ def run_model_light(
     train = rows[:train_end]
     test = rows[calib_end:]
 
-    selected = list(FEATURE_KEYS) if feature_names is None else list(feature_names)
+    selected = list(MODEL_FEATURE_KEYS) if feature_names is None else [
+        f for f in feature_names if f not in STRUCTURAL_FEATURES
+    ]
 
     elo_hfa = 30.0
     if len(train) >= 20:

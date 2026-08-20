@@ -662,8 +662,8 @@ def test_lineups() -> None:
     for pid in (3, 4):
         batter_logs.update(ent(pid, "2026", 1, 1))
     st = new_state()
-    f24 = build_features_for_game(attach_lineups_as_of([g24], {1: lineup}, batter_logs)[0], st)
-    f26 = build_features_for_game(attach_lineups_as_of([g26], {2: lineup}, batter_logs)[0], st)
+    f24 = build_features_for_game(attach_lineups_as_of([g24], {1: lineup}, batter_logs, pregame_only=False)[0], st)
+    f26 = build_features_for_game(attach_lineups_as_of([g26], {2: lineup}, batter_logs, pregame_only=False)[0], st)
     check("lineupKnown=1 with lineups", f24["lineupKnown"] == 1 and f26["lineupKnown"] == 1)
     check("lineupOpsDiff non-zero", f24["lineupOpsDiff"] > 0 and f26["lineupOpsDiff"] > 0)
     check("per-season OPS respected", f26["lineupOpsDiff"] > f24["lineupOpsDiff"],
@@ -681,7 +681,7 @@ def test_lineups() -> None:
                           "sf": 0, "tb": 8, "2b": 2, "3b": 0, "hr": 1}]
         for pid in (1, 2, 3, 4)
     }
-    f_leak = build_features_for_game(attach_lineups_as_of([g24], {1: lineup}, leaky)[0], st)
+    f_leak = build_features_for_game(attach_lineups_as_of([g24], {1: lineup}, leaky, pregame_only=False)[0], st)
     check("no-lookahead lineup (post-game entries excluded)",
           f_leak["lineupKnown"] == 0 and f_leak["lineupOpsDiff"] == 0.0
           and f_leak["lineupWobaDiff"] == 0.0 and f_leak["lineupIsoDiff"] == 0.0
@@ -716,7 +716,7 @@ def test_lineups() -> None:
     }
     tg = {"gamePk": 9, "date": "2026-05-20", "season": "2026",
           "home": {"id": 119}, "away": {"id": 108}}
-    attached_t = attach_lineups_as_of([tg], {9: traj_lineup}, traj_logs)[0]
+    attached_t = attach_lineups_as_of([tg], {9: traj_lineup}, traj_logs, pregame_only=False)[0]
     hs = attached_t["lineupStats"]["home"]
     as_ = attached_t["lineupStats"]["away"]
     check("lineup momentum positive (heating up)", hs["momentum"] == 0.286, f"{hs['momentum']}")
@@ -726,11 +726,11 @@ def test_lineups() -> None:
     feats_t = build_features_for_game(attached_t, new_state())
     check("lineupMomentumDiff = home - away", feats_t["lineupMomentumDiff"] == 0.286,
           f"{feats_t['lineupMomentumDiff']}")
-    check("lineupFatigueDiff = away - home (lower-better)", feats_t["lineupFatigueDiff"] == -2.0,
+    check("lineupFatigueDiff = scaled away - home (lower-better)", abs(feats_t["lineupFatigueDiff"] - (-2.0 / 7.0)) < 1e-12,
           f"{feats_t['lineupFatigueDiff']}")
     # Gating: fewer than 5 prior games -> momentum stays 0 (no junk values).
     sparse = {f"{pid}|2026": [mk_traj(True, d) for d in home_days[:3]] for pid in (11, 12, 21, 22)}
-    sparse_lu = attach_lineups_as_of([tg], {9: traj_lineup}, sparse)[0]
+    sparse_lu = attach_lineups_as_of([tg], {9: traj_lineup}, sparse, pregame_only=False)[0]
     check("momentum gated on >= 5 prior games",
           sparse_lu["lineupStats"]["home"]["momentum"] == 0.0
           and sparse_lu["lineupStats"]["away"]["momentum"] == 0.0)
@@ -1196,6 +1196,13 @@ def test_as_of_pointer_equiv() -> None:
             "recentOps": data.batter_recent_ops_as_of(log, ymd),
             "momentum": data.batter_momentum_as_of(log, ymd),
             "games7": data.batter_games7_as_of(log, ymd),
+            # Historical lineup attachment also carries optional matchup
+            # fields. These fixtures intentionally contain no split rows, so
+            # the naive reference preserves the pointer path's empty values.
+            "bvpOps": None,
+            "bvpPA": 0.0,
+            "platoonOps": None,
+            "vsTeamOps": None,
         }
 
     def naive_lineups(games: list[dict]) -> list[dict]:
@@ -1242,7 +1249,7 @@ def test_as_of_pointer_equiv() -> None:
             })
         return out
 
-    ptr_lu = data.attach_lineups_as_of([dict(g) for g in games], lineups, batter_logs)
+    ptr_lu = data.attach_lineups_as_of([dict(g) for g in games], lineups, batter_logs, pregame_only=False)
     naive_lu = naive_lineups(games)
     check("lineup as-of: pointer == naive on unsorted games", ptr_lu == naive_lu, "output mismatch")
 

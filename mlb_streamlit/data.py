@@ -568,8 +568,15 @@ def attach_team_season_stats(games: list[dict], stats: dict) -> list[dict]:
 
 
 def _compact_hitting_entry(split: dict) -> dict | None:
+    """Keep the stat line plus the opponent identity when Stats API supplies it.
+
+    The old compact representation discarded ``team``/``opponent`` from a
+    player game-log split.  That made it impossible to build point-in-time
+    vs-team and platoon aggregates later, even though the scraper had already
+    downloaded the required rows.
+    """
     st = split.get("stat") or {}
-    return {
+    out = {
         "d": split.get("date") or "",
         "ab": _num(st.get("atBats")),
         "h": _num(st.get("hits")),
@@ -582,6 +589,28 @@ def _compact_hitting_entry(split: dict) -> dict | None:
         "3b": _num(st.get("triples")),
         "hr": _num(st.get("homeRuns")),
     }
+    team_id = _boxscore_player_id((split.get("team") or {}).get("id"))
+    opponent_id = _boxscore_player_id((split.get("opponent") or {}).get("id"))
+    if team_id is not None:
+        out["teamId"] = team_id
+    if opponent_id is not None:
+        out["opponentId"] = opponent_id
+    # Some game-log hydrations include the opposing pitcher/player; preserve
+    # it when present so historical BvP aggregates can remain point-in-time.
+    pitcher_value = (
+        split.get("pitcherId")
+        or split.get("opposingPlayerId")
+        or split.get("opponentPlayerId")
+        or split.get("pitcher")
+        or split.get("opposingPlayer")
+        or split.get("opponentPlayer")
+    )
+    if isinstance(pitcher_value, dict):
+        pitcher_value = pitcher_value.get("id")
+    pitcher_id = _boxscore_player_id(pitcher_value)
+    if pitcher_id is not None:
+        out["pitcherId"] = pitcher_id
+    return out
 
 
 def _compact_fielding_entry(split: dict) -> dict | None:
@@ -860,8 +889,8 @@ def attach_as_of_stats(games: list[dict], pitcher_logs: dict, team_logs: dict) -
     tacc: dict[str, dict] = {}
     for i in order:
         g = games[i]
-        season = g.get("season")
         ymd = g["date"]
+        season = g.get("season") or (ymd[:4] if isinstance(ymd, str) and len(ymd) >= 4 else "")
         hp = g.get("homePitcher")
         ap = g.get("awayPitcher")
         if hp and hp.get("id"):
@@ -954,52 +983,108 @@ def fetch_current_injury_snapshot(team_ids: list[int], d: str, season: str) -> d
 # Lineups (actual starting 9 + bench, from the per-game boxscore)
 # ---------------------------------------------------------------------------
 
-def fetch_game_lineup(game_pk: int) -> dict | None:
-    """Actual lineup from the boxscore. None when lineups are not posted yet.
+def _boxscore_player_id(value) -> int | None:
+    """Coerce Stats API player identifiers from numeric/``ID123`` shapes."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)) and int(value) > 0:
+        return int(value)
+    if isinstance(value, str):
+        match = re.search(r"\d+", value)
+        if match:
+            parsed = int(match.group())
+            return parsed if parsed > 0 else None
+    return None
 
-    A transient network failure is retried once so a real game is never
-    permanently cached as "no lineups" because of a timeout."""
-    data = None
-    for attempt in (0, 1):
-        try:
-            req = urllib.request.Request(f"{MLB_BASE}/api/v1/game/{game_pk}/boxscore", headers={"User-Agent": _USER_AGENT})
-            with urllib.request.urlopen(req, timeout=20) as r:
-                data = json.load(r)
-            break
-        except Exception:  # noqa: BLE001 — 404/empty boxscore is the expected pre-lineup state
-            if attempt == 1:
-                return None
-            time.sleep(0.5)
-    teams = data.get("teams")
+
+def parse_boxscore_lineup(data: dict | None) -> dict | None:
+    """Parse a Stats API boxscore into ``home/away`` batting orders.
+
+    Stats API has emitted all of these shapes over time: ``batters`` or
+    ``battingOrder`` ID arrays, ``ID123`` strings, and no team-level order
+    while each player has a ``battingOrder`` slot. Normalize every shape here
+    so a payload variation cannot silently turn every lineup into an empty
+    feature vector.
+    """
+    teams = (data or {}).get("teams") if isinstance(data, dict) else None
     if not teams or not teams.get("home") or not teams.get("away"):
         return None
 
     def parse_side(side: dict) -> dict:
-        batting_order = []
-        bench = []
-        order_ids = set(side.get("battingOrder") or [])
-        order_slot = {}
-        players = side.get("players") or {}
-        for key, p in players.items():
-            person = p.get("person") or {}
-            pid = person.get("id")
-            if not isinstance(pid, int):
+        batting_order: list[dict] = []
+        bench: list[dict] = []
+        order_ids: set[int] = set()
+        order_slot: dict[int, int] = {}
+
+        # ``batters`` is the canonical Stats API list. Older payloads used
+        # ``battingOrder`` instead; player-level slots remain the final
+        # fallback when neither list is present.
+        explicit_order = side.get("batters") or side.get("battingOrder") or []
+        if not isinstance(explicit_order, list):
+            explicit_order = []
+        for index, raw_id in enumerate(explicit_order):
+            pid = _boxscore_player_id(raw_id)
+            if pid is not None:
+                order_ids.add(pid)
+                order_slot.setdefault(pid, (index + 1) * 100)
+
+        raw_players = side.get("players") or {}
+        if isinstance(raw_players, dict):
+            players = list(raw_players.items())
+        elif isinstance(raw_players, list):
+            players = [(index, player) for index, player in enumerate(raw_players)]
+        else:
+            players = []
+        pitcher_ids = {
+            pid for pid in (_boxscore_player_id(raw) for raw in (side.get("pitchers") or []))
+            if pid is not None
+        }
+        for key, p in players:
+            if not isinstance(p, dict):
                 continue
-            pos = (p.get("position") or {}).get("abbreviation")
-            if pid in order_ids:
-                try:
-                    slot = int(p.get("battingOrder"))
-                except (TypeError, ValueError):
-                    slot = 0
-                if slot > 0:
+            person = p.get("person") or {}
+            pid = _boxscore_player_id(person.get("id")) or _boxscore_player_id(key)
+            if pid is None:
+                continue
+            position = p.get("position") or {}
+            pos = position.get("abbreviation") or position.get("code")
+            slot = _boxscore_player_id(p.get("battingOrder"))
+            is_batter = pid in order_ids or (slot is not None and slot > 0)
+            player = {"id": pid, "name": person.get("fullName") or "", "pos": pos}
+            if is_batter and pid not in pitcher_ids and pos != "P":
+                if slot is not None and slot > 0:
                     order_slot[pid] = slot
-                batting_order.append({"id": pid, "name": person.get("fullName") or "", "pos": pos})
-            elif pos != "P":
-                bench.append({"id": pid, "name": person.get("fullName") or "", "pos": pos})
-        batting_order.sort(key=lambda p: order_slot.get(p["id"], 99))
+                batting_order.append(player)
+            elif pid not in pitcher_ids and pos != "P":
+                bench.append(player)
+        batting_order.sort(key=lambda p: order_slot.get(p["id"], 999999))
         return {"battingOrder": batting_order, "bench": bench}
 
     return {"home": parse_side(teams["home"]), "away": parse_side(teams["away"])}
+
+
+def fetch_game_lineup(game_pk: int) -> dict | None:
+    """Actual lineup from the boxscore. None when lineups are not posted yet.
+
+    A transient network failure is retried once. Callers deliberately do not
+    persist a missing completed-game response as a permanent ``None`` marker;
+    a timeout or API shape change must be retried on the next refresh.
+    """
+    data = None
+    for attempt in (0, 1):
+        try:
+            req = urllib.request.Request(
+                f"{MLB_BASE}/api/v1/game/{game_pk}/boxscore",
+                headers={"User-Agent": _USER_AGENT},
+            )
+            with urllib.request.urlopen(req, timeout=20) as r:
+                data = json.load(r)
+            break
+        except Exception:  # noqa: BLE001 — empty boxscore is expected pre-lineup
+            if attempt == 1:
+                return None
+            time.sleep(0.5)
+    return parse_boxscore_lineup(data)
 
 
 def fetch_lineups_for_games(games: list[dict], concurrency: int = 16) -> dict:
@@ -1014,6 +1099,9 @@ def fetch_lineups_for_games(games: list[dict], concurrency: int = 16) -> dict:
 
     def fetch(g):
         lu = fetch_game_lineup(g["gamePk"])
+        # Keep partial but real orders: the feature layer marks a side as
+        # `known` only when it has enough pre-game stat coverage. Dropping a
+        # valid API payload here was the source of a large silent blackout.
         if (
             lu
             and (lu.get("home") or {}).get("battingOrder")
@@ -1223,24 +1311,68 @@ def batter_games7_as_of(entries: list[dict] | None, ymd: str) -> int:
     return sum(1 for e in entries if cutoff <= e["d"] < ymd)
 
 
-def _batter_prefix(log: list[dict] | None, ymd: str, acc: dict, key: str) -> dict:
-    """Pointer-accumulated twin of the per-batter as-of fields.
+_HITTING_TOTAL_KEYS = ("ab", "h", "bb", "ibb", "hbp", "sf", "tb", "2b", "3b", "hr")
 
-    Equivalent to running `batter_ops_as_of` / `woba` / `iso` / `recent` /
-    `momentum` / `games7` on the log prefix strictly before `ymd`, but the
-    cursor advances across a chronological pass instead of rescanning the
-    whole log per game. Identical arithmetic and rounding.
+
+def _empty_hitting_bucket() -> dict[str, float]:
+    return {key: 0.0 for key in _HITTING_TOTAL_KEYS}
+
+
+def _add_hitting_bucket(bucket: dict[str, float], entry: dict) -> None:
+    for key in _HITTING_TOTAL_KEYS:
+        bucket[key] += float(entry.get(key, 0.0) or 0.0)
+
+
+def _bucket_ops(bucket: dict[str, float] | None) -> float | None:
+    if not bucket:
+        return None
+    value = _ops_from_hitting(
+        bucket["ab"], bucket["h"], bucket["bb"], bucket["hbp"], bucket["sf"], bucket["tb"]
+    )
+    return round(value, 3) if value is not None else None
+
+
+def _batter_prefix(
+    log: list[dict] | None,
+    ymd: str,
+    acc: dict,
+    key: str,
+    team_id: int | None = None,
+    opponent_id: int | None = None,
+    pitcher_id: int | None = None,
+    contexts: dict | None = None,
+) -> dict:
+    """Pointer-accumulated as-of batter metrics, including split buckets.
+
+    The cursor is still advanced once per batter, but it now also retains
+    point-in-time aggregates keyed by opposing team, opposing starter hand,
+    and opposing pitcher whenever the Stats API game log supplies those IDs.
+    That restores historical split features without querying full-season
+    totals into past games.
     """
     if not log:
-        return {"ops": None, "woba": None, "iso": None, "recentOps": None, "momentum": None, "games7": 0}
+        return {
+            "ops": None, "woba": None, "iso": None, "recentOps": None,
+            "momentum": None, "games7": 0, "bvpOps": None, "bvpPA": 0.0,
+            "platoonOps": None, "vsTeamOps": None,
+        }
     st = acc.get(key)
     if st is None:
-        st = {"ptr": 0, "ptr7": 0, "count": 0, "count7": 0, "ab": 0.0, "h": 0.0, "bb": 0.0, "ibb": 0.0,
-              "hbp": 0.0, "sf": 0.0, "tb": 0.0, "2b": 0.0, "3b": 0.0, "hr": 0.0, "lastYmd": ""}
+        st = {
+            "ptr": 0, "ptr7": 0, "count": 0, "count7": 0,
+            "ab": 0.0, "h": 0.0, "bb": 0.0, "ibb": 0.0, "hbp": 0.0,
+            "sf": 0.0, "tb": 0.0, "2b": 0.0, "3b": 0.0, "hr": 0.0,
+            "vsTeam": {}, "platoon": {}, "bvp": {}, "lastYmd": "",
+        }
         acc[key] = st
     if st["lastYmd"] and ymd < st["lastYmd"]:
-        for k in ("ptr", "ptr7", "count", "count7", "ab", "h", "bb", "ibb", "hbp", "sf", "tb", "2b", "3b", "hr"):
-            st[k] = 0 if k in ("ptr", "ptr7", "count", "count7") else 0.0
+        for field in ("ptr", "ptr7", "count", "count7"):
+            st[field] = 0
+        for field in _HITTING_TOTAL_KEYS:
+            st[field] = 0.0
+        st["vsTeam"] = {}
+        st["platoon"] = {}
+        st["bvp"] = {}
     st["lastYmd"] = ymd
     ptr = st["ptr"]
     while ptr < len(log) and log[ptr]["d"] < ymd:
@@ -1256,6 +1388,22 @@ def _batter_prefix(log: list[dict] | None, ymd: str, acc: dict, key: str) -> dic
         st["3b"] += e.get("3b", 0.0)
         st["hr"] += e.get("hr", 0.0)
         st["count"] += 1
+
+        entry_team = _boxscore_player_id(e.get("teamId"))
+        entry_opponent = _boxscore_player_id(e.get("opponentId"))
+        if entry_opponent is not None:
+            bucket = st["vsTeam"].setdefault(entry_opponent, _empty_hitting_bucket())
+            _add_hitting_bucket(bucket, e)
+        if entry_team is not None and contexts:
+            context = contexts.get((key.split("|")[-1], e["d"], entry_team)) or {}
+            hand = context.get("pitchHand")
+            if hand in ("L", "R"):
+                bucket = st["platoon"].setdefault(hand, _empty_hitting_bucket())
+                _add_hitting_bucket(bucket, e)
+        entry_pitcher = _boxscore_player_id(e.get("pitcherId"))
+        if entry_pitcher is not None:
+            bucket = st["bvp"].setdefault(entry_pitcher, _empty_hitting_bucket())
+            _add_hitting_bucket(bucket, e)
         ptr += 1
     st["ptr"] = ptr
     try:
@@ -1270,8 +1418,7 @@ def _batter_prefix(log: list[dict] | None, ymd: str, acc: dict, key: str) -> dic
         st["ptr7"] = ptr7
 
     ab, h = st["ab"], st["h"]
-    ops = _ops_from_hitting(ab, h, st["bb"], st["hbp"], st["sf"], st["tb"])
-    ops = round(ops, 3) if ops is not None else None
+    ops = _bucket_ops(st)
     woba = _woba_from_hitting(ab, h, st["bb"], st["ibb"], st["hbp"], st["sf"], st["2b"], st["3b"], st["hr"])
     woba = round(woba, 3) if woba is not None else None
     iso = _iso_from_hitting(h, st["tb"], ab)
@@ -1279,37 +1426,43 @@ def _batter_prefix(log: list[dict] | None, ymd: str, acc: dict, key: str) -> dic
     recent = log[max(0, ptr - 10):ptr]
     recent_ops = None
     if recent:
-        r_ab = r_h = r_bb = r_hbp = r_sf = r_tb = 0.0
-        for e in recent:
-            r_ab += e["ab"]
-            r_h += e["h"]
-            r_bb += e["bb"]
-            r_hbp += e["hbp"]
-            r_sf += e["sf"]
-            r_tb += e["tb"]
-        rv = _ops_from_hitting(r_ab, r_h, r_bb, r_hbp, r_sf, r_tb)
-        recent_ops = round(rv, 3) if rv is not None else None
+        recent_bucket = _empty_hitting_bucket()
+        for entry in recent:
+            _add_hitting_bucket(recent_bucket, entry)
+        recent_ops = _bucket_ops(recent_bucket)
     recent_ops_val = recent_ops if recent_ops is not None else ops
     momentum = None
     if st["count"] >= 5 and ops is not None and recent_ops is not None:
         momentum = round(recent_ops - ops, 3)
     games7 = st["count"] - st["count7"] if cutoff else 0
-    return {"ops": ops, "woba": woba, "iso": iso, "recentOps": recent_ops_val, "momentum": momentum, "games7": games7}
+    vs_team_ops = _bucket_ops(st["vsTeam"].get(opponent_id)) if opponent_id is not None else None
+    platoon_ops = _bucket_ops(st["platoon"].get((contexts or {}).get("targetHand"))) if (contexts or {}).get("targetHand") else None
+    bvp_bucket = st["bvp"].get(pitcher_id) if pitcher_id is not None else None
+    return {
+        "ops": ops, "woba": woba, "iso": iso, "recentOps": recent_ops_val,
+        "momentum": momentum, "games7": games7,
+        "bvpOps": _bucket_ops(bvp_bucket),
+        "bvpPA": (bvp_bucket or {}).get("ab", 0.0) + (bvp_bucket or {}).get("bb", 0.0) + (bvp_bucket or {}).get("hbp", 0.0) + (bvp_bucket or {}).get("sf", 0.0),
+        "platoonOps": platoon_ops,
+        "vsTeamOps": vs_team_ops,
+    }
 
 
 def attach_lineups_as_of(
     games: list[dict],
     lineups: dict,
     batter_logs: dict,
-    pregame_only: bool | None = None,
+    pregame_only: bool = True,
 ) -> list[dict]:
     """Attach lineups with each batter's OPS as-of the game's own date.
 
-    When ``pregame_only`` is true, completed games are intentionally returned
-    without lineup features. The MLB boxscore endpoint exposes the observed
-    lineup but not a reliable publication timestamp; using a completed game's
-    lineup in a historical row would therefore be an unprovable post-game
-    leak. Upcoming/scheduled games may use a lineup fetched before first pitch.
+    The boxscore endpoint exposes the observed starting batting order but not
+    a publication timestamp. We use only the order (not post-game boxscore
+    outcomes) and compute every player metric from log entries with
+    ``date < game.date``. This keeps the feature values point-in-time while
+    allowing historical training rows to retain their real pre-game lineup
+    when callers explicitly pass ``pregame_only=False``. The safe default
+    excludes completed-game boxscores from live/prediction callers.
 
     One chronological pass with per-batter cursors (amortized O(1) per game),
     then restores input order. Output is byte-identical to the naive rescan.
@@ -1318,24 +1471,57 @@ def attach_lineups_as_of(
     order = sorted(range(n), key=lambda i: (games[i].get("gameDate") or games[i].get("date") or "", i))
     out: list[dict] = [None] * n  # type: ignore[list-item]
     bacc: dict[str, dict] = {}
+    # Map each prior player-game log entry to the opposing starter's hand.
+    # Stats API game logs include team/opponent IDs; using the schedule's
+    # point-in-time starter metadata lets historical platoon aggregates remain
+    # honest without applying today's full-season split totals backward.
+    contexts: dict[tuple[str, str, int], dict] = {}
+    for context_game in games:
+        context_season = context_game.get("season") or ""
+        context_date = context_game.get("date") or ""
+        home_id = (context_game.get("home") or {}).get("id")
+        away_id = (context_game.get("away") or {}).get("id")
+        if home_id and away_id:
+            contexts[(context_season, context_date, home_id)] = {
+                "pitchHand": (context_game.get("awayPitcher") or {}).get("pitchHand"),
+            }
+            contexts[(context_season, context_date, away_id)] = {
+                "pitchHand": (context_game.get("homePitcher") or {}).get("pitchHand"),
+            }
     for i in order:
         g = games[i]
-        historical_boxscore_guard = (
-            pregame_only is True
-            or (pregame_only is None and g.get("status") in ("Final", "Live"))
-        )
-        if historical_boxscore_guard and g.get("winner") in ("home", "away"):
+        # The boxscore's ``battingOrder`` is the starting lineup, while all
+        # player stats below are accumulated strictly before ``ymd``.
+        status = g.get("status")
+        if isinstance(status, str):
+            status_name = status
+        elif isinstance(status, dict):
+            status_name = status.get("abstractGameState") or status.get("detailedState")
+        else:
+            status_name = ""
+        completed = g.get("winner") in ("home", "away") or str(status_name or "").lower() in {"final", "closed", "completed"}
+        if pregame_only and completed:
             out[i] = g
             continue
-        lu = lineups.get(g["gamePk"])
+        lu = lineups.get(g["gamePk"]) or lineups.get(str(g["gamePk"]))
         if not lu:
             out[i] = g
             continue
         season = g.get("season")
         ymd = g["date"]
 
-        def batter(p):
-            stats = _batter_prefix(batter_logs.get(f"{p['id']}|{season}"), ymd, bacc, f"{p['id']}|{season}")
+        def batter(p, team_id, opponent_id, starter):
+            target_hand = (starter or {}).get("pitchHand")
+            stats = _batter_prefix(
+                batter_logs.get(f"{p['id']}|{season}"),
+                ymd,
+                bacc,
+                f"{p['id']}|{season}",
+                team_id=team_id,
+                opponent_id=opponent_id,
+                pitcher_id=(starter or {}).get("id"),
+                contexts={**contexts, "targetHand": target_hand},
+            )
             return {
                 **p,
                 "ops": stats["ops"],
@@ -1344,22 +1530,36 @@ def attach_lineups_as_of(
                 "recentOps": stats["recentOps"],
                 "momentum": stats["momentum"],
                 "games7": stats["games7"],
+                "bvpOps": stats["bvpOps"],
+                "bvpPA": stats["bvpPA"],
+                "platoonOps": stats["platoonOps"],
+                "vsTeamOps": stats["vsTeamOps"],
             }
 
-        def with_ops(side):
+        def with_ops(side, team_id, opponent_id, starter):
             if not side:
                 return side
             return {
-                "battingOrder": [batter(p) for p in side["battingOrder"]],
-                "bench": [batter(p) for p in side["bench"]],
+                "battingOrder": [batter(p, team_id, opponent_id, starter) for p in side["battingOrder"]],
+                "bench": [batter(p, team_id, opponent_id, starter) for p in side["bench"]],
             }
 
-        home = with_ops(lu.get("home"))
-        away = with_ops(lu.get("away"))
+        home = with_ops(
+            lu.get("home"),
+            (g.get("home") or {}).get("id"),
+            (g.get("away") or {}).get("id"),
+            g.get("awayPitcher"),
+        )
+        away = with_ops(
+            lu.get("away"),
+            (g.get("away") or {}).get("id"),
+            (g.get("home") or {}).get("id"),
+            g.get("homePitcher"),
+        )
         home_ops = lineup_ops(home["battingOrder"]) if home else 0.0
         away_ops = lineup_ops(away["battingOrder"]) if away else 0.0
-        home_known = home_ops > 0
-        away_known = away_ops > 0
+        home_known = bool(home and any(isinstance(p.get("ops"), (int, float)) for p in home["battingOrder"]))
+        away_known = bool(away and any(isinstance(p.get("ops"), (int, float)) for p in away["battingOrder"]))
         out[i] = {
             **g,
             "lineups": {"home": home, "away": away},

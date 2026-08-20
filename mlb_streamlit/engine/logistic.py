@@ -391,20 +391,30 @@ def knn_model(train: list[dict], feature_names: list[str], k: int = 21):
 
 
 def naive_bayes_params(train: list[dict], feature_names: list[str]) -> dict:
-    """Serializable parameters for the Gaussian Naive Bayes classifier.
+    """Serializable Gaussian Naive Bayes parameters in the shared z-space.
 
-    The per-class Gaussian moments + Laplace-smoothed prior are JSON-safe, so
-    the model can be persisted and served later (a deployable ensemble member).
+    The old member consumed raw OPS/ERA/weather/interaction units while the
+    other stack families used standardized features.  A live temperature or
+    workload scale change could therefore dominate this member.  Fit train-only
+    mean/std statistics and store class moments after the same winsorized z
+    transform used by logistic, kNN, and the MLP.
     """
     n = len(train)
     pos = [r for r in train if r["label"] == 1]
     neg = [r for r in train if r["label"] == 0]
     prior = (len(pos) + 1) / (n + 2)
+    feature_stats = {
+        f: {
+            "mean": mean([r["features"][f] for r in train]),
+            "std": std([r["features"][f] for r in train]) or 1.0,
+        }
+        for f in feature_names
+    }
 
     def cond(rows: list[dict]) -> list[dict]:
         out = []
         for f in feature_names:
-            vals = [r["features"][f] for r in rows]
+            vals = [zscore(r["features"][f], feature_stats[f]["mean"], feature_stats[f]["std"]) for r in rows]
             v = std(vals) * std(vals) + 1e-6
             out.append({"m": mean(vals), "v": v})
         return out
@@ -414,6 +424,7 @@ def naive_bayes_params(train: list[dict], feature_names: list[str]) -> dict:
         "posStats": cond(pos),
         "negStats": cond(neg),
         "featureNames": list(feature_names),
+        "featureStats": feature_stats,
     }
 
 
@@ -430,9 +441,12 @@ def naive_bayes_predict(member: dict, features: dict) -> float:
 
     log_pos = math.log(prior)
     log_neg = math.log(1 - prior)
+    feature_stats = member.get("featureStats") or {}
     for j, f in enumerate(feature_names):
-        log_pos += gauss_log(features[f], pos_stats[j])
-        log_neg += gauss_log(features[f], neg_stats[j])
+        stats = feature_stats.get(f) or {"mean": 0.0, "std": 1.0}
+        x = zscore(features[f], stats["mean"], stats["std"])
+        log_pos += gauss_log(x, pos_stats[j])
+        log_neg += gauss_log(x, neg_stats[j])
     max_log = max(log_pos, log_neg)
     p_pos = math.exp(log_pos - max_log)
     p_neg = math.exp(log_neg - max_log)

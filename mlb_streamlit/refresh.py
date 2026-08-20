@@ -34,7 +34,7 @@ from .data import (
     market_odds_enabled,
     market_odds_for_game,
 )
-from .engine.features import FEATURE_KEYS, FEATURE_VERSION, build_features_for_game, compute_elo_and_features
+from .engine.features import MODEL_FEATURE_KEYS, FEATURE_KEYS, FEATURE_VERSION, build_features_for_game, compute_elo_and_features
 from .engine.gating import GATE_VERSION, apply_concordance_gate, default_gate_config, summarize_gate_results
 from .engine.betting import build_bet_decision, stamp_market_odds, summarize_bet_decisions
 from .engine.calib_wf import build_walk_forward_calibration_rows_v2
@@ -80,7 +80,7 @@ def _market_odds_snapshot(odds_map: dict | None) -> dict:
     payload = cache.load_market_odds() or {}
     return stamp_market_odds(odds_map, payload.get("fetchedAt"))
 
-PREDICTION_VERSION = 11  # invalidate docs whenever the PIT market/EV execution layer changes
+PREDICTION_VERSION = 12  # invalidate docs whenever the PIT market/EV execution layer changes
 BACKTEST_STATES_FILE = "backtest_states.json"
 BACKTEST_CACHE_VERSION = cache.BACKTEST_CACHE_VERSION  # invalidate stale point-in-time rows when the gate recipe changes
 WF_REFIT_DAYS = 7  # refit the walk-forward model every N days (games in a block share a model)
@@ -487,15 +487,19 @@ def _refresh_fast(fresh: list[dict], all_games: list[dict], cached_state: dict, 
     rep("No changes detected", 60, "Data unchanged — reusing trained model, refreshing predictions…")
 
     lineup_cache = cache.load_lineups()
-    lineup_targets = [g for g in all_games if g["gamePk"] not in lineup_cache]
+    # Missing/None entries are intentionally retried. A failed boxscore request
+    # or a late-posted lineup is not a permanent data fact and must not freeze
+    # an entire game's lineup-derived feature block at zero.
+    lineup_targets = [g for g in all_games if not lineup_cache.get(g["gamePk"]) ]
     fetched_lineups = fetch_lineups_for_games(lineup_targets, 16)
     for g in lineup_targets:
         lu = fetched_lineups.get(g["gamePk"])
         if lu:
             lineup_cache[g["gamePk"]] = lu
-        elif g.get("winner") in ("home", "away"):
-            # Completed game with no posted lineups — final, never refetch.
-            lineup_cache[g["gamePk"]] = None
+        else:
+            # Do not negative-cache a missing response. Boxscores can be
+            # temporarily unavailable or can gain lineup metadata later.
+            lineup_cache.pop(g["gamePk"], None)
     lineups = {pk: lu for pk, lu in lineup_cache.items() if lu}
 
     pitcher_log_cache = cache.load_pitcher_logs()
@@ -540,7 +544,7 @@ def _refresh_fast(fresh: list[dict], all_games: list[dict], cached_state: dict, 
     b0 = len(batter_log_cache)
     if to_fetch_batter:
         batter_log_cache.update(fetch_batter_game_logs(to_fetch_batter, season, batter_log_cache))
-    enriched = attach_lineups_as_of(enriched, lineups, batter_log_cache, pregame_only=True)
+    enriched = attach_lineups_as_of(enriched, lineups, batter_log_cache, pregame_only=False)
 
     rep("Scoring fresh games", 78, "Predicting with the stored model…")
     matchup = enrich_with_matchups(
@@ -784,7 +788,10 @@ def run_refresh(
         team_pairs.setdefault(f"{g['away']['id']}|{s}", {"id": g["away"]["id"], "season": s})
     to_fetch_team = [p for p in team_pairs.values() if f"{p['id']}|{p['season']}" not in team_log_cache]
 
-    lineup_targets = [g for g in all_games if g["gamePk"] not in lineup_cache]
+    # Missing/None entries are intentionally retried. A failed boxscore request
+    # or a late-posted lineup is not a permanent data fact and must not freeze
+    # an entire game's lineup-derived feature block at zero.
+    lineup_targets = [g for g in all_games if not lineup_cache.get(g["gamePk"]) ]
     team_ids = sorted({tid for g in completed for tid in (g["home"]["id"], g["away"]["id"]) if tid > 0})
 
     # Fast path: when the training data is unchanged since the last run (same
@@ -824,9 +831,10 @@ def run_refresh(
         lu = fetched_lineups.get(g["gamePk"])
         if lu:
             lineup_cache[g["gamePk"]] = lu
-        elif g.get("winner") in ("home", "away"):
-            # Completed game with no posted lineups — final, never refetch.
-            lineup_cache[g["gamePk"]] = None
+        else:
+            # Do not negative-cache a missing response. Boxscores can be
+            # temporarily unavailable or can gain lineup metadata later.
+            lineup_cache.pop(g["gamePk"], None)
     lineups = {pk: lu for pk, lu in lineup_cache.items() if lu}
     for tid, count in current_injury.items():
         lst = injury_snapshots.setdefault(str(tid), [])
@@ -870,7 +878,7 @@ def run_refresh(
         for fut in futures:
             batter_log_cache.update(fut.result())
     rep("Batter game logs loaded", 48, f"Cached {len(batter_log_cache)} batter-season logs.")
-    enriched = attach_lineups_as_of(enriched, lineups, batter_log_cache, pregame_only=True)
+    enriched = attach_lineups_as_of(enriched, lineups, batter_log_cache, pregame_only=False)
 
     # 6c. Matchup edges (BvP / platoon / vs-team): only for games in the fresh
     #    window (real boxscore lineup + opposing starter both known), mirroring
@@ -1218,7 +1226,7 @@ def _backtest_state(target: str, report=None) -> dict | None:
             except (TypeError, ValueError):
                 pass
     batter_log_cache = cache.load_batter_logs()
-    enriched = attach_lineups_as_of(enriched, lineups, batter_log_cache, pregame_only=True)
+    enriched = attach_lineups_as_of(enriched, lineups, batter_log_cache, pregame_only=False)
     # No matchup enrichment: current-season platoon/vs-team splits are
     # season-to-date and would leak post-target games into training features.
     completed_enriched = [g for g in enriched if g.get("winner") in ("home", "away")]
@@ -1229,7 +1237,7 @@ def _backtest_state(target: str, report=None) -> dict | None:
     # capped MLP as the calibration backtest, so every dashboard's point-in-
     # time model is the same recipe.
     deployed_state = cache.load_model_state()
-    fallback_features = (deployed_state or {}).get("featureNames") or list(FEATURE_KEYS)
+    fallback_features = (deployed_state or {}).get("featureNames") or list(MODEL_FEATURE_KEYS)
     sel_day = load_selection_days().get(target) or {}
     feature_names = sel_day.get("features") or fallback_features
     model_choice = sel_day.get("modelChoice") or None
@@ -1398,7 +1406,12 @@ def build_walk_forward_calibration_rows(
                     lineups[int(pk)] = lu
                 except (TypeError, ValueError):
                     pass
-        enriched = attach_lineups_as_of(enriched, lineups, cache.load_batter_logs(), pregame_only=True)
+        # Historical boxscores are the only reliable source for the actual
+        # starting nine. Their game outcome is already known, but every batter
+        # stat remains strictly date < game.date inside attach_lineups_as_of,
+        # so retaining completed-game lineups is PIT-safe and prevents a
+        # silent all-zero historical lineup matrix.
+        enriched = attach_lineups_as_of(enriched, lineups, cache.load_batter_logs(), pregame_only=False)
         enriched = [g for g in enriched if (g.get("date") or "") < today]
         if not enriched:
             return []
@@ -1706,7 +1719,7 @@ def predict_date(date: str, state: dict | None = None, report=None) -> int:
     if to_fetch:
         fresh_batter_logs = fetch_batter_game_logs(to_fetch, season, batter_log_cache)
         batter_log_cache.update(fresh_batter_logs)
-    enriched = attach_lineups_as_of(enriched, lineups, batter_log_cache)
+    enriched = attach_lineups_as_of(enriched, lineups, batter_log_cache, pregame_only=False)
 
     # Matchup edges (BvP / platoon / vs-team) for the selected date's real
     # lineups, mirroring React's predictDate. Market odds are independent and
