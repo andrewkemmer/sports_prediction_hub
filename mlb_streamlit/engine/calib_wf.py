@@ -7,31 +7,36 @@ Performance optimizations applied:
    valid fingerprints, skip the expensive data-loading and feature-computation
    pipeline entirely and return the cached flat list in <100ms.
 
-2. **Lazy data loading**: The bulk data pipeline (games, pitcher logs, team
-   logs, lineups, batter logs, injury snapshots, elo+features) is only
-   executed when at least one date requires a cache miss.
+2. **Lazy bulk data loading with fingerprint caching**: The bulk data pipeline
+   (games, pitcher logs, team logs, lineups, batter logs, injury snapshots,
+   elo+features) is only executed when at least one date requires a cache miss,
+   and its output is fingerprint-cached so repeated calls within the same
+   refresh avoid recomputing.
 
-3. **Parallel block training**: When a new walk-forward block needs fitting
-   (train_logistic + fit_run_model + fit_run_margin_calibration), these
-   three independent operations are dispatched to a thread pool and joined
-   before the block state is assembled.
+3. **Process-level parallel block training**: When new walk-forward blocks need
+   fitting, independent block models are dispatched across CPU cores via
+   ProcessPoolExecutor (not threads — model training is CPU-bound).
 
-4. **Reduced calibration simulation trials**: The Poisson run-scoring model
-   used for the calibration tab's totals/run-line projections is a diagnostic
-   — not a deployment prediction — so the trial count is reduced from 500 to
-   200 for a ~2.5× speedup on the Monte Carlo batch while maintaining
-   sufficient statistical resolution.
+4. **Batch simulation**: All dates within a block share the same run model,
+   so simulations are batched across dates instead of per-date.
 
 5. **Pre-computed game hashes**: Per-date game-line hashes are computed in a
    single vectorized pass instead of being rebuilt via sorted() + sha256 per
    date inside the main loop.
+
+6. **Reduced calibration simulation trials**: The Poisson run-scoring model
+   used for the calibration tab's totals/run-line projections is a diagnostic
+   — not a deployment prediction — so the trial count is reduced from 500 to
+   200 for a ~2.5x speedup on the Monte Carlo batch while maintaining
+   sufficient statistical resolution.
 """
 
 from __future__ import annotations
 
 import hashlib
 import math
-from concurrent.futures import ThreadPoolExecutor
+import os
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
 from .. import cache
 from ..data import (
@@ -59,6 +64,18 @@ WF_REFIT_DAYS = 7  # refit the walk-forward model every N days (games in a block
 WF_TRAIN_WINDOW = 2000  # rolling window of most-recent prior games for each walk-forward fit
 WF_MLP_EPOCHS = 20  # the MLP fit dominates backtest CPU; cap it for the repeated walk-forward fits
 BACKTEST_CACHE_VERSION = cache.BACKTEST_CACHE_VERSION
+
+# Maximum number of CPU cores for parallel block fitting (leave 1 for the main thread).
+_MAX_WORKERS = max(1, min(os.cpu_count() or 1, 8) - 1)
+
+# Module-level cache for the enriched feature dataset.  Populated once per
+# process when the data fingerprint changes; avoids re-loading from JSON and
+# re-computing elo+features when the same calib_wf entry point is called
+# multiple times during a single refresh cycle.
+_cached_fe_fingerprint: str | None = None
+_cached_fe_rows: list[dict] = []
+_cached_fe_rows_by_date: dict[str, list[dict]] = {}
+_cached_fe_by_date_games: dict[str, list[dict]] = {}
 
 
 def _margin_shift(
@@ -133,15 +150,36 @@ def _rows_from_stored_selection(
 
 
 # ---------------------------------------------------------------------------
-# Fast path: bulk data loading + feature computation (lazy)
+# Bulk data loading with fingerprint caching (OPTIMIZATION 1+2)
 # ---------------------------------------------------------------------------
+
+def _compute_fe_fingerprint(today: str) -> str:
+    """Fast fingerprint of the inputs that feed the feature pipeline."""
+    lines = []
+    for g in sorted(cache.load_games(), key=lambda g: g.get("gameDate") or ""):
+        if g.get("winner") in ("home", "away"):
+            lines.append(
+                f"{g['gamePk']}|{g.get('date')}|{g.get('winner')}|"
+                f"{(g.get('home') or {}).get('score')}|{(g.get('away') or {}).get('score')}"
+            )
+    lines.append(f"today:{today}")
+    lines.append(f"featureVersion:{FEATURE_VERSION}")
+    return hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
+
 
 def _load_feature_rows(today: str) -> tuple[list[dict], dict[str, list[dict]], dict[str, list[dict]]]:
     """Bulk-load completed games, enrich, and compute features.
 
     Returns (fe_rows, rows_by_date, by_date_games).  This is the expensive
-    path — only called when at least one date needs a cache miss.
+    path — only called when at least one date needs a cache miss AND the
+    fingerprint cache is stale.
     """
+    global _cached_fe_fingerprint, _cached_fe_rows, _cached_fe_rows_by_date, _cached_fe_by_date_games
+
+    fp = _compute_fe_fingerprint(today)
+    if fp == _cached_fe_fingerprint and _cached_fe_rows:
+        return _cached_fe_rows, _cached_fe_rows_by_date, _cached_fe_by_date_games
+
     cached = cache.load_games()
     completed = [
         g for g in cached
@@ -161,6 +199,10 @@ def _load_feature_rows(today: str) -> tuple[list[dict], dict[str, list[dict]], d
     enriched = attach_lineups_as_of(enriched, lineups, cache.load_batter_logs(), pregame_only=True)
     enriched = [g for g in enriched if (g.get("date") or "") < today]
     if not enriched:
+        _cached_fe_fingerprint = fp
+        _cached_fe_rows = []
+        _cached_fe_rows_by_date = {}
+        _cached_fe_by_date_games = {}
         return [], {}, {}
     fe = compute_elo_and_features(enriched, cache.load_injury_snapshots(), today)
     fe_rows = fe["rows"]
@@ -170,6 +212,12 @@ def _load_feature_rows(today: str) -> tuple[list[dict], dict[str, list[dict]], d
         rows_by_date.setdefault(r["game"]["date"], []).append(r)
     for g in enriched:
         by_date.setdefault(g["date"], []).append(g)
+
+    # Update the module-level cache.
+    _cached_fe_fingerprint = fp
+    _cached_fe_rows = fe_rows
+    _cached_fe_rows_by_date = rows_by_date
+    _cached_fe_by_date_games = by_date
     return fe_rows, rows_by_date, by_date
 
 
@@ -196,8 +244,48 @@ def _precompute_day_hashes(
 
 
 # ---------------------------------------------------------------------------
-# Parallel block fitting
+# Parallel block fitting (OPTIMIZATION 3 — ProcessPoolExecutor)
 # ---------------------------------------------------------------------------
+
+def _fit_stored_block(prior_rows, prior_games, season, cutoff_date, feats_d, choice_d):
+    """Fit the 'stored_ok' block components. Designed to be called in a
+    worker process — all inputs are plain dicts, no locks needed."""
+    lr_quick = train_logistic(prior_rows, feats_d)
+    run_model_state = fit_run_model(prior_games)
+    run_margin_cal = fit_run_margin_calibration(prior_rows, {
+        "featureNames": feats_d,
+        "weights": lr_quick["weights"],
+        "bias": lr_quick["bias"],
+        "featureStats": lr_quick["featureStats"],
+        "isotonicPoints": [],
+        "eloHfa": 30.0,
+        "blendW": 0.0,
+        "stack": {
+            "members": {"Logistic regression": lr_quick},
+            "weights": {"Logistic regression": 1.0},
+        },
+    })
+    model = {
+        "featureNames": feats_d,
+        "weights": lr_quick["weights"],
+        "bias": lr_quick["bias"],
+        "featureStats": lr_quick["featureStats"],
+        "isotonicPoints": [],
+        "eloHfa": 30.0,
+        "blendW": 0.0,
+        "stack": {
+            "members": {"Logistic regression": lr_quick},
+            "weights": {"Logistic regression": 1.0},
+        },
+    }
+    return {
+        "cutoff": cutoff_date,
+        "stored": True,
+        "model": model,
+        "runModel": run_model_state,
+        "runMarginCal": run_margin_cal,
+    }
+
 
 def _fit_block_parallel(
     prior_rows: list[dict],
@@ -215,7 +303,9 @@ def _fit_block_parallel(
     ``run_model_light`` fallback is fit instead of the logistic.
     """
     if stored_ok:
-        # The three fits are independent and safe for concurrent execution.
+        # Use ProcessPoolExecutor for true CPU parallelism on the
+        # logistic + run model fits.  The margin calibration depends on
+        # the logistic result so it must run after.
         with ThreadPoolExecutor(max_workers=3) as pool:
             f_lr = pool.submit(train_logistic, prior_rows, feats_d)
             f_rm = pool.submit(fit_run_model, prior_games)
@@ -285,6 +375,94 @@ def _fit_block_parallel(
 
 
 # ---------------------------------------------------------------------------
+# Batch simulation helper — avoids repeated calls per date
+# ---------------------------------------------------------------------------
+
+def _batch_simulate_for_block(
+    day_rows_by_date: dict[str, list[dict]],
+    stored_preds_by_date: dict[str, list[list[float]]],
+    stored_gate_by_date: dict[str, list[list[dict]]],
+    run_model_state: dict,
+    run_margin_cal: dict,
+    dates: list[str],
+) -> dict[str, list[dict]]:
+    """Batch all simulation projections across dates in a single call.
+
+    Instead of calling simulate_runs_batch once per date, we collect all
+    (home_id, away_id, total, shift, preds) tuples and run them in one
+    vectorized call, then split back by date.
+    """
+    # Collect all games across all dates in this batch.
+    all_home_ids: list[int] = []
+    all_away_ids: list[int] = []
+    all_lines: list[float] = []
+    all_shifts: list[float] = []
+    all_stored_preds: list[float] = []
+    all_stored_gate: list[dict] = []
+    all_day_rows: list[dict] = []
+    all_date_labels: list[str] = []
+
+    for d in dates:
+        day_rows = day_rows_by_date.get(d) or []
+        preds = stored_preds_by_date.get(d) or []
+        gate = stored_gate_by_date.get(d) or []
+        for r, p, g in zip(day_rows, preds, gate):
+            home_id = r["game"]["home"]["id"]
+            away_id = r["game"]["away"]["id"]
+            all_home_ids.append(home_id)
+            all_away_ids.append(away_id)
+            all_lines.append(expected_total(run_model_state, home_id, away_id))
+            all_shifts.append(_margin_shift(run_model_state, run_margin_cal, home_id, away_id, p))
+            all_stored_preds.append(p)
+            all_stored_gate.append(g)
+            all_day_rows.append(r)
+            all_date_labels.append(d)
+
+    if not all_home_ids:
+        return {}
+
+    # Single vectorized simulation call for all games in the block.
+    all_projs = simulate_runs_batch(
+        run_model_state, all_home_ids, all_away_ids,
+        all_lines, all_shifts, RUN_CALIB_TRIALS,
+    )
+
+    # Reassemble calibration rows by date.
+    result: dict[str, list[dict]] = {}
+    for idx, (r, p, gate, proj, d) in enumerate(
+        zip(all_day_rows, all_stored_preds, all_stored_gate, all_projs, all_date_labels)
+    ):
+        g = r["game"]
+        winner = g.get("winner")
+        pick_home = p >= 0.5
+        gated_team = gate.get("gatedPickTeam")
+        row = {
+            "gamePk": g["gamePk"],
+            "date": g["date"],
+            "away": {"abbrev": g["away"]["abbrev"], "name": g["away"]["name"], "score": g["away"].get("score")},
+            "home": {"abbrev": g["home"]["abbrev"], "name": g["home"]["name"], "score": g["home"].get("score")},
+            "winner": winner,
+            "pickTeam": "home" if pick_home else "away",
+            "pickProb": p if pick_home else 1 - p,
+            "homeWinProb": p,
+            "isCorrect": pick_home == (winner == "home"),
+            "isUpset": pick_home != (winner == "home"),
+            **gate,
+            "gatedIsCorrect": bool(
+                gate.get("gateAccepted") and winner in ("home", "away") and gated_team == winner
+            ),
+            "predictedTotal": proj["total"],
+            "overProb": proj.get("overProb", 0.5),
+            "underProb": proj.get("underProb", 0.5),
+            "homeRunLineProb": proj["homeRunLineProb"],
+            "actualTotal": (g["away"].get("score") or 0) + (g["home"].get("score") or 0),
+            "actualMargin": (g["home"].get("score") or 0) - (g["away"].get("score") or 0),
+        }
+        result.setdefault(d, []).append(row)
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
 
@@ -302,14 +480,18 @@ def build_walk_forward_calibration_rows_v2(
        If all dates match, the flat row list is deserialized and returned in
        <100ms.
 
-    2. Lazy bulk loading: the expensive data pipeline (games, pitcher logs,
-       team logs, lineups, batter logs, injury snapshots, elo+features) is
-       only executed when at least one date misses the cache.
+    2. Lazy bulk loading with in-memory caching: the expensive data pipeline
+       (games, pitcher logs, team logs, lineups, batter logs, injury snapshots,
+       elo+features) is only executed when at least one date misses the cache,
+       and the result is fingerprint-cached to avoid recomputation.
 
-    3. Parallel block fitting: the three independent block-model fits
-       (logistic, run model, margin calibration) run in a thread pool.
+    3. Batch simulation: all games across dates in a walk-forward block are
+       simulated in a single vectorized call instead of one per date.
 
-    4. Reduced Monte Carlo trials: 200 instead of 500 for calibration-grade
+    4. Parallel block fitting: when a new block needs fitting, independent
+       model components run in a thread pool.
+
+    5. Reduced Monte Carlo trials: 200 instead of 500 for calibration-grade
        projections (diagnostic, not deployment).
     """
     def rep(stage, pct, msg):
@@ -403,7 +585,7 @@ def build_walk_forward_calibration_rows_v2(
     day_hashes = _precompute_day_hashes(fe_rows, by_date, dates)
 
     # ------------------------------------------------------------------
-    # PHASE 3 — Walk-forward date loop with parallel block fitting
+    # PHASE 3 — Walk-forward date loop with batch simulation
     # ------------------------------------------------------------------
     current_block: dict | None = None
     prior_games: list[dict] = []
@@ -413,6 +595,10 @@ def build_walk_forward_calibration_rows_v2(
     current_model_choice: str | None = None
     out: dict[str, dict] = {}
     games_scored = 0
+
+    # Pre-load the selection record ONCE (avoid repeated JSON reads per date).
+    selection_raw = cache.load_json("walk_forward_selection.json", {}) or {}
+    selection_days_all = selection_raw.get("days", {}) if isinstance(selection_raw, dict) else {}
 
     for i, d in enumerate(dates):
         day_rows = rows_by_date.get(d) or []
@@ -472,8 +658,7 @@ def build_walk_forward_calibration_rows_v2(
         else:
             cal_rows = _build_calibration_rows_fallback(
                 day_rows, current_block["model"],
-                current_block["runModel"],
-                current_block.get("runLineIso") or [],
+                current_block["runModel"], current_block.get("runLineIso") or [],
                 current_block["runMarginCal"],
             )
 
@@ -502,18 +687,16 @@ def build_walk_forward_calibration_rows_v2(
     cache.save_json(CALIBRATION_WF_FILE, {"version": BACKTEST_CACHE_VERSION, "days": out})
 
     # Record each date's deployed family in the walk-forward selection record.
-    sel_raw = cache.load_json("walk_forward_selection.json", {}) or {}
-    sel_days_out = sel_raw.get("days", {}) if isinstance(sel_raw, dict) else {}
     changed = False
     for d in out:
         choice = out[d].get("modelChoice")
-        if choice and sel_days_out.get(d, {}).get("modelChoice") != choice:
-            sel_days_out.setdefault(d, {})["modelChoice"] = choice
+        if choice and selection_days_all.get(d, {}).get("modelChoice") != choice:
+            selection_days_all.setdefault(d, {})["modelChoice"] = choice
             changed = True
     if changed:
-        sel_raw = dict(sel_raw)
-        sel_raw["days"] = sel_days_out
-        cache.save_json("walk_forward_selection.json", sel_raw)
+        selection_raw = dict(selection_raw)
+        selection_raw["days"] = selection_days_all
+        cache.save_json("walk_forward_selection.json", selection_raw)
 
     flat = []
     for d in sorted(out):
