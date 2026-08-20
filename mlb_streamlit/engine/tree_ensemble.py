@@ -21,6 +21,9 @@ try:
 except Exception:  # pragma: no cover
     _np = None
 
+# n_jobs=1 is mandatory on Streamlit Cloud free-tier (1 vCPU / 1 GB): any
+# background thread pool spawn duplicates weight buffers and wakes the OOM
+# killer. All three library classes honor n_jobs=1 via the same kwarg.
 try:
     from sklearn.ensemble import RandomForestClassifier as _SKRF
     _HAS_SKLEARN = True
@@ -38,6 +41,71 @@ try:
     _HAS_LGBM = True
 except Exception:
     _HAS_LGBM = False
+
+
+def _single_thread_kwargs(extra: dict | None = None) -> dict:
+    """Return a kwargs dict with n_jobs=1 / nthread=1 forced across all libs.
+
+    Streamlit Cloud free tier caps the container to 1 vCPU + 1 GB RAM. Library
+    defaults (sklearn n_jobs=None, xgboost nthread=auto, lightgbm n_jobs=-1)
+    silently spawn worker pools that duplicate the model state and compete
+    for the same single core. This helper centralizes the safe values.
+    """
+    base = {"n_jobs": 1, "nthread": 1}
+    if extra:
+        # Caller-supplied overrides win for non-conflicting keys only.
+        for k, v in extra.items():
+            if k not in base:
+                base[k] = v
+    return base
+
+
+def _skrf_safe(n_estimators=200, max_depth=5, min_samples_leaf=15, random_state=42):
+    """RandomForestClassifier with single-thread guard."""
+    return _SKRF(
+        n_estimators=n_estimators,
+        max_depth=max_depth,
+        min_samples_leaf=min_samples_leaf,
+        random_state=random_state,
+        n_jobs=1,  # CRITICAL: streamlit-cloud 1 vCPU + 1 GB ceiling
+    )
+
+
+def _xgb_safe(n_estimators=150, max_depth=3, learning_rate=0.03,
+              subsample=0.8, colsample_bytree=0.8, random_state=42, **kw):
+    """XGBClassifier with single-thread guard."""
+    safe_kw = dict(
+        n_estimators=n_estimators,
+        max_depth=max_depth,
+        learning_rate=learning_rate,
+        subsample=subsample,
+        colsample_bytree=colsample_bytree,
+        eval_metric="logloss",
+        random_state=random_state,
+        n_jobs=1,    # CRITICAL: streamlit-cloud 1 vCPU
+        nthread=1,   # xgboost native thread limiter
+        verbosity=0,
+    )
+    safe_kw.update({k: v for k, v in kw.items() if k not in safe_kw})
+    return _XGB(**safe_kw)
+
+
+def _lgbm_safe(n_estimators=150, max_depth=3, learning_rate=0.03,
+               subsample=0.8, colsample_bytree=0.8, random_state=42, **kw):
+    """LGBMClassifier with single-thread guard."""
+    safe_kw = dict(
+        n_estimators=n_estimators,
+        max_depth=max_depth,
+        learning_rate=learning_rate,
+        subsample=subsample,
+        colsample_bytree=colsample_bytree,
+        random_state=random_state,
+        n_jobs=1,    # CRITICAL: streamlit-cloud 1 vCPU
+        verbose=-1,
+    )
+    safe_kw.update({k: v for k, v in kw.items() if k not in safe_kw})
+    return _LGBM(**safe_kw)
+
 
 np = _np
 
