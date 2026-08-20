@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import os
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from pathlib import Path
 
 CACHE_DIR = Path(__file__).resolve().parent / "cache"
@@ -40,7 +41,7 @@ _MARKET_ODDS = "market_odds.json"
 
 # Bump to invalidate stale backtest caches (calibration_rows_wf.json).
 # refresh.py reads this value as its source of truth.
-BACKTEST_CACHE_VERSION = 13
+BACKTEST_CACHE_VERSION = 15  # invalidate rows built before schedule-clock provenance
 
 
 def _path(name: str) -> Path:
@@ -59,6 +60,10 @@ def load_json(name: str, default=None):
 
 
 def save_json(name: str, data) -> None:
+    # Keep the raw writer safe for refresh callers that persist several files
+    # through save_many: lineups must never bypass the provenance gate.
+    if name == _LINEUPS:
+        data = _sanitize_lineup_cache_payload(data)
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     tmp = _path(name).with_suffix(".tmp")
     with open(tmp, "w", encoding="utf-8") as f:
@@ -230,14 +235,47 @@ def save_pitcher_hands(hands: dict) -> None:
     save_json(_PITCHER_HANDS, hands)
 
 
-def load_lineups() -> dict:
-    """Return a lineup cache keyed by integer ``gamePk`` values.
+def _trusted_lineup_cache_value(value) -> bool:
+    """Reject legacy/final-boxscore lineup payloads at the cache boundary."""
+    if not isinstance(value, dict):
+        return False
+    provenance = value.get("provenance")
+    if not isinstance(provenance, dict):
+        return False
+    if provenance.get("source") != "mlb_statsapi_pregame_boxscore" or provenance.get("isPregame") is not True:
+        return False
+    try:
+        captured = datetime.fromisoformat(str(provenance["capturedAt"]).replace("Z", "+00:00"))
+        first = datetime.fromisoformat(str(provenance["firstPitchAt"]).replace("Z", "+00:00"))
+        if captured.tzinfo is None:
+            captured = captured.replace(tzinfo=timezone.utc)
+        if first.tzinfo is None:
+            first = first.replace(tzinfo=timezone.utc)
+    except (KeyError, TypeError, ValueError):
+        return False
+    return captured < first and bool(
+        (value.get("home") or {}).get("battingOrder")
+        and (value.get("away") or {}).get("battingOrder")
+    )
 
-    JSON object keys are always strings on disk.  The schedule parser and the
-    lineup attachers use integer gamePk values, so returning the raw decoded
-    object silently made every cached lineup miss after the first refresh.
-    Normalize at the cache boundary and preserve explicit ``None`` markers for
-    completed games whose boxscore has no lineup.
+
+def _sanitize_lineup_cache_payload(value) -> dict:
+    if not isinstance(value, dict):
+        return {}
+    return {
+        str(key): item
+        for key, item in value.items()
+        if _trusted_lineup_cache_value(item)
+    }
+
+
+def load_lineups() -> dict:
+    """Return only explicitly pre-first-pitch lineup snapshots.
+
+    JSON object keys are always strings on disk. Legacy entries without an
+    auditable capture timestamp (including final boxscore payloads and None
+    negative-cache markers) are intentionally discarded instead of being
+    treated as historical pre-game data.
     """
     raw = load_json(_LINEUPS, {}) or {}
     if not isinstance(raw, dict):
@@ -245,15 +283,17 @@ def load_lineups() -> dict:
     normalized: dict = {}
     for key, value in raw.items():
         try:
-            normalized[int(key)] = value
+            game_pk = int(key)
         except (TypeError, ValueError):
-            # Ignore malformed cache keys rather than making every refresh fail.
             continue
+        if _trusted_lineup_cache_value(value):
+            normalized[game_pk] = value
     return normalized
 
 
 def save_lineups(lineups: dict) -> None:
-    save_json(_LINEUPS, lineups)
+    # save_json applies the same conservative filter used by save_many.
+    save_json(_LINEUPS, lineups or {})
 
 
 def load_injury_snapshots() -> dict:

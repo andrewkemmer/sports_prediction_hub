@@ -16,7 +16,7 @@ ELO_HFA_UPDATE = 30.0  # home advantage baked into Elo updates only
 
 # Bump whenever feature engineering changes so refresh fingerprints and every
 # cached prediction/backtest are invalidated and rebuilt point-in-time.
-FEATURE_VERSION = 9
+FEATURE_VERSION = 11  # schedule-clock provenance + same-day state isolation
 
 # Fixed physical scales keep live weather and interaction terms in the same
 # numeric domain as the training matrix. Logistic/MLP/kNN still fit their own
@@ -385,36 +385,55 @@ def lookup_injuries(team_id: int, date: str, snapshots) -> int:
         return 0
     best = 0
     for s in lst:
-        if s["date"] > date:
+        # Snapshots are date-granular. A snapshot recorded on the target date
+        # may have been taken after first pitch, so the safe PIT rule is T-1:
+        # only dates strictly earlier than the target game can contribute.
+        if s["date"] >= date:
             break
         best = s["count"]
     return best
 
 
 def compute_elo_and_features(games: list[dict], injury_snapshots=None, latest_date: str | None = None):
-    """Chronological pass producing feature rows + current team state."""
+    """Chronological pass producing feature rows + current team state.
+
+    The state is snapshotted once per calendar date. This is the explicit
+    ``game_date < current_target_date`` boundary: a result from another game
+    on the target date cannot become an input to a later game on that date.
+    """
     sorted_games = sorted(games, key=lambda g: g.get("gameDate") or g.get("date") or "")
     state = new_state()
     rows: list[dict] = []
-    for game in sorted_games:
-        if game["winner"] not in ("home", "away"):
-            continue
-        # Defensive guard: drop only genuinely malformed cache rows (no team
-        # ids) — never actual results. Every decided game with valid team ids
-        # still produces a training row.
-        if not (game.get("home") or {}).get("id") or not (game.get("away") or {}).get("id"):
-            continue
-        state["injuries"][game["home"]["id"]] = lookup_injuries(game["home"]["id"], game["date"], injury_snapshots)
-        state["injuries"][game["away"]["id"]] = lookup_injuries(game["away"]["id"], game["date"], injury_snapshots)
-        features = build_features(game, state)
-        rows.append({
-            "game": game,
-            "features": features,
-            "homeElo": state["elo"].get(game["home"]["id"], ELO_INIT),
-            "awayElo": state["elo"].get(game["away"]["id"], ELO_INIT),
-            "label": 1 if game["winner"] == "home" else 0,
-        })
-        update_state(state, game)
+    cursor = 0
+    while cursor < len(sorted_games):
+        target_date = sorted_games[cursor].get("date") or ""
+        end = cursor
+        while end < len(sorted_games) and (sorted_games[end].get("date") or "") == target_date:
+            end += 1
+        day_games = sorted_games[cursor:end]
+        valid_day_games: list[dict] = []
+        # Build every row from the state at the start of the date.
+        for game in day_games:
+            if game.get("winner") not in ("home", "away"):
+                continue
+            if not (game.get("home") or {}).get("id") or not (game.get("away") or {}).get("id"):
+                continue
+            valid_day_games.append(game)
+            state["injuries"][game["home"]["id"]] = lookup_injuries(game["home"]["id"], target_date, injury_snapshots)
+            state["injuries"][game["away"]["id"]] = lookup_injuries(game["away"]["id"], target_date, injury_snapshots)
+            features = build_features(game, state)
+            rows.append({
+                "game": game,
+                "features": features,
+                "homeElo": state["elo"].get(game["home"]["id"], ELO_INIT),
+                "awayElo": state["elo"].get(game["away"]["id"], ELO_INIT),
+                "label": 1 if game["winner"] == "home" else 0,
+            })
+        # Only after all target-date rows have been materialized may their
+        # outcomes enter the state used by a later date.
+        for game in valid_day_games:
+            update_state(state, game)
+        cursor = end
     # Refresh injury counts to the latest snapshot so upcoming-game
     # predictions use current roster state.
     if latest_date and injury_snapshots:

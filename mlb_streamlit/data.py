@@ -29,6 +29,7 @@ PAST_SEASON_END_MD = "11-01"
 FIP_CONSTANT = 3.1
 INJURY_SNAPSHOT_DAYS = 28
 _USER_AGENT = "FreebuffMLB/1.0"
+PREGAME_LINEUP_SOURCE = "mlb_statsapi_pregame_boxscore"
 
 
 # ---------------------------------------------------------------------------
@@ -980,8 +981,103 @@ def fetch_current_injury_snapshot(team_ids: list[int], d: str, season: str) -> d
 
 
 # ---------------------------------------------------------------------------
-# Lineups (actual starting 9 + bench, from the per-game boxscore)
+# Lineups (pre-game snapshots only)
 # ---------------------------------------------------------------------------
+
+def _parse_timestamp(value) -> datetime | None:
+    """Parse an ISO/epoch timestamp as an aware UTC datetime."""
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if isinstance(value, (int, float)) and value == value:
+        try:
+            seconds = float(value) / 1000.0 if abs(float(value)) > 10_000_000_000 else float(value)
+            return datetime.fromtimestamp(seconds, tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+            return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+        except ValueError:
+            return None
+    return None
+
+
+def _game_first_pitch(game: dict | None) -> datetime | None:
+    """Return the scheduled first-pitch timestamp, or None if it is unknown."""
+    if not isinstance(game, dict):
+        return None
+    return _parse_timestamp(game.get("gameDate") or game.get("firstPitchAt"))
+
+
+def _lineup_provenance(lineup: dict | None) -> dict:
+    if not isinstance(lineup, dict):
+        return {}
+    provenance = lineup.get("provenance")
+    if isinstance(provenance, dict):
+        return provenance
+    # Do not infer provenance from the lineup shape. These fields are accepted
+    # only when an upstream pre-game collector explicitly wrote them.
+    return {}
+
+
+def is_pregame_lineup_snapshot(lineup: dict | None, game: dict | None = None) -> bool:
+    """True only for a lineup explicitly captured before that game's first pitch.
+
+    A final boxscore contains the same batting-order shape but has no reliable
+    historical publication timestamp. Requiring an explicit provenance record
+    prevents a post-game boxscore from being mistaken for a pre-game card.
+    """
+    if not isinstance(lineup, dict):
+        return False
+    provenance = _lineup_provenance(lineup)
+    if provenance.get("isPregame") is not True:
+        return False
+    if provenance.get("source") != PREGAME_LINEUP_SOURCE:
+        return False
+    captured = _parse_timestamp(provenance.get("capturedAt"))
+    provenance_first = _parse_timestamp(provenance.get("firstPitchAt"))
+    game_first = _game_first_pitch(game)
+    # When the schedule is available, it is the authoritative target clock.
+    # A payload cannot make itself safe by supplying a later/different
+    # firstPitchAt value; capture must precede both clocks. For cache-only
+    # validation, the explicit provenance clock remains required.
+    first = game_first or provenance_first
+    if captured is None or first is None or captured >= first:
+        return False
+    if provenance_first is not None and captured >= provenance_first:
+        return False
+    expected_date = game.get("date") if isinstance(game, dict) else None
+    for timestamp in (game_first, provenance_first):
+        if expected_date and timestamp is not None and timestamp.date().isoformat() != expected_date:
+            return False
+    return bool(
+        (lineup.get("home") or {}).get("battingOrder")
+        and (lineup.get("away") or {}).get("battingOrder")
+    )
+
+
+def with_pregame_provenance(lineup: dict, captured_at, first_pitch_at) -> dict:
+    """Attach an auditable pre-game provenance record to a parsed lineup.
+
+    This helper is used by the live fetcher and by offline fixtures. It does
+    not make an after-the-fact boxscore historical: callers must provide a
+    capture timestamp that is strictly earlier than first pitch.
+    """
+    captured = _parse_timestamp(captured_at)
+    first = _parse_timestamp(first_pitch_at)
+    if captured is None or first is None or captured >= first:
+        return {}
+    return {
+        **lineup,
+        "provenance": {
+            "source": PREGAME_LINEUP_SOURCE,
+            "isPregame": True,
+            "capturedAt": captured.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "firstPitchAt": first.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
+        },
+    }
+
 
 def _boxscore_player_id(value) -> int | None:
     """Coerce Stats API player identifiers from numeric/``ID123`` shapes."""
@@ -1063,52 +1159,87 @@ def parse_boxscore_lineup(data: dict | None) -> dict | None:
     return {"home": parse_side(teams["home"]), "away": parse_side(teams["away"])}
 
 
-def fetch_game_lineup(game_pk: int) -> dict | None:
-    """Actual lineup from the boxscore. None when lineups are not posted yet.
+def parse_pregame_lineup(data: dict | None, game: dict, captured_at=None) -> dict | None:
+    """Parse a lineup payload only when it has a pre-first-pitch capture time.
 
-    A transient network failure is retried once. Callers deliberately do not
-    persist a missing completed-game response as a permanent ``None`` marker;
-    a timeout or API shape change must be retried on the next refresh.
+    The MLB Stats API exposes a boxscore both before and after a game. The
+    payload shape alone cannot tell those states apart, so the caller must
+    prove that the response was captured before ``gameDate``. A live feed's
+    post-game ``liveData.boxscore`` is intentionally not treated as a lineup
+    source here.
     """
-    data = None
+    first = _game_first_pitch(game)
+    captured = _parse_timestamp(captured_at)
+    if first is None or captured is None or captured >= first:
+        return None
+    if isinstance(data, dict) and "liveData" in data:
+        # A live feed may contain a final boxscore after first pitch. Only an
+        # explicit pregameLineups/lineups payload is eligible in that wrapper.
+        payload = data.get("pregameLineups") or data.get("lineups")
+        if not isinstance(payload, dict):
+            return None
+        data = {"teams": payload}
+    parsed = parse_boxscore_lineup(data)
+    if not parsed:
+        return None
+    trusted = with_pregame_provenance(parsed, captured, first)
+    return trusted if is_pregame_lineup_snapshot(trusted, game) else None
+
+
+def fetch_game_lineup(game: dict | int) -> dict | None:
+    """Fetch a lineup only while the scheduled game is still pre-game.
+
+    Completed games are never queried for a lineup: their boxscore would be a
+    post-game fallback and would leak the realized starting nine into a
+    historical training row. A pre-game snapshot captured during an earlier
+    refresh is loaded from cache instead.
+    """
+    if isinstance(game, dict):
+        game_record = game
+        game_pk = game.get("gamePk")
+    else:
+        # The legacy integer-only call has no scheduled timestamp and therefore
+        # cannot satisfy the PIT contract.
+        game_record = {}
+        game_pk = game
+    first = _game_first_pitch(game_record)
+    now = datetime.now(timezone.utc)
+    if not game_pk or first is None or now >= first:
+        return None
+    url = f"{MLB_BASE}/api/v1/game/{game_pk}/boxscore"
     for attempt in (0, 1):
         try:
-            req = urllib.request.Request(
-                f"{MLB_BASE}/api/v1/game/{game_pk}/boxscore",
-                headers={"User-Agent": _USER_AGENT},
-            )
-            with urllib.request.urlopen(req, timeout=20) as r:
-                data = json.load(r)
-            break
-        except Exception:  # noqa: BLE001 — empty boxscore is expected pre-lineup
-            if attempt == 1:
+            data = fetch_json(url)
+            captured = datetime.now(timezone.utc)
+            # The response must itself arrive before first pitch; a request
+            # that started pre-game but finished after it is not admissible.
+            if captured >= first:
                 return None
-            time.sleep(0.5)
-    return parse_boxscore_lineup(data)
+            return parse_pregame_lineup(data, game_record, captured)
+        except Exception:  # noqa: BLE001 — lineup availability is best-effort
+            if attempt == 0:
+                time.sleep(0.5)
+    return None
 
 
 def fetch_lineups_for_games(games: list[dict], concurrency: int = 16) -> dict:
     out: dict[int, dict] = {}
     seen = set()
     targets = []
+    now = datetime.now(timezone.utc)
     for g in games:
-        if g["gamePk"] in seen:
+        pk = g.get("gamePk")
+        first = _game_first_pitch(g)
+        # Never make a historical boxscore request. Missing historical cards
+        # remain missing rather than being reconstructed from final results.
+        if pk in seen or first is None or first <= now:
             continue
-        seen.add(g["gamePk"])
+        seen.add(pk)
         targets.append(g)
 
     def fetch(g):
-        lu = fetch_game_lineup(g["gamePk"])
-        # Keep partial but real orders: the feature layer marks a side as
-        # `known` only when it has enough pre-game stat coverage. Dropping a
-        # valid API payload here was the source of a large silent blackout.
-        if (
-            lu
-            and (lu.get("home") or {}).get("battingOrder")
-            and (lu.get("away") or {}).get("battingOrder")
-        ):
-            return g["gamePk"], lu
-        return g["gamePk"], None
+        lu = fetch_game_lineup(g)
+        return g["gamePk"], lu if is_pregame_lineup_snapshot(lu, g) else None
 
     for pk, lu in map_limit(targets, concurrency, fetch):
         if lu:
@@ -1137,34 +1268,15 @@ def lineup_ops(lineup: list[dict] | None) -> float:
 
 
 def attach_lineups(games: list[dict], lineups: dict, player_ops: dict) -> list[dict]:
-    out = []
-    for g in games:
-        lu = lineups.get(g["gamePk"])
-        if not lu:
-            out.append(g)
-            continue
+    """Deprecated compatibility shim that refuses non-PIT season aggregates.
 
-        def with_ops(side):
-            if not side:
-                return side
-            return {
-                "battingOrder": [{**p, "ops": player_ops.get(p["id"])} for p in side["battingOrder"]],
-                "bench": [{**p, "ops": player_ops.get(p["id"])} for p in side["bench"]],
-            }
-
-        home = with_ops(lu.get("home"))
-        away = with_ops(lu.get("away"))
-        home_ops = lineup_ops(home["battingOrder"]) if home else 0.0
-        away_ops = lineup_ops(away["battingOrder"]) if away else 0.0
-        out.append({
-            **g,
-            "lineups": {"home": home, "away": away},
-            "lineupStats": {
-                "home": {"known": home_ops > 0, "ops": home_ops},
-                "away": {"known": away_ops > 0, "ops": away_ops},
-            },
-        })
-    return out
+    The old helper combined a lineup with full-season ``player_ops`` values,
+    which cannot prove those values were available before each target game.
+    Active callers use ``attach_lineups_as_of`` with per-game logs; keeping
+    this entry point inert prevents an older refresh path from reintroducing
+    final-boxscore or post-game-stat leakage.
+    """
+    return list(games)
 
 
 def fetch_player_season_ops(ids: list[int], season: str, cached: dict | None = None) -> dict:
@@ -1461,8 +1573,9 @@ def attach_lineups_as_of(
     outcomes) and compute every player metric from log entries with
     ``date < game.date``. This keeps the feature values point-in-time while
     allowing historical training rows to retain their real pre-game lineup
-    when callers explicitly pass ``pregame_only=False``. The safe default
-    excludes completed-game boxscores from live/prediction callers.
+    even for completed historical games, but only when the cached card has
+    an explicit capture timestamp before first pitch. The legacy
+    ``pregame_only`` flag cannot bypass that provenance check.
 
     One chronological pass with per-batter cursors (amortized O(1) per game),
     then restores input order. Output is byte-identical to the naive rescan.
@@ -1490,25 +1603,18 @@ def attach_lineups_as_of(
             }
     for i in order:
         g = games[i]
-        # The boxscore's ``battingOrder`` is the starting lineup, while all
-        # player stats below are accumulated strictly before ``ymd``.
-        status = g.get("status")
-        if isinstance(status, str):
-            status_name = status
-        elif isinstance(status, dict):
-            status_name = status.get("abstractGameState") or status.get("detailedState")
-        else:
-            status_name = ""
-        completed = g.get("winner") in ("home", "away") or str(status_name or "").lower() in {"final", "closed", "completed"}
-        if pregame_only and completed:
-            out[i] = g
-            continue
+        # A lineup is usable only when the upstream snapshot explicitly proves
+        # it was captured before first pitch. The compatibility flag remains in
+        # the signature but cannot authorize a final boxscore.
         lu = lineups.get(g["gamePk"]) or lineups.get(str(g["gamePk"]))
-        if not lu:
+        if not is_pregame_lineup_snapshot(lu, g):
             out[i] = g
             continue
         season = g.get("season")
         ymd = g["date"]
+        # Carry the auditable pre-game capture record through feature
+        # enrichment so downstream matchup code can re-check provenance.
+        lineup_provenance = dict(_lineup_provenance(lu))
 
         def batter(p, team_id, opponent_id, starter):
             target_hand = (starter or {}).get("pitchHand")
@@ -1562,7 +1668,7 @@ def attach_lineups_as_of(
         away_known = bool(away and any(isinstance(p.get("ops"), (int, float)) for p in away["battingOrder"]))
         out[i] = {
             **g,
-            "lineups": {"home": home, "away": away},
+            "lineups": {"home": home, "away": away, "provenance": lineup_provenance},
             "lineupStats": {
                 "home": {
                     "known": home_known,
@@ -1832,8 +1938,14 @@ def attach_matchups(
     edge is the PA-saturated, slot-weighted mean over the starting 9."""
     out = []
     for g in games:
+        # Current-season matchup endpoints expose totals as of fetch time, not
+        # as-of a historical game. Never attach them to a decided game even if
+        # a caller accidentally passes one into this helper.
+        if g.get("winner") in ("home", "away"):
+            out.append(g)
+            continue
         lu = g.get("lineups")
-        if not lu:
+        if not is_pregame_lineup_snapshot(lu, g):
             out.append(g)
             continue
         season = g.get("season") or ""
@@ -1882,10 +1994,14 @@ def attach_matchups(
                 "bench": [map_batter(p, starter, opp_team_id) for p in side["bench"]],
             }
 
+        lineup_provenance = dict(_lineup_provenance(lu))
         home = with_matchup(lu.get("home"), g.get("awayPitcher"), (g.get("away") or {}).get("id"))
         away = with_matchup(lu.get("away"), g.get("homePitcher"), (g.get("home") or {}).get("id"))
         if not g.get("lineupStats"):
-            out.append({**g, "lineups": {"home": home, "away": away}})
+            out.append({
+                **g,
+                "lineups": {"home": home, "away": away, "provenance": lineup_provenance},
+            })
             continue
 
         def extend(side_stats, batters):
@@ -1899,7 +2015,7 @@ def attach_matchups(
 
         out.append({
             **g,
-            "lineups": {"home": home, "away": away},
+            "lineups": {"home": home, "away": away, "provenance": lineup_provenance},
             "lineupStats": {
                 "home": extend(g["lineupStats"].get("home") or {}, (home or {}).get("battingOrder")),
                 "away": extend(g["lineupStats"].get("away") or {}, (away or {}).get("battingOrder")),
@@ -1931,6 +2047,11 @@ def enrich_with_matchups(
     seen_vs_team: set[str] = set()
     seen_hand: set[int] = set()
     for g in games:
+        # Matchup caches are fetched at refresh time and therefore are valid
+        # only for games that have not started. Historical rows must use only
+        # the T-1 log slices computed by attach_lineups_as_of.
+        if g.get("winner") in ("home", "away"):
+            continue
         lu = g.get("lineups")
         if not lu:
             continue

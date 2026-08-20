@@ -41,6 +41,7 @@ from mlb_streamlit.data import (  # noqa: E402
     matchup_lineup_mean,
     matchup_ops,
     matchup_pa,
+    with_pregame_provenance,
 )
 from mlb_streamlit.engine.features import (  # noqa: E402
     FEATURE_KEYS,
@@ -645,6 +646,8 @@ def test_lineups() -> None:
     g26 = {"gamePk": 2, "date": "2026-06-01", "season": "2026",
            "home": {"id": 119, "name": "Dodgers", "abbrev": "LAD"},
            "away": {"id": 108, "name": "Angels", "abbrev": "LAA"}}
+    lineup24 = with_pregame_provenance(lineup, "2024-06-01T12:00:00Z", "2024-06-01T18:00:00Z")
+    lineup26 = with_pregame_provenance(lineup, "2026-06-01T12:00:00Z", "2026-06-01T18:00:00Z")
 
     def ent(pid, season, h, tb, dbl=0, hr=0, bb=0):
         return {f"{pid}|{season}": [{"d": f"{season}-05-01", "ab": 4, "h": h, "bb": bb, "ibb": 0,
@@ -662,8 +665,8 @@ def test_lineups() -> None:
     for pid in (3, 4):
         batter_logs.update(ent(pid, "2026", 1, 1))
     st = new_state()
-    f24 = build_features_for_game(attach_lineups_as_of([g24], {1: lineup}, batter_logs, pregame_only=False)[0], st)
-    f26 = build_features_for_game(attach_lineups_as_of([g26], {2: lineup}, batter_logs, pregame_only=False)[0], st)
+    f24 = build_features_for_game(attach_lineups_as_of([g24], {1: lineup24}, batter_logs, pregame_only=False)[0], st)
+    f26 = build_features_for_game(attach_lineups_as_of([g26], {2: lineup26}, batter_logs, pregame_only=False)[0], st)
     check("lineupKnown=1 with lineups", f24["lineupKnown"] == 1 and f26["lineupKnown"] == 1)
     check("lineupOpsDiff non-zero", f24["lineupOpsDiff"] > 0 and f26["lineupOpsDiff"] > 0)
     check("per-season OPS respected", f26["lineupOpsDiff"] > f24["lineupOpsDiff"],
@@ -681,7 +684,7 @@ def test_lineups() -> None:
                           "sf": 0, "tb": 8, "2b": 2, "3b": 0, "hr": 1}]
         for pid in (1, 2, 3, 4)
     }
-    f_leak = build_features_for_game(attach_lineups_as_of([g24], {1: lineup}, leaky, pregame_only=False)[0], st)
+    f_leak = build_features_for_game(attach_lineups_as_of([g24], {1: lineup24}, leaky, pregame_only=False)[0], st)
     check("no-lookahead lineup (post-game entries excluded)",
           f_leak["lineupKnown"] == 0 and f_leak["lineupOpsDiff"] == 0.0
           and f_leak["lineupWobaDiff"] == 0.0 and f_leak["lineupIsoDiff"] == 0.0
@@ -714,6 +717,7 @@ def test_lineups() -> None:
         "home": {"battingOrder": [{"id": 11, "name": "H1"}, {"id": 12, "name": "H2"}], "bench": []},
         "away": {"battingOrder": [{"id": 21, "name": "A1"}, {"id": 22, "name": "A2"}], "bench": []},
     }
+    traj_lineup = with_pregame_provenance(traj_lineup, "2026-05-20T12:00:00Z", "2026-05-20T18:00:00Z")
     tg = {"gamePk": 9, "date": "2026-05-20", "season": "2026",
           "home": {"id": 119}, "away": {"id": 108}}
     attached_t = attach_lineups_as_of([tg], {9: traj_lineup}, traj_logs, pregame_only=False)[0]
@@ -786,6 +790,7 @@ def test_matchups() -> None:
         "home": {"battingOrder": [{"id": 11, "name": "H1"}, {"id": 12, "name": "H2"}], "bench": []},
         "away": {"battingOrder": [{"id": 21, "name": "A1"}, {"id": 22, "name": "A2"}], "bench": []},
     }
+    lineup = with_pregame_provenance(lineup, "2026-06-01T12:00:00Z", "2026-06-01T18:00:00Z")
     game = {
         "gamePk": 1,
         "date": "2026-06-01",
@@ -896,12 +901,13 @@ def test_matchups() -> None:
     check("enrich attaches games", result["games"][0]["lineupStats"]["home"]["bvpOps"] == 0.775)
 
     # Past-season splits are reused from the cache (cached= passed through);
+    past_lineup = with_pregame_provenance(lineup, "2025-06-01T12:00:00Z", "2025-06-01T18:00:00Z")
     # current-season splits always refetch (cached={}).
     past = {"gamePk": 3, "date": "2025-06-01", "season": "2025",
             "home": {"id": 119}, "away": {"id": 108},
             "homePitcher": {"id": 901, "pitchHand": "L"},
             "awayPitcher": {"id": 902, "pitchHand": "R"},
-            "lineups": lineup,
+            "lineups": past_lineup,
             "lineupStats": {"home": {"known": True, "ops": 0.8}, "away": {"known": True, "ops": 0.7}}}
     calls = {"bvp": [], "platoon": [], "vs": [], "hands": []}
     data.fetch_platoon_splits = fake_platoon
@@ -925,10 +931,11 @@ def test_matchups() -> None:
           f"platoon calls={calls['platoon']}")
 
     # 6. pitcher-hand fallback fetch when the schedule hydrate omits the hand.
+    no_hand_lineup = with_pregame_provenance(lineup, "2026-06-02T12:00:00Z", "2026-06-02T18:00:00Z")
     no_hand = {"gamePk": 4, "date": "2026-06-02", "season": "2026",
                "home": {"id": 119}, "away": {"id": 108},
                "homePitcher": {"id": 901}, "awayPitcher": {"id": 902},
-               "lineups": lineup,
+               "lineups": no_hand_lineup,
                "lineupStats": {"home": {"known": True, "ops": 0.8}, "away": {"known": True, "ops": 0.7}}}
     calls = {"bvp": [], "platoon": [], "vs": [], "hands": []}
     data.fetch_pitcher_hands = fake_hands
@@ -1177,6 +1184,10 @@ def test_as_of_pointer_equiv() -> None:
         1: {"home": {"battingOrder": home9, "bench": [batter(3001)]}, "away": {"battingOrder": away9, "bench": []}},
         4: {"home": {"battingOrder": home9, "bench": []}, "away": {"battingOrder": away9, "bench": []}},
     }
+    lineups = {
+        1: data.with_pregame_provenance(lineups[1], "2026-04-01T12:00:00Z", "2026-04-01T18:00:00Z"),
+        4: data.with_pregame_provenance(lineups[4], "2026-04-08T12:00:00Z", "2026-04-08T18:00:00Z"),
+    }
     batter_logs: dict[str, list[dict]] = {}
     for bid in list(range(1001, 1010)) + list(range(2001, 2010)) + [3001]:
         batter_logs[f"{bid}|2026"] = [
@@ -1241,7 +1252,7 @@ def test_as_of_pointer_equiv() -> None:
 
             out.append({
                 **g,
-                "lineups": {"home": home, "away": away},
+                "lineups": {"home": home, "away": away, "provenance": data._lineup_provenance(lu)},
                 "lineupStats": {
                     "home": ls(home["battingOrder"] if home else None, home_known),
                     "away": ls(away["battingOrder"] if away else None, away_known),

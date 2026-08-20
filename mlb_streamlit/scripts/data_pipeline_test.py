@@ -17,7 +17,14 @@ ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(ROOT))
 
 from mlb_streamlit import cache  # noqa: E402
-from mlb_streamlit.data import attach_lineups_as_of, parse_boxscore_lineup  # noqa: E402
+import mlb_streamlit.data as data_module  # noqa: E402
+from mlb_streamlit.data import (  # noqa: E402
+    attach_as_of_stats,
+    attach_lineups_as_of,
+    is_pregame_lineup_snapshot,
+    parse_boxscore_lineup,
+    with_pregame_provenance,
+)
 from mlb_streamlit.engine.ensemble import boosted_stumps_params, boosted_stumps_predict  # noqa: E402
 from mlb_streamlit.engine.features import (  # noqa: E402
     FEATURE_KEYS,
@@ -114,15 +121,33 @@ def make_logs(prefix: int) -> dict:
 
 def test_pipeline() -> None:
     print("lineup parser and PIT feature population")
-    lineup = parse_boxscore_lineup(make_boxscore())
-    check("boxscore parser returns both sides", lineup is not None)
+    parsed_lineup = parse_boxscore_lineup(make_boxscore())
+    check("boxscore parser returns both sides", parsed_lineup is not None)
     check("canonical batters array yields nine starters",
-          len(lineup["home"]["battingOrder"]) == 9
-          and len(lineup["away"]["battingOrder"]) == 9)
+          len(parsed_lineup["home"]["battingOrder"]) == 9
+          and len(parsed_lineup["away"]["battingOrder"]) == 9)
     check("bench remains separate",
-          len(lineup["home"]["bench"]) == 1 and lineup["home"]["bench"][0]["id"] == 1099)
+          len(parsed_lineup["home"]["bench"]) == 1 and parsed_lineup["home"]["bench"][0]["id"] == 1099)
 
     game = make_game()
+    lineup = with_pregame_provenance(parsed_lineup, "2026-04-20T12:00:00Z", game["gameDate"])
+    check("unprovenanced lineup is rejected",
+          attach_lineups_as_of([game], {game["gamePk"]: parsed_lineup}, {}, pregame_only=False)[0] == game)
+    check("post-first-pitch capture cannot be trusted",
+          with_pregame_provenance(parsed_lineup, "2026-04-20T19:00:00Z", game["gameDate"]) == {})
+    claimed_late_first = with_pregame_provenance(
+        parsed_lineup, "2026-04-20T18:30:00Z", "2026-04-20T20:00:00Z"
+    )
+    check("provenance cannot move first pitch past the schedule",
+          not is_pregame_lineup_snapshot(claimed_late_first, game))
+    original_fetch_json = data_module.fetch_json
+    fetch_calls = []
+    data_module.fetch_json = lambda url: fetch_calls.append(url) or make_boxscore()
+    try:
+        check("historical lineup fetch never falls back to boxscore",
+              data_module.fetch_lineups_for_games([game]) == {} and fetch_calls == [])
+    finally:
+        data_module.fetch_json = original_fetch_json
     enriched = attach_lineups_as_of(
         [game],
         {game["gamePk"]: lineup},
@@ -149,6 +174,20 @@ def test_pipeline() -> None:
     check("lineup fatigue interaction is bounded", -1 <= features["lineupFatigueDiff"] <= 1,
           str(features["lineupFatigueDiff"]))
 
+    # Same-day logs are not T-1 history. The target-day pitcher line must not
+    # change the target row's workload/ERA, even when it appears in the cache.
+    pitcher_logs = {
+        "9001|2026": [
+            {"d": "2026-04-19", "ip": 6.0, "er": 1.0, "so": 6.0, "bb": 1.0, "hbp": 0.0, "hr": 0.0, "h": 5.0},
+            {"d": "2026-04-20", "ip": 6.0, "er": 6.0, "so": 0.0, "bb": 8.0, "hbp": 0.0, "hr": 2.0, "h": 12.0},
+        ],
+        "9002|2026": [],
+    }
+    as_of = attach_as_of_stats([game], pitcher_logs, {})[0]
+    check("pitcher T-1 cutoff excludes target-day log",
+          as_of["homePitcher"]["era"] == 1.5 and as_of["homePitcher"]["workload"] == 6.0,
+          f"{as_of['homePitcher']}")
+
     drift_rows = [
         {"features": {"homeField": 1.0, "tempDev": float(i) / 10}}
         for i in range(10)
@@ -162,10 +201,14 @@ def test_pipeline() -> None:
     old_cache_dir = cache.CACHE_DIR
     cache.CACHE_DIR = Path(tmp)
     try:
-        cache.save_lineups({"123": lineup, 456: lineup})
+        cache.save_lineups({"123": lineup, 456: lineup, "999": parsed_lineup})
         loaded = cache.load_lineups()
         check("lineup cache normalizes JSON string keys", 123 in loaded and 456 in loaded)
+        check("lineup cache rejects unprovenanced payload", 999 not in loaded)
         check("lineup cache retains actual payload", len(loaded[123]["home"]["battingOrder"]) == 9)
+        cache.save_json("lineups.json", {"777": parsed_lineup, "123": lineup})
+        reloaded = cache.load_lineups()
+        check("raw lineup writer also rejects unprovenanced payload", 777 not in reloaded and 123 in reloaded)
     finally:
         cache.CACHE_DIR = old_cache_dir
         shutil.rmtree(tmp, ignore_errors=True)

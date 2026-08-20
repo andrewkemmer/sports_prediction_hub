@@ -180,7 +180,7 @@ def build_walk_forward_calibration_rows_v2(
                     lineups[int(pk)] = lu
                 except (TypeError, ValueError):
                     pass
-        enriched = attach_lineups_as_of(enriched, lineups, cache.load_batter_logs(), pregame_only=False)
+        enriched = attach_lineups_as_of(enriched, lineups, cache.load_batter_logs(), pregame_only=True)
         enriched = [g for g in enriched if (g.get("date") or "") < today]
         if not enriched:
             return []

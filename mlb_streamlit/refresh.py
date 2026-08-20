@@ -80,7 +80,7 @@ def _market_odds_snapshot(odds_map: dict | None) -> dict:
     payload = cache.load_market_odds() or {}
     return stamp_market_odds(odds_map, payload.get("fetchedAt"))
 
-PREDICTION_VERSION = 12  # invalidate docs whenever the PIT market/EV execution layer changes
+PREDICTION_VERSION = 14  # invalidate docs when schedule-clock PIT provenance changes
 BACKTEST_STATES_FILE = "backtest_states.json"
 BACKTEST_CACHE_VERSION = cache.BACKTEST_CACHE_VERSION  # invalidate stale point-in-time rows when the gate recipe changes
 WF_REFIT_DAYS = 7  # refit the walk-forward model every N days (games in a block share a model)
@@ -441,14 +441,13 @@ def merge_raw_with_stored(fresh: dict, stored: dict) -> dict:
     }
 
 
-def _data_fingerprint(completed: list[dict], injury_counts: dict) -> str:
-    """Stable hash of everything the trained model depends on.
+def _data_fingerprint(completed: list[dict], injury_counts: dict, lineups: dict | None = None) -> str:
+    """Stable hash of every input that can change a trained feature matrix.
 
-    Every completed game (id, date, result, score) plus each team's current
-    injured-list count. When this matches the stored fingerprint, retraining
-    would produce an identical model, so the refresh can reuse the stored
-    state and only re-score the fresh window. Sort order is fixed so the hash
-    is stable across runs.
+    Game results, injury counts, and trusted pre-game lineup provenance are
+    included. Unprovenanced/final-boxscore payloads are never fingerprinted as
+    valid lineup data. This prevents the fast refresh path from reusing a model
+    after a historical pre-game card arrives in the cache.
     """
     lines = []
     for g in completed:
@@ -458,6 +457,20 @@ def _data_fingerprint(completed: list[dict], injury_counts: dict) -> str:
         )
     for tid in sorted(injury_counts):
         lines.append(f"il:{tid}:{injury_counts[tid]}")
+    for pk, lineup in sorted((lineups or {}).items(), key=lambda item: str(item[0])):
+        provenance = (lineup or {}).get("provenance") or {}
+        if not provenance.get("isPregame"):
+            continue
+        players = []
+        for side_name in ("home", "away"):
+            players.extend(
+                str(p.get("id"))
+                for p in ((lineup.get(side_name) or {}).get("battingOrder") or [])
+            )
+        lines.append(
+            f"lineup:{pk}|{provenance.get('capturedAt')}|{provenance.get('firstPitchAt')}|"
+            f"{','.join(players)}"
+        )
     # Feature-engineering version participates in the fingerprint so a change
     # to how features are computed (e.g. a point-in-time leak fix) forces a
     # full retrain instead of reusing a model trained on stale features.
@@ -544,7 +557,7 @@ def _refresh_fast(fresh: list[dict], all_games: list[dict], cached_state: dict, 
     b0 = len(batter_log_cache)
     if to_fetch_batter:
         batter_log_cache.update(fetch_batter_game_logs(to_fetch_batter, season, batter_log_cache))
-    enriched = attach_lineups_as_of(enriched, lineups, batter_log_cache, pregame_only=False)
+    enriched = attach_lineups_as_of(enriched, lineups, batter_log_cache, pregame_only=True)
 
     rep("Scoring fresh games", 78, "Predicting with the stored model…")
     matchup = enrich_with_matchups(
@@ -801,7 +814,7 @@ def run_refresh(
     # intraday roster change still triggers a retrain.
     rep("Checking for changes", 22, "Comparing data fingerprint…")
     current_injury = fetch_current_injury_snapshot(team_ids, today, season)
-    fingerprint = _data_fingerprint(completed, current_injury)
+    fingerprint = _data_fingerprint(completed, current_injury, lineup_cache)
     if (
         not force_full
         and cached_state
@@ -878,7 +891,7 @@ def run_refresh(
         for fut in futures:
             batter_log_cache.update(fut.result())
     rep("Batter game logs loaded", 48, f"Cached {len(batter_log_cache)} batter-season logs.")
-    enriched = attach_lineups_as_of(enriched, lineups, batter_log_cache, pregame_only=False)
+    enriched = attach_lineups_as_of(enriched, lineups, batter_log_cache, pregame_only=True)
 
     # 6c. Matchup edges (BvP / platoon / vs-team): only for games in the fresh
     #    window (real boxscore lineup + opposing starter both known), mirroring
@@ -1203,7 +1216,7 @@ def _backtest_state(target: str, report=None) -> dict | None:
     ]
     if len(prior) < MIN_COMPLETED_GAMES:
         return None
-    fingerprint = _data_fingerprint(prior, {})
+    fingerprint = _data_fingerprint(prior, {}, cache.load_lineups())
 
     states_raw = cache.load_json(BACKTEST_STATES_FILE, {}) or {}
     states = states_raw.get("days", {}) if isinstance(states_raw, dict) and "days" in states_raw else {}
@@ -1226,7 +1239,7 @@ def _backtest_state(target: str, report=None) -> dict | None:
             except (TypeError, ValueError):
                 pass
     batter_log_cache = cache.load_batter_logs()
-    enriched = attach_lineups_as_of(enriched, lineups, batter_log_cache, pregame_only=False)
+    enriched = attach_lineups_as_of(enriched, lineups, batter_log_cache, pregame_only=True)
     # No matchup enrichment: current-season platoon/vs-team splits are
     # season-to-date and would leak post-target games into training features.
     completed_enriched = [g for g in enriched if g.get("winner") in ("home", "away")]
@@ -1411,7 +1424,7 @@ def build_walk_forward_calibration_rows(
         # stat remains strictly date < game.date inside attach_lineups_as_of,
         # so retaining completed-game lineups is PIT-safe and prevents a
         # silent all-zero historical lineup matrix.
-        enriched = attach_lineups_as_of(enriched, lineups, cache.load_batter_logs(), pregame_only=False)
+        enriched = attach_lineups_as_of(enriched, lineups, cache.load_batter_logs(), pregame_only=True)
         enriched = [g for g in enriched if (g.get("date") or "") < today]
         if not enriched:
             return []
@@ -1701,7 +1714,8 @@ def predict_date(date: str, state: dict | None = None, report=None) -> int:
         f_lineups = pool.submit(fetch_lineups_for_games, raw, 16)
         fresh_pitcher_logs = f_pitcher.result()
         fresh_team_logs = f_team.result()
-        lineups = f_lineups.result()
+        lineups = cache.load_lineups()
+        lineups.update(f_lineups.result())
     pitcher_log_cache.update(fresh_pitcher_logs)
     team_log_cache.update(fresh_team_logs)
 
@@ -1719,7 +1733,7 @@ def predict_date(date: str, state: dict | None = None, report=None) -> int:
     if to_fetch:
         fresh_batter_logs = fetch_batter_game_logs(to_fetch, season, batter_log_cache)
         batter_log_cache.update(fresh_batter_logs)
-    enriched = attach_lineups_as_of(enriched, lineups, batter_log_cache, pregame_only=False)
+    enriched = attach_lineups_as_of(enriched, lineups, batter_log_cache, pregame_only=True)
 
     # Matchup edges (BvP / platoon / vs-team) for the selected date's real
     # lineups, mirroring React's predictDate. Market odds are independent and

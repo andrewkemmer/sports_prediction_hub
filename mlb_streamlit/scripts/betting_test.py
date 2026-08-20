@@ -8,7 +8,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(ROOT))
 
-from mlb_streamlit.data import attach_lineups_as_of  # noqa: E402
+from mlb_streamlit.data import attach_lineups_as_of, with_pregame_provenance  # noqa: E402
 from mlb_streamlit.engine.betting import (  # noqa: E402
     american_implied_probability,
     american_to_decimal,
@@ -146,8 +146,11 @@ def main() -> None:
         "away": {"id": 2},
     }
     scheduled_game = {**completed_game, "gamePk": 2, "status": "Scheduled", "winner": None}
+    scheduled_lineup = with_pregame_provenance(
+        lineup, "2026-08-19T12:00:00Z", scheduled_game["gameDate"]
+    )
     guarded = attach_lineups_as_of([completed_game], {1: lineup}, {})[0]
-    live_lineup = attach_lineups_as_of([scheduled_game], {2: lineup}, {})[0]
+    live_lineup = attach_lineups_as_of([scheduled_game], {2: scheduled_lineup}, {})[0]
     check("completed boxscore lineup is excluded by default", "lineups" not in guarded)
     check("scheduled lineup remains available", "lineups" in live_lineup)
 

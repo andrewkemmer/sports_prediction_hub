@@ -37,7 +37,7 @@ WF_SELECTION_FILE = "walk_forward_selection.json"
 # disable the live abstention layer. Version 10 adds per-date `gateDetails`
 # (the full compact gate result per game) so the walk-forward calibration
 # backtest can reuse these predictions instead of re-fitting the same models.
-WF_SELECTION_VERSION = 11
+WF_SELECTION_VERSION = 13  # schedule-clock provenance + T-1 state boundary
 WF_SELECTION_REFIT_DAYS = 7  # candidates share a fit within a block (matches calibration)
 WF_TRAIN_WINDOW = 2000  # rolling window of most-recent prior games for each candidate fit
 WF_MLP_EPOCHS = 20  # the MLP fit dominates backtest CPU; cap it for the repeated walk-forward fits
@@ -173,6 +173,12 @@ def _game_line(g: dict) -> str:
     )
 
 
+def _row_feature_line(row: dict) -> str:
+    """Stable feature digest so lineup/log changes invalidate WF caches."""
+    values = row.get("features") or {}
+    return "|".join(f"{name}:{values.get(name, 0.0)!r}" for name in MODEL_FEATURE_KEYS)
+
+
 def _load_completed_rows(today: str) -> list[dict]:
     """Load completed games (< today), enrich as-of their own dates, and return
     the chronological feature rows."""
@@ -190,7 +196,7 @@ def _load_completed_rows(today: str) -> list[dict]:
                 lineups[int(pk)] = lu
             except (TypeError, ValueError):
                 pass
-    enriched = attach_lineups_as_of(enriched, lineups, cache.load_batter_logs(), pregame_only=False)
+    enriched = attach_lineups_as_of(enriched, lineups, cache.load_batter_logs(), pregame_only=True)
     enriched = [g for g in enriched if (g.get("date") or "") < today]
     return compute_elo_and_features(enriched, cache.load_injury_snapshots(), today)["rows"]
 
@@ -271,7 +277,9 @@ def build_walk_forward_selection(report=None, rows=None) -> dict:
             continue
         while ptr < len(fe_rows) and fe_rows[ptr]["game"]["date"] < d:
             prior_games.append(fe_rows[ptr]["game"])
-            prior_hash.update(_game_line(fe_rows[ptr]["game"]).encode("utf-8"))
+            prior_hash.update(
+                f"{_game_line(fe_rows[ptr]['game'])}|{_row_feature_line(fe_rows[ptr])}".encode("utf-8")
+            )
             ptr += 1
         if len(prior_games) < MIN_PRIOR_GAMES:
             current_model = None
@@ -279,8 +287,13 @@ def build_walk_forward_selection(report=None, rows=None) -> dict:
             current_features = None
             current_gate = None
             continue
-        day_hash = hashlib.sha256(
-            "\n".join(sorted(_game_line(g) for g in by_date[d])).encode("utf-8")
+        day_hash = hashlib.sha256(                "\n".join(
+                    sorted(
+                        f"{_game_line(r['game'])}|{_row_feature_line(r)}"
+                        for r in rows_by_date[d]
+                    )
+                ).encode("utf-8")
+
         ).hexdigest()
         fp = hashlib.sha256((prior_hash.hexdigest() + "|" + day_hash).encode("utf-8")).hexdigest()
         cached_day = existing.get(d)
