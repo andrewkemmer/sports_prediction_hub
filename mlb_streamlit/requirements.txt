@@ -10,8 +10,11 @@ plotly>=5.20.0         # calibration & rolling-Brier charts
 # pure Python when numpy is not installed.
 numpy>=1.24.0
 
-# Optional tree ensemble accelerators.  The engine has pure-Python fallback
-# implementations for all three; installing these gives a 10-50x speedup.
-scikit-learn>=1.3.0    # RandomForestClassifier
-xgboost>=2.0.0         # XGBClassifier
-lightgbm>=4.0.0        # LGBMClassifier
+# Optional tree ensemble accelerators — INSTALLED ONLY in Docker or locally.
+# The engine has pure-Python fallback implementations for all three;
+# installing these gives a 10-50x speedup on the candidate-pool training.
+# Streamlit Cloud builds these are excluded to avoid C++ compilation timeouts;
+# add them back in the Docker image or local environment for best performance.
+# scikit-learn>=1.3.0    # RandomForestClassifier
+# xgboost>=2.0.0         # XGBClassifier
+# lightgbm>=4.0.0        # LGBMClassifier

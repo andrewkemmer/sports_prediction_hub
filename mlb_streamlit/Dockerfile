@@ -18,6 +18,10 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install -r requirements.txt
 
+# Install optional ML accelerators for Docker builds (not on Streamlit Cloud
+# where these fail to compile within the build timeout).
+RUN pip install scikit-learn>=1.3.0 xgboost>=2.0.0 lightgbm>=4.0.0
+
 # App code, theme config (.streamlit/config.toml) and engine.
 COPY . .
 
