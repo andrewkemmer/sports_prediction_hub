@@ -57,6 +57,12 @@ from .metrics import (
 from .nn import mlp_model
 from .runs import expected_margin, expected_total, fit_run_model, simulate_runs
 from .stack import fit_stack, stack_logit
+# Cache-First execution wrapper: fingerprint-disk-cache the 5-family stack
+# fit so a warm Streamlit Cloud session (1 vCPU / 1 GB) skips the expensive
+# tree/MLP refits and rehydrates from JSON in <1 s. The cache key hashes the
+# exact (train, feature_names, mlp_epochs) so a single new completed game
+# invalidates only its own walk-forward block.
+from .cache_first import cache_first_fit_stack
 from .teams import team_meta
 
 try:  # numpy is optional; only used as an accelerator
@@ -601,7 +607,7 @@ def run_model(
     #    Fit every family on the full chronological history, tune family
     #    weights + the Elo blend on a chronological holdout, then fit isotonic
     #    on the exact blend apply_model serves (stack + Elo) — train == serve.
-    stack, stack_blend_w = fit_stack(rows, selected, elo_hfa)
+    stack, stack_blend_w = cache_first_fit_stack(rows, selected, elo_hfa)
 
     # Stack-membership highlight for the monitor. `selected` above is the
     # strict best single family by holdout Brier (a rank, exactly one row);
@@ -1428,7 +1434,7 @@ def fit_deployable_model(
     deployed family and both holdout Briers for the monitor.
     """
     selected = list(feature_names)
-    stack, blend_w = fit_stack(rows, selected, elo_hfa, mlp_epochs=mlp_epochs)
+    stack, blend_w = cache_first_fit_stack(rows, selected, elo_hfa, mlp_epochs=mlp_epochs)
     full_stack = stack
     full_members = dict(stack.get("members") or {})
     # Canonical production logistic ridge per policy: λ=0.1. This is the

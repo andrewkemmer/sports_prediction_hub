@@ -24,6 +24,7 @@ signature is preserved and remains importable from `engine.model`.
 
 from __future__ import annotations
 
+import gzip
 import hashlib
 import json
 import os
@@ -70,16 +71,19 @@ def _train_fingerprint(train: list[dict], feature_names: list[str], mlp_epochs: 
 
 def _cache_path(fp: str) -> Path:
     # Shard by first 2 hex chars to keep any single directory small.
-    return _pool_cache_dir() / fp[:2] / f"{fp}.json"
+    # .json.gz — gzip-compressed JSON keeps the per-block footprint ~10x
+    # smaller on the persistent disk without adding a pandas/parquet dep.
+    return _pool_cache_dir() / fp[:2] / f"{fp}.json.gz"
 
 
 def _atomic_write_json(path: Path, payload: dict) -> None:
-    """Atomic JSON write: tmp file + os.replace (same contract as cache.save_json)."""
+    """Atomic gzip-JSON write: tmp file + os.replace (same contract as cache.save_json)."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(prefix=".pool_", suffix=".json", dir=str(path.parent))
+    fd, tmp_name = tempfile.mkstemp(prefix=".pool_", suffix=".gz", dir=str(path.parent))
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(payload, f, separators=(",", ":"))
+        with os.fdopen(fd, "wb") as raw:
+            with gzip.GzipFile(fileobj=raw, mode="wb", compresslevel=6) as gz:
+                gz.write(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
         os.replace(tmp_name, path)
     except Exception:
         try:
@@ -97,7 +101,7 @@ def _prune_lru() -> None:
     files: list[tuple[float, Path]] = []
     for sub in root.iterdir():
         if sub.is_dir():
-            for p in sub.glob("*.json"):
+            for p in list(sub.glob("*.json.gz")) + list(sub.glob("*.json")):
                 files.append((p.stat().st_mtime, p))
     if len(files) <= _MAX_CACHE_FILES:
         return
@@ -111,16 +115,30 @@ def _prune_lru() -> None:
 
 
 def try_load_pool_cache(fp: str) -> dict | None:
-    """Return the cached candidate-pool payload for `fp`, or None on miss."""
+    """Return the cached candidate-pool payload for `fp`, or None on miss.
+
+    Reads gzip-compressed JSON. Falls back to plain JSON for any cache file
+    written before the gzip change (defensive migration).
+    """
     path = _cache_path(fp)
     if not path.exists():
-        return None
+        # Pre-gzip migration: an older plain .json may still exist.
+        legacy = _pool_cache_dir() / fp[:2] / f"{fp}.json"
+        if legacy.exists():
+            path = legacy
+        else:
+            return None
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            payload = json.load(f)
-    except (OSError, json.JSONDecodeError):
+        with open(path, "rb") as raw:
+            try:
+                with gzip.GzipFile(fileobj=raw, mode="rb") as gz:
+                    payload = json.loads(gz.read().decode("utf-8"))
+            except (OSError, EOFError, gzip.BadGzipFile):
+                raw.seek(0)
+                payload = json.load(raw)  # plain-JSON fallback
+    except (OSError, json.JSONDecodeError, ValueError):
         return None
-    if payload.get("version") != POOL_CACHE_VERSION:
+    if not isinstance(payload, dict) or payload.get("version") != POOL_CACHE_VERSION:
         return None
     return payload
 
@@ -255,7 +273,7 @@ def clear_pool_cache(max_age_seconds: int = 86400 * 30) -> int:
     for sub in root.iterdir():
         if not sub.is_dir():
             continue
-        for p in sub.glob("*.json"):
+        for p in list(sub.glob("*.json.gz")) + list(sub.glob("*.json")):
             try:
                 if p.stat().st_mtime < cutoff:
                     p.unlink()

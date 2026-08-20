@@ -53,6 +53,32 @@ from mlb_streamlit.refresh import (
     run_refresh,
 )
 
+
+# ---------------------------------------------------------------------------
+# Streamlit-native session cache ("Cache-First" boot path)
+# ---------------------------------------------------------------------------
+# `load_bundle()` reads ~5 JSON caches from disk. Decorating it with
+# `@st.cache_data` keeps the parsed bundle warm across user sessions and
+# Streamlit reruns, so a returning visitor sees the dashboard in <1 s instead
+# of re-parsing megabytes of JSON on every interaction. The refresh flow
+# calls `_cached_load_bundle.clear()` after a successful rebuild so the next
+# read picks up the new artifacts.
+#
+# `ttl=3600` bounds staleness: the dashboard refreshes at most hourly even if
+# the underlying cache files change out-of-band. The refresh button always
+# clears first, so manual refreshes are never stale.
+@st.cache_data(ttl=3600, show_spinner=False)
+def _cached_load_bundle() -> dict | None:
+    """Session-warm load_bundle — parses the JSON caches at most once/hour."""
+    return load_bundle()
+
+
+def _invalidate_bundle_cache() -> None:
+    """Drop the session cache right before a reload after refresh/build."""
+    _cached_load_bundle.clear()
+
+
+
 # ---------------------------------------------------------------------------
 # Page setup + theme CSS
 # ---------------------------------------------------------------------------
@@ -356,7 +382,10 @@ def do_refresh() -> None:
         bar.empty()
         st.error(f"Refresh failed: {e}")
         return
-    st.session_state.bundle = load_bundle()
+    # Fresh artifacts are on disk — drop the session cache so the reload
+    # below serves the new model state (never the stale cached bundle).
+    _invalidate_bundle_cache()
+    st.session_state.bundle = _cached_load_bundle()
     st.session_state.pop("requested_dates", None)
     bar.progress(100, text="Complete")
     st.toast(
@@ -503,7 +532,7 @@ def _ensure_games_for_date(bundle) -> None:
         return
     finally:
         progress.empty()
-    st.session_state.bundle = load_bundle()
+    st.session_state.bundle = _cached_load_bundle()
     st.rerun()
 
 
@@ -1426,7 +1455,8 @@ def calibration_tab(bundle) -> None:
                 st.warning(f"Walk-forward build failed: {e}")
             finally:
                 progress.empty()
-            nb = load_bundle()
+            _invalidate_bundle_cache()
+            nb = _cached_load_bundle()
             if nb is not None:
                 st.session_state.bundle = nb
             st.rerun()
@@ -1452,7 +1482,8 @@ def calibration_tab(bundle) -> None:
                 st.warning(f"Walk-forward build failed: {e}")
             finally:
                 progress.empty()
-            nb = load_bundle()
+            _invalidate_bundle_cache()
+            nb = _cached_load_bundle()
             if nb is not None:
                 st.session_state.bundle = nb
             st.rerun()
@@ -2170,7 +2201,7 @@ def monitor_tab(bundle) -> None:
 
 def main() -> None:
     if "bundle" not in st.session_state:
-        st.session_state.bundle = load_bundle()
+        st.session_state.bundle = _cached_load_bundle()
 
     # Auto-ML button sets this flag (callbacks cannot render a progress bar);
     # run the pipeline here in the main flow, then rerun to show fresh results.
