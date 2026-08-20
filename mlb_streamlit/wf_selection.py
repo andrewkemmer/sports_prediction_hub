@@ -29,6 +29,7 @@ from .engine.gating import apply_concordance_gate, default_gate_config, summariz
 from .engine.logistic import cross_validate, logistic_logit, train_logistic_l1
 from .engine.metrics import compute_auc, compute_brier, evaluate, roundn, sigmoid, spearman_rank
 from .engine.model import CANDIDATE_MIN_AUC, apply_model, elo_prob, fit_walk_forward_step, refit_stack_model
+from .engine.markets import normalized_weight_rows
 from .engine.stack import predict_member, stack_probability
 
 WF_SELECTION_FILE = "walk_forward_selection.json"
@@ -703,10 +704,10 @@ def apply_walk_forward_selection(result: dict, model: dict, rows: list[dict], se
     # Single normalized allocation vector across the full candidate pool:
     # deployed stack members carry their (sum-to-1) weights, every other row
     # is an explicit zero — never an implicit 100% fallback.
-    result["stackingWeights"] = [
-        {"name": c["name"], "weight": roundn((stack.get("weights") or {}).get(c["name"], 0.0), 3)}
-        for c in result["candidates"]
-    ]
+    result["stackingWeights"] = normalized_weight_rows(
+        stack.get("weights") or {},
+        [c["name"] for c in result["candidates"]],
+    )
     result["crossValidation"] = selection["crossValidation"]
     result["optimizationParams"] = selection["optimizationParams"]
     result["concordanceGate"] = selection.get("concordanceGate") or default_gate_config()

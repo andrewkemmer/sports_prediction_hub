@@ -48,6 +48,7 @@ from .model import (
     simulate_runs_batch,
 )
 from .runs import expected_margin, expected_total, fit_run_model
+from .markets import build_market_payload, market_rows_for_calibration
 
 CALIBRATION_WF_FILE = "calibration_rows_wf.json"
 RUN_CALIB_TRIALS = 500
@@ -119,6 +120,8 @@ def _rows_from_stored_selection(
                 gate.get("gateAccepted") and winner in ("home", "away") and gated_team == winner
             ),
             "predictedTotal": proj["total"],
+            "overProb": proj.get("overProb", 0.5),
+            "underProb": proj.get("underProb", 0.5),
             "homeRunLineProb": proj["homeRunLineProb"],
             "actualTotal": (g["away"].get("score") or 0) + (g["home"].get("score") or 0),
             "actualMargin": (g["home"].get("score") or 0) - (g["away"].get("score") or 0),
@@ -331,13 +334,28 @@ def build_walk_forward_calibration_rows_v2(
                 current_block.get("runLineIso") or [],
                 current_block["runMarginCal"],
             )
-        for r in cal_rows:
-            r["trainedThrough"] = current_block["cutoff"]
-            r["modelChoice"] = current_model_choice
+        for index, calibration_row in enumerate(cal_rows):
+            calibration_row["trainedThrough"] = current_block["cutoff"]
+            calibration_row["modelChoice"] = current_model_choice
+            # Carry the out-of-sample candidate probabilities into the row so
+            # the moneyline track can select/weight candidates independently.
+            candidates_for_game = {}
+            for name, values in (sel_day.get("candPreds") or {}).items():
+                if index < len(values):
+                    candidates_for_game[name] = values[index]
+            if candidates_for_game:
+                calibration_row["candidatePredictions"] = candidates_for_game
+            calibration_row["marketRows"] = market_rows_for_calibration(calibration_row)
         out[d] = {"fp": fp, "rows": cal_rows, "modelChoice": current_model_choice}
         rep("Walk-forward", 30 + int(65 * (i + 1) / max(1, len(dates))),
             f"Scored {len(cal_rows)} game(s) on {d} with a model trained on {len(prior_games)} prior game(s)…")
 
+    # Migrate cache hits from the legacy one-row schema into explicit market
+    # vectors without changing the point-in-time predictions themselves.
+    for day in out.values():
+        for calibration_row in day.get("rows", []):
+            if not calibration_row.get("marketRows"):
+                calibration_row["marketRows"] = market_rows_for_calibration(calibration_row)
     cache.save_json(CALIBRATION_WF_FILE, {"version": BACKTEST_CACHE_VERSION, "days": out})
     # Record each date's deployed family in the walk-forward selection record so
     # the Model Monitor can show the per-date stack-vs-logistic decision.
@@ -358,6 +376,11 @@ def build_walk_forward_calibration_rows_v2(
         flat.extend(out[d]["rows"])
     rep("Walk-forward", 100, f"Walk-forward calibration ready ({len(flat)} games scored point-in-time).")
     return flat
+
+
+def build_market_calibration_tracks(rows: list[dict]) -> dict:
+    """Return isolated ML/TOTAL/RUN_LINE selection, stack, and gate payloads."""
+    return build_market_payload(rows)
 
 
 def _build_calibration_rows_fallback(
@@ -421,6 +444,8 @@ def _build_calibration_rows_fallback(
             **compact_gate,
             "gatedIsCorrect": gated_correct,
             "predictedTotal": proj["total"],
+            "overProb": proj.get("overProb", 0.5),
+            "underProb": proj.get("underProb", 0.5),
             "homeRunLineProb": proj["homeRunLineProb"],
             "actualTotal": (g["away"].get("score") or 0) + (g["home"].get("score") or 0),
             "actualMargin": (g["home"].get("score") or 0) - (g["away"].get("score") or 0),

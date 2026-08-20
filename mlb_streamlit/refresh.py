@@ -37,7 +37,8 @@ from .data import (
 from .engine.features import MODEL_FEATURE_KEYS, FEATURE_KEYS, FEATURE_VERSION, build_features_for_game, compute_elo_and_features
 from .engine.gating import GATE_VERSION, apply_concordance_gate, default_gate_config, summarize_gate_results
 from .engine.betting import build_bet_decision, stamp_market_odds, summarize_bet_decisions
-from .engine.calib_wf import build_walk_forward_calibration_rows_v2
+from .engine.calib_wf import build_market_calibration_tracks, build_walk_forward_calibration_rows_v2
+from .engine.markets import MARKET_ARCHITECTURE_METADATA, market_rows_for_calibration
 from .engine.logistic import train_logistic
 from .engine.metrics import (
     apply_isotonic,
@@ -226,10 +227,19 @@ def build_calibration_rows(
             **compact_gate,
             "gatedIsCorrect": gated_correct,
             "predictedTotal": proj["total"],
+            "overProb": proj.get("overProb", 0.5),
+            "underProb": proj.get("underProb", 0.5),
+            "overProb": proj.get("overProb", 0.5),
+            "underProb": proj.get("underProb", 0.5),
             "homeRunLineProb": proj["homeRunLineProb"],
             "actualTotal": (g["away"].get("score") or 0) + (g["home"].get("score") or 0),
             "actualMargin": (g["home"].get("score") or 0) - (g["away"].get("score") or 0),
         })
+    # Persist an explicit market vector alongside each legacy-compatible game
+    # row. The nested vectors are derived from the same T-1 prediction/result
+    # fields and are the only rows consumed by execution backtests.
+    for calibration_row in out:
+        calibration_row["marketRows"] = market_rows_for_calibration(calibration_row)
     return out
 
 
@@ -280,6 +290,8 @@ def build_calibration_summary(rows: list[dict]) -> dict:
     total = len(rows)
     correct = sum(1 for r in rows if r["isCorrect"])
     return {
+        "architectureMetadata": MARKET_ARCHITECTURE_METADATA,
+        "marketTypes": ["MONEYLINE", "TOTAL", "RUN_LINE"],
         "metrics": metrics,
         "totalsMetrics": totals_metrics,
         "runLineMetrics": run_line_metrics,
@@ -661,6 +673,25 @@ def _refresh_fast(fresh: list[dict], all_games: list[dict], cached_state: dict, 
     state = dict(cached_state)
     state["asOfDate"] = today
     state["trainedAt"] = int(now.timestamp() * 1000)
+    # Older cached model states may predate the market migration. Rebuild the
+    # compact isolated summaries from the persisted PIT rows without retraining
+    # so the fast refresh path still exposes the same dashboard contract.
+    if not state.get("marketTracks"):
+        wf_days = cache.load_calibration_rows_wf()
+        wf_rows = [
+            row
+            for day in sorted(wf_days)
+            for row in (wf_days[day].get("rows", []) or [])
+        ]
+        if wf_rows:
+            market_payload = build_market_calibration_tracks(wf_rows)
+            state["architectureMetadata"] = MARKET_ARCHITECTURE_METADATA
+            state["marketArchitectureMetadata"] = MARKET_ARCHITECTURE_METADATA
+            state["marketTypes"] = market_payload["marketTypes"]
+            state["marketTracks"] = market_payload["summaries"]
+            state["marketCalibrationTracks"] = market_payload["summaries"]
+    state["architectureMetadata"] = state.get("architectureMetadata") or MARKET_ARCHITECTURE_METADATA
+    state["marketArchitectureMetadata"] = state.get("marketArchitectureMetadata") or MARKET_ARCHITECTURE_METADATA
     state["marketExecution"] = summarize_bet_decisions(docs)
     state["marketOddsStatus"] = {
         "enabled": market_odds_enabled(),
@@ -682,6 +713,9 @@ def _refresh_fast(fresh: list[dict], all_games: list[dict], cached_state: dict, 
         "selectedModel": state.get("selectedModel"),
         "monteCarloEnabled": state.get("monteCarloEnabled"),
         "storedGames": len(docs),
+        "architectureMetadata": state.get("architectureMetadata") or MARKET_ARCHITECTURE_METADATA,
+        "marketTypes": state.get("marketTypes") or [],
+        "marketTracks": state.get("marketTracks") or {},
     }
 
 
@@ -1170,11 +1204,21 @@ def run_refresh(
     # Reuses the walk-forward selection record (stored per-date predictions +
     # gate results) so the walk-forward models are NOT re-fit a second time;
     # only the cheap run-scoring projections are computed here.
-    build_walk_forward_calibration_rows_v2(
+    walk_forward_rows = build_walk_forward_calibration_rows_v2(
         report=rep,
         feature_names=result["featureNames"],
         rows=rows,
     )
+    market_payload = build_market_calibration_tracks(walk_forward_rows)
+    # Persist only the compact isolated track payload in model_state. The
+    # heavyweight execution rows remain in calibration_rows_wf.json and are
+    # expanded on demand, keeping refresh/startup memory bounded.
+    state["architectureMetadata"] = MARKET_ARCHITECTURE_METADATA
+    state["marketArchitectureMetadata"] = MARKET_ARCHITECTURE_METADATA
+    state["marketTypes"] = market_payload["marketTypes"]
+    state["marketTracks"] = market_payload["summaries"]
+    state["marketCalibrationTracks"] = market_payload["summaries"]
+    cache.save_model_state(state)
 
     rep("Complete", 100, f"Refreshed {len(fresh_dates)} day(s) of predictions", )
     return {
@@ -1189,6 +1233,9 @@ def run_refresh(
         "selectedModel": result["selectedModel"],
         "monteCarloEnabled": result["monteCarloEnabled"],
         "storedGames": len(fresh_docs),
+        "architectureMetadata": MARKET_ARCHITECTURE_METADATA,
+        "marketTypes": market_payload["marketTypes"],
+        "marketTracks": market_payload["summaries"],
     }
 
 

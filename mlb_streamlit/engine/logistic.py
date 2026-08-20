@@ -631,8 +631,17 @@ def build_stacking_weights(cand_preds: dict, labels: list[int]) -> dict:
         ensemble = list(cand_preds[order[0]])
         cur_brier = best_single_brier
 
-    total = sum(weights.values()) or 1
-    weight_list = [{"name": nm, "weight": roundn((weights.get(nm) or 0) / total, 3)} for nm in names]
+    total = sum(weights.values()) or 1.0
+    normalized = {nm: (weights.get(nm) or 0.0) / total for nm in names}
+    # Keep the served allocation vector mathematically normalized. Do not round
+    # each member independently: two displayed 100% rows were previously
+    # created by family-local serializers, and per-item rounding can also make
+    # the persisted vector differ from one. The UI formats these floats.
+    drift = 1.0 - sum(normalized.values())
+    if names:
+        anchor = next((nm for nm in reversed(names) if normalized.get(nm, 0.0) > 0), names[0])
+        normalized[anchor] = max(0.0, normalized.get(anchor, 0.0) + drift)
+    weight_list = [{"name": nm, "weight": normalized.get(nm, 0.0)} for nm in names]
     return {"preds": ensemble, "brier": cur_brier, "weights": weight_list}
 
 

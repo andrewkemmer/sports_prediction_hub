@@ -38,6 +38,7 @@ from .logistic import (
     naive_bayes_model,
     train_logistic,
 )
+from .markets import normalized_weight_rows
 from .metrics import (
     apply_isotonic,
     calibration_curve_points,
@@ -856,10 +857,10 @@ def run_model(
         # Single normalized allocation vector across the full candidate pool:
         # deployed stack members carry their (sum-to-1) weights, every other
         # row is an explicit zero — never an implicit 100% fallback.
-        "stackingWeights": [
-            {"name": c["name"], "weight": roundn((stack.get("weights") or {}).get(c["name"], 0.0), 3)}
-            for c in candidates
-        ],
+        "stackingWeights": normalized_weight_rows(
+            stack.get("weights") or {},
+            [c["name"] for c in candidates],
+        ),
         "crossValidation": cross_validation,
         "optimizationParams": optimization_params,
         "runModel": run_model_state,

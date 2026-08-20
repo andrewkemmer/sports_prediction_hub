@@ -30,6 +30,11 @@ import streamlit as st
 from mlb_streamlit import cache, ui
 from mlb_streamlit.data import et_date_string, market_odds_enabled
 from mlb_streamlit.engine.backtest import build_execution_backtest
+from mlb_streamlit.engine.markets import (
+    MARKET_ARCHITECTURE_METADATA,
+    MARKET_TYPES,
+    expand_market_rows,
+)
 from mlb_streamlit.engine.metrics import (
     calibration_curve_points,
     compute_auc,
@@ -41,7 +46,7 @@ from mlb_streamlit.engine.teams import team_meta
 from mlb_streamlit.refresh import (
     PREDICTION_VERSION,
     SEASON_START,
-    build_walk_forward_calibration_rows,
+    build_walk_forward_calibration_rows_v2 as build_walk_forward_calibration_rows,
     load_bundle,
     power_rankings_as_of,
     predict_date,
@@ -1060,30 +1065,79 @@ def _calibration_range(rows: list[dict], fallback: str) -> tuple[_dt.date, _dt.d
     return _dt.date.fromisoformat(dates[0]), _dt.date.fromisoformat(dates[-1])
 
 
-def _execution_backtest_panel(rows: list[dict]) -> None:
-    """Paper-trading P&L for the base model and the concordance gate.
+def _execution_backtest_panel(rows: list[dict], market_type: str | None = None) -> None:
+    """Render global or market-sliced execution and threshold diagnostics.
 
-    Replays the point-in-time predictions against a flat -110 price using
-    quarter-Kelly sizing (1% cap). This is a model-side benchmark — a model
-    that cannot clear -110 has no edge to trade against sharper closing lines.
+    Canonical rows carry an independent market, side, line, result, and
+    decimal closing price. Missing historical prices remain the explicit
+    1.9091 (-110) fallback; live quotes are never backfilled into this panel.
     """
-    if len(rows) < 10:
+    scope_options = ["Global", "Moneyline", "Totals", "Run Lines"]
+    selected_scope = st.segmented_control(
+        "Execution market",
+        scope_options,
+        key="cal_market_scope",
+        default="Global",
+    ) or "Global"
+    selected_type = {"Global": None, "Moneyline": "MONEYLINE", "Totals": "TOTAL", "Run Lines": "RUN_LINE"}.get(selected_scope)
+    market_type = selected_type if market_type is None else market_type
+    market_rows = expand_market_rows(rows)
+    if market_type:
+        market_rows = [r for r in market_rows if r.get("market_type") == market_type]
+    if not market_rows:
         return
-    bt = build_execution_backtest(rows)
-    base = bt["base"]
-    gated = bt["gated"]
+    bt = build_execution_backtest(market_rows)  # canonical market rows
+    st.caption(MARKET_ARCHITECTURE_METADATA)
+    summary = bt["global"]
+    base = summary["base"]
+    gated = summary["gated"]
+    scope_label = {
+        None: "Global",  # all three market tracks
+        "MONEYLINE": "Moneyline",
+        "TOTAL": "Game Totals",
+        "RUN_LINE": "Run Lines",
+    }.get(market_type, market_type or "Global")
     st.markdown(
         f"<div style='margin-top:16px;background:{ui._card_bg()};border:1px solid {ui.BORDER};border-radius:16px;padding:16px;'>"
         f"<div style='display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;'>"
-        f"<div><h3 style='margin:0;font-size:14px;font-weight:600;color:{ui.TEXT}'>Execution Backtest (paper trading)</h3>"
+        f"<div><h3 style='margin:0;font-size:14px;font-weight:600;color:{ui.TEXT}'>Execution Backtest · {scope_label}</h3>"
         f"<p style='margin:5px 0 0;font-size:12px;color:{ui.MUTED};line-height:1.5'>"
-        f"Point-in-time picks replayed at a flat {bt['price']} price (breakeven {fmt_pct(bt['breakeven'], 1)}), "
-        f"quarter-Kelly staking with a 1% cap. Measures whether the model clears the vig — not historical closing-line CLV.</p></div>"
-        f"{ui.pill('PIT · -110 benchmark', ui.CYAN, 'rgba(34,211,238,0.15)')}"
+        f"PIT predictions replayed with row-level decimal closing odds, quarter-Kelly sizing, and a 1% cap. "
+        f"Rows without a historical close use the transparent {bt['defaultClosingOdds']:.4f} (-110) fallback.</p></div>"
+        f"{ui.pill('PIT · market-centric', ui.CYAN, 'rgba(34,211,238,0.15)')}"
         f"</div>",
         unsafe_allow_html=True,
     )
-    cols = st.columns(6)
+    if market_type is None:
+        market_labels = {"MONEYLINE": "Moneyline", "TOTAL": "Totals", "RUN_LINE": "Run Lines"}
+        track_rows = []
+        for key in MARKET_TYPES:
+            track = bt["markets"].get(key) or {}
+            track_base = track.get("base") or {}
+            track_gated = track.get("gated") or {}
+            gate = (track.get("track") or {}).get("gate") or {}
+            track_rows.append([
+                f"<b style='color:{ui.TEXT}'>{market_labels[key]}</b>",
+                f"<span style='color:{ui.TEXT}'>{track_base.get('bets', 0)} / {track_base.get('games', 0)}</span>",
+                f"<span style='color:{ui.TEXT}'>{track_base.get('roi', 0):+.1%}</span>",
+                f"<span style='color:{ui.TEXT}'>{track_base.get('hitRate', 0):.1%}</span>",
+                f"<span style='color:{ui.TEXT}'>{track_gated.get('bets', 0)}</span>",
+                ui.pill(
+                    "Active" if gate.get("enabled") else "Held out",
+                    ui.EMERALD if gate.get("enabled") else ui.AMBER,
+                    "rgba(52,211,153,0.15)" if gate.get("enabled") else "rgba(252,211,77,0.15)",
+                ),
+            ])
+        st.markdown(
+            f"<div style='margin-top:12px;'><h4 style='margin:0 0 8px;font-size:13px;font-weight:600;color:{ui.TEXT}'>Market track summary</h4>"
+            + ui.html_table(
+                ["Market", "Bets / rows", "Base ROI", "Hit rate", "Gated bets", "Gate"],
+                track_rows,
+                align=["left", "right", "right", "right", "right", "right"],
+            ) + "</div>",
+            unsafe_allow_html=True,
+        )
+    cols = st.columns(6)  # global or selected market track
     roi_color = ui.EMERALD if base["roi"] >= 0 else ui.ROSE
     gated_roi_color = ui.EMERALD if gated["roi"] >= 0 else ui.ROSE
     cards = [
